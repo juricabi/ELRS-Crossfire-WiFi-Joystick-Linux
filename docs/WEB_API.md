@@ -107,8 +107,9 @@ Body ignored (send `{}`). `start`/`stop` listen or not; `restart` re-sends our r
 a restart (`joystick_end`, then `joystick_begin`); nothing for a locked Crossfire; for a locked module that
 may be Crossfire (16 channels, no beacon from it yet) the restart waits until it has streamed 20 s without
 a Crossfire beacon; the module IP, not locked and not known as ELRS by its beacon (no beacon yet, or
-Crossfire), only a `joystick_begin`; nothing when no module is locked and no module IP is set. A restart
-that fails is sent again every 5 s while the module streams, 3 sends in all (rule 6 of
+Crossfire), only a `joystick_begin`; nothing when no module is locked and no module IP is set, nor while
+stopped ("Not running - nothing to restart") or not listening yet ("Not listening - nothing to restart").
+A restart that fails is sent again every 5 s while the module streams, 3 sends in all (rule 6 of
 [DESIGN.md](DESIGN.md#2-protocol-what-the-core-does)).
 
 ## `GET /api/log?since=N`

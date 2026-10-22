@@ -811,14 +811,17 @@ static bool run_commands(engine_t *e, int64_t now) {
   if (cfg_new && memcmp(&req, &e->cfg, sizeof req)) apply_config(e, &req, now);
   if (run == 1 && !e->running) do_start(e, now);
   if (restart) {
-    if (e->sock < 0) eng_log(e, "Not listening - nothing to restart");
+    /* stopped: the Windows app's line; running but the UDP port not open yet (the bind is retried) */
+    if (!e->running) eng_log(e, "Not running - nothing to restart");
+    else if (e->sock < 0) eng_log(e, "Not listening - nothing to restart");
     else wifi_proto_restart(&e->p, now);
   }
   return quit;
 }
 
 /* ================================================================ status */
-static void status_text(engine_t *e, uint32_t pending_ip, int npending, char *out, size_t cap) {
+/* pending_ip: the module shown as "activating" (activating_ip), 0 = none */
+static void status_text(engine_t *e, uint32_t pending_ip, char *out, size_t cap) {
   const wifi_proto_t *p = &e->p;
   char ip[16];
   if (!e->running) { snprintf(out, cap, "stopped"); return; }
@@ -828,7 +831,7 @@ static void status_text(engine_t *e, uint32_t pending_ip, int npending, char *ou
   if (!strncmp(p->detail, "module found", 12)) {
     wifi_ip_str(p->nostick_ip, ip);
     snprintf(out, cap, "no stick data from %s", ip);
-  } else if (npending) {
+  } else if (pending_ip) {
     wifi_ip_str(pending_ip, ip);
     snprintf(out, cap, "activating %s", ip);
   } else if (!strncmp(p->detail, "activated", 9)) {
@@ -842,19 +845,31 @@ static void status_text(engine_t *e, uint32_t pending_ip, int npending, char *ou
   }
 }
 
+/* the module shown as "activating": with a module IP set, only its own POST (one still in flight to a module
+ * just left behind is not what the user waits for: the state is "connecting to <ip>"), else the first queued
+ * or in flight; 0 = none. As sticktime-pi's input_wifi.c. */
+static uint32_t activating_ip(engine_t *e) {
+  uint32_t ip = 0;
+  pthread_mutex_lock(&e->qmu);
+  if (e->p.target) {
+    if (wifi_actq_is_pending(&e->q, e->p.target)) ip = e->p.target;
+  } else if (e->q.npending) {
+    ip = e->q.pending[0];
+  }
+  pthread_mutex_unlock(&e->qmu);
+  return ip;
+}
+
 /* the receive thread's view -> the snapshot (only when something changed) */
 static void publish(engine_t *e) {
   eng_snapshot_t *w = &e->work;
   const wifi_proto_t *p = &e->p;
-  pthread_mutex_lock(&e->qmu);
-  int npend = e->q.npending;
-  uint32_t pend = npend ? e->q.pending[0] : 0;
-  pthread_mutex_unlock(&e->qmu);
+  uint32_t pend = activating_ip(e);
   w->running = e->running;
   w->listening = e->sock >= 0;
   w->state = p->state;
   snprintf(w->detail, sizeof w->detail, "%s", p->detail);
-  status_text(e, pend, npend, w->status, sizeof w->status);
+  status_text(e, pend, w->status, sizeof w->status);
   w->bound = p->bound;
   if (p->bound) {
     wifi_ip_str(p->bound_ip, w->source);

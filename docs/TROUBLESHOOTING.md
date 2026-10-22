@@ -64,7 +64,9 @@ are in [USAGE.md](USAGE.md#the-request-rate-and-channels); in short:
 - **"The restart of <ip> failed ..."**: the module did not answer the restart with a 2xx (look at
   "Stream end POST" and "Activation POST" in the log). It is sent again every 5 s while the module streams
   (3 tries in all), then the program gives up: check the module's web server port (`--http-port`) and
-  that nothing else (another app, a phone) talks to the module, then press `a`.
+  that nothing else (another app, a phone) talks to the module, then press `a`. When the module streams
+  to the program again after a dropout or a stop, it is restarted once more ("<ip> may still stream its
+  old request ...").
 
 ### Two modules on the network
 

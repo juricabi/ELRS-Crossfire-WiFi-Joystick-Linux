@@ -73,7 +73,7 @@ bars for CH1..CH8 and marks for the 8 buttons. Keys (upper or lower case):
 | `r` | prompt for the rate (the presets, or 10..1000 Hz) |
 | `c` | prompt for the channels (4..16) |
 | `p` | prompt for the UDP port |
-| `a` | restart the stream, so that a new rate or channel count takes effect (a Crossfire module is never sent `joystick_end`); see [the request](#the-request-rate-and-channels) |
+| `a` | restart the stream, so that a new rate or channel count takes effect (a module known as Crossfire by its beacon is never sent `joystick_end`); see [the request](#the-request-rate-and-channels) |
 | `w` | print the web page's address |
 | `h`, `?` | help |
 | `q`, Ctrl+C | quit (the joystick is centered and removed) |
@@ -208,11 +208,12 @@ is **250 Hz and 16 channels**, the same as the Windows app.
 - **A change while the module does not stream to the program** (during its activation, a WiFi dropout
   of more than 3 s, a stop, or before switching the module IP to it) goes into its next
   `joystick_begin`. The program remembers what it last asked each module and what their beacons said
-  (up to 8 modules, never forgetting the kind of the one streaming now), and keeps both across a stop and
-  start or a port change (those clear the lock, the 5 s limits and waiting restarts): a module that
-  streams to the program again with an older request (it streams on through those) is restarted then, by
-  the rules above ("<ip> still streams 250 Hz, 16 channels from before the change - restarting its
-  stream with ...").
+  (up to 8 modules, never forgetting the kind of the one streaming now; with more modules the one heard
+  from longest ago is forgotten), and keeps both across a stop and start or a port change (those clear the
+  lock, the 5 s limits and waiting restarts): a module that streams to the program again with an older
+  request (it streams on through those) is restarted then, by the rules above ("<ip> still streams
+  250 Hz, 16 channels from before the change - restarting its stream with ..."; a rate that is not one of
+  the presets is shown with its interval, "286 Hz (3500 us)").
 - **At startup** the values from the command line and the settings file only set the next
   `joystick_begin`. A module still streaming from before (it keeps streaming after the program quits,
   below) keeps its old rate: press `a` (or restart in the web page) to apply them. Only a different
@@ -225,20 +226,29 @@ is **250 Hz and 16 channels**, the same as the Windows app.
   (`--module`, `t`) is restarted if its beacon said ELRS; otherwise (no beacon yet, or Crossfire) it only
   gets a `joystick_begin` at once, never `joystick_end` ("<ip> has sent no beacon yet (it may be
   Crossfire, which is never sent joystick_end): activating it with ..."): a module that is not streaming
-  takes the request from that alone. Without a module IP nothing is sent ("No module to restart ...").
+  takes the request from that alone. Without a module IP nothing is sent ("No module to restart ...");
+  stopped, nothing either ("Not running - nothing to restart"), nor while the UDP port is not open yet
+  ("Not listening - nothing to restart").
 - **A restart that fails** (its `joystick_end` or its `joystick_begin` gets no 2xx answer) changed
   nothing. It is sent again every 5 s while the module still streams to the program and is not known as
   Crossfire, 3 sends per change in all ("The restart of <ip> failed - sending it again in 5 s"), then the
   program gives up and says so ("... failed 3 times - giving up ..."); press `a` to try again. A plain
   `joystick_begin` that fails is never turned into a restart: the next beacon, or the module IP's next
-  try, sends it again after 5 s.
+  try, sends it again after 5 s. A restart that did not take (it failed, or a stop or port change cut it
+  short before its answer came) and could not be sent again because the module stopped streaming to the
+  program (a WiFi dropout of more than 3 s, switching the module IP, a stop or a port change) leaves the
+  program not knowing what the module streams: when it streams to the program again it is restarted once
+  more, by the rules above ("<ip> may still stream its old request (its restart failed) ...", or "...
+  (Stop cut its restart short) ...").
 - **Switching the module IP** to the module that streams now keeps it: nothing is sent, nothing
   centered ("Target module set to <ip> - streaming from it already"). Another module IP lets go of the
   module streaming now (the joystick centers), asks the new one at once ("connecting to <ip>") and sends
   the module being left nothing: a restart waiting for it is dropped, also when the rate or the channels
   change in the same go (the new module's `joystick_begin` carries them).
-- **Timing**: one `joystick_begin` per module per 5 s at most; a restart goes out at once and starts the
-  5 s over. Lock loss, sending again and waiting restarts are checked at least 10 times a second,
+- **Timing**: one activation per module per 5 s for the automatic ones (beacons, the module IP's
+  retries); setting the module IP, `a`, and a restart go out at once and start the 5 s over. A restart
+  decided while a request to the same module is still under way goes out as soon as that one is
+  answered. Lock loss, sending again and waiting restarts are checked at least 10 times a second,
   whatever arrives.
 
 The web page and the status line show the measured rate and jitter, so you can compare settings.

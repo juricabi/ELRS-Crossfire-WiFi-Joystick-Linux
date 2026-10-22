@@ -746,8 +746,9 @@ static void t_flow(void) {
   eng_stop(E);                                          /* twice: nothing */
   sleep_ms(100);
   CHECK_INT(logged("Stopped."), 1);
-  eng_restart_stream(E);                                /* stopped: nothing to restart */
-  CHECK(WAIT(1000, logged("Not listening - nothing to restart") == 1));
+  eng_restart_stream(E);                                /* stopped: nothing to restart (the Windows app's line) */
+  CHECK(WAIT(1000, logged("Not running - nothing to restart") == 1));
+  CHECK_INT(logged("Not listening"), 0);
   eng_start(E);
   eng_start(E);
   CHECK(WAIT(2000, S.bound));
@@ -927,6 +928,36 @@ static void t_status_texts(void) {
   fk_stop(&m);
 }
 
+/* The module IP switched while a POST to the module being left is still in flight (a slow module): the status
+ * is about the new module ("activating" its own POST, then "connecting to"), never "activating <the old one>" */
+static void t_status_switch_in_flight(void) {
+  uint16_t U = free_udp(), H = free_tcp();
+  fake_t m;
+  fk_start(&m, "127.0.0.2", false, H, U);
+  fk_lock(&m);
+  m.http_delay_ms = 1500;
+  fk_unlock(&m);
+  start(U, H, "127.0.0.2", false);
+  CHECK(WAIT(500, !strcmp(S.status, "activating 127.0.0.2")));
+  snprintf(g_ip, sizeof g_ip, "127.0.0.3");          /* nothing answers there: refused */
+  char err[256];
+  CHECK_INT(set_cfg(set_ip, err, sizeof err), 0);
+  CHECK(WAIT(500, strstr(S.status, "127.0.0.3") != NULL));
+  bool old_shown = false;
+  int64_t end = now_us() + 1000000;                  /* the POST to 127.0.0.2 is still in flight */
+  while (now_us() < end) {
+    snap();
+    if (strstr(S.status, "127.0.0.2")) old_shown = true;
+    eng_wait(E, S.seq, S.log_seq, 20);
+  }
+  CHECK(!old_shown);
+  CHECK(WAIT(3000, logged("Activation POST -> 127.0.0.2: 200 OK") == 1));
+  CHECK(WAIT(3000, logged("Activation failed for 127.0.0.3") >= 1));
+  CHECK(WAIT(1000, !strcmp(S.status, "connecting to 127.0.0.3")));
+  finish();
+  fk_stop(&m);
+}
+
 static void t_bind_error(void) {
   uint16_t U = free_udp();
   int blocker = socket(AF_INET, SOCK_DGRAM, 0);
@@ -959,6 +990,10 @@ static void t_bind_error(void) {
   eng_start(E);
   sleep_ms(100);
   CHECK_INT(logged("ERROR"), 1);
+  /* a restart while running but not listening: nothing could be sent */
+  eng_restart_stream(E);
+  CHECK(WAIT(1000, logged("Not listening - nothing to restart") == 1));
+  CHECK_INT(logged("Not running"), 0);
   close(blocker);
   CHECK(WAIT(7000, S.listening));                       /* the next try, within 5 s */
   CHECK_STR(S.status, "listening");
@@ -1534,7 +1569,7 @@ int main(int argc, char **argv) {
   setvbuf(stderr, NULL, _IONBF, 0);
   int64_t t0 = now_us();
   /* one part: test_engine config|flow|xf|mismatch|status|bind|joyfail|log|shutdown|joywrite|concurrency|burst|
-   * update|applied|owngap|endrefused|switch|sametarget|kind */
+   * update|applied|owngap|endrefused|switch|sametarget|kind|statusswitch */
   static const struct { const char *name; void (*fn)(void); } PARTS[] = {
     { "config", t_config_check }, { "flow", t_flow }, { "xf", t_crossfire_and_target }, { "mismatch", t_mismatch },
     { "status", t_status_texts }, { "bind", t_bind_error }, { "joyfail", t_joystick_fails }, { "log", t_log_ring },
@@ -1542,6 +1577,7 @@ int main(int argc, char **argv) {
     { "burst", t_command_burst }, { "update", t_update_config }, { "applied", t_wait_applied },
     { "owngap", t_own_restart_no_gap }, { "endrefused", t_restart_end_refused }, { "switch", t_switch_module_and_rate },
     { "sametarget", t_same_target_no_center }, { "kind", t_kind_after_stop_start },
+    { "statusswitch", t_status_switch_in_flight },
   };
   if (argc > 1) {
     for (size_t i = 0; i < sizeof PARTS / sizeof PARTS[0]; i++)
@@ -1555,6 +1591,7 @@ int main(int argc, char **argv) {
   t_crossfire_and_target();
   t_mismatch();
   t_status_texts();
+  t_status_switch_in_flight();
   t_bind_error();
   t_joystick_fails();
   t_log_ring();

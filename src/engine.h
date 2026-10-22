@@ -92,8 +92,9 @@ typedef struct {
   char detail[64];          /* wifi_proto's state detail */
   /* one line for people, every text there is: "stopped"; "opening UDP port 11000" (running, the bind
    * not done yet), "UDP port 11000 in use", "no permission for UDP port 11000", "cannot open UDP port
-   * 11000" (the bind failed: state error, retried every 5 s); "listening", "activating 10.0.0.1",
-   * "connecting to 10.0.0.1", "no data from 10.0.0.1", "no stick data from 10.0.0.1"; "streaming" */
+   * 11000" (the bind failed: state error, retried every 5 s); "listening", "activating 10.0.0.1" (a POST
+   * under way; with a module IP set, only its own), "connecting to 10.0.0.1", "no data from 10.0.0.1",
+   * "no stick data from 10.0.0.1"; "streaming" */
   char status[80];
   bool bound;               /* locked to a module */
   char source[16];          /* its IP, "" when not bound */

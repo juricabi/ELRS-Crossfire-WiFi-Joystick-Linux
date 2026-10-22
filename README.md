@@ -85,7 +85,7 @@ The program asks the module for an update **rate** and a **channel count** - "th
 
 - **ExpressLRS** (3.4.0 and later) streams what it is asked for. A change with the keys `r` / `c` or the web page restarts its stream so that it takes effect ([details](docs/USAGE.md#the-request-rate-and-channels)).
 - `--rate` / `--channels` and the settings file only set the next request: if the module still streams from before, press `a` (or restart in the web page). Only a different channel count is fixed by itself.
-- **TBS Crossfire / Tracer** ignores both: it always sends 16 channels at about 90 Hz, and it is never sent `joystick_end`.
+- **TBS Crossfire / Tracer** ignores both: it always sends 16 channels at about 90 Hz, and a module known as Crossfire by its beacon is never sent `joystick_end`.
 
 ## 📋 Channel Mapping
 

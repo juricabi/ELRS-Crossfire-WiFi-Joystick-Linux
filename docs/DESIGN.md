@@ -66,7 +66,11 @@ See the header comment of `core/wifi_proto.h`. In short:
   3. Not locked: the next `joystick_begin` carries the request. What each module was last asked is
      remembered per module (a table of 8); a module that locks with another remembered request is restarted
      under rule 2's kind rules (Crossfire: only logged). So a change made while it was not locked (during
-     its activation, a WiFi dropout, a stop, before a switch to it) reaches a module that streams on.
+     its activation, a WiFi dropout, a stop, before a switch to it) reaches a module that streams on. (The
+     check runs on every frame: a locked module whose remembered request differs is restarted too, which
+     only `wifi_proto_store_request` without a switch to another module leads to - the engine calls
+     `wifi_proto_set_request` then.) A restart that did not take (rule 6, failed and its module no longer
+     locked; rule 9, cut short) leaves that module's remembered request unknown: its next lock restarts it.
   4. Explicit restart (key `a`, the web page's Restart, the `restart` command): locked: as rule 2
      (Crossfire: logged, nothing sent). Not locked with a module IP set: a module known as ELRS is
      restarted; unknown or Crossfire gets a plain `joystick_begin` past the throttle, never `joystick_end`.
@@ -77,7 +81,11 @@ See the header comment of `core/wifi_proto.h`. In short:
      detected: the frames do not carry it.)
   6. A restart counts as done only when both POSTs got a 2xx. A failed one is sent again every 5 s (the
      throttle) while that module is still locked and not known as Crossfire, at most 3 sends per request
-     change; giving up is logged. A failed plain `joystick_begin` is never retried as a restart.
+     change; giving up is logged. A failed plain `joystick_begin` is never retried as a restart. A restart
+     decided while a POST to that module is in flight (the worker takes one per module at a time) goes out
+     when that POST's result is in; one for a module that is not locked waits for its next lock, unless it
+     is the module IP known as ELRS (rule 4): never a `joystick_end` to an unlocked module that may be
+     Crossfire.
   7. Setting the module IP to the module locked now keeps the lock, sends nothing and logs that it streams
      already (no centering). Another module IP unlocks, reports "connecting to <ip>", POSTs
      `joystick_begin` at once, and drops any pending or held restart for the module being left.
@@ -85,14 +93,20 @@ See the header comment of `core/wifi_proto.h`. In short:
      `joystick_begin` carries it, the module being left gets nothing.
   9. Stop/start and a port change start a new session: lock, throttles and restart state are cleared; the
      kinds learnt from beacons and the remembered requests are kept (an ELRS module streams on after a
-     stop, and it never beacons while it streams).
-  10. Tables are bounded (8 modules); the locked module's kind is never evicted.
+     stop, and it never beacons while it streams), except that a module whose restart had not taken (its
+     answer still awaited, or failed) is remembered as unknown (rule 3).
+  10. Tables are bounded (8 modules); the locked module's kind is never evicted. A full table drops the
+      entry written longest ago (by a counter, not the time: the datagrams of one drain share a time), never
+      the locked module's or the module IP's kind or remembered request. With more than 8 modules each
+      beacon round POSTs them all again.
   11. Lock loss (3 s without data), stop, exit and switching to another module IP center the 8 axes
       (16384) and release the buttons; channels a frame does not carry are neutral (centered / released);
       short gaps hold the last values ([§4](#4-the-virtual-joystick-uinput)).
   12. The tick (lock release, retries, held restarts, the module IP's re-POST) runs at least every 100 ms
       whatever traffic arrives.
   13. One POST per module per 5 s for plain activations (the throttle); restarts bypass it and restart it.
+      Plain means the automatic ones (beacons, the module IP's re-POST); the `joystick_begin` of rules 4
+      and 7 goes out at once too.
 
 ## 3. Threads and data flow
 

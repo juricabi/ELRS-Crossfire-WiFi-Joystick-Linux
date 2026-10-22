@@ -180,7 +180,9 @@ int eng_update_config(engine_t *e, const eng_config_t *cin, unsigned fields, eng
     } else if (e->running && e->present) {
       e->restarts++;
       e->posts += 2;
-      dlog(e, "Restarting the stream of %s: %d Hz, %d channels", e->ip, wifi_interval_hz(c->interval_us), c->channels);
+      char hz[32];
+      dlog(e, "Restarting the stream of %s: %s, %d channels", e->ip, wifi_describe_interval(c->interval_us, hz, sizeof hz),
+           c->channels);
     }
   }
   settle(e);
@@ -203,8 +205,9 @@ void eng_restart_stream(engine_t *e) {
   } else if (e->running && (e->present || e->cfg.module_ip[0])) {
     e->restarts++;
     e->posts += 2;
-    dlog(e, "Restarting the stream of %s: %d Hz, %d channels", e->present ? e->ip : e->cfg.module_ip,
-         wifi_interval_hz(e->cfg.interval_us), e->cfg.channels);
+    char hz[32];
+    dlog(e, "Restarting the stream of %s: %s, %d channels", e->present ? e->ip : e->cfg.module_ip,
+         wifi_describe_interval(e->cfg.interval_us, hz, sizeof hz), e->cfg.channels);
   }
   pthread_mutex_unlock(&e->mu);
 }

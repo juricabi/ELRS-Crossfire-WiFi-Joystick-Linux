@@ -197,7 +197,7 @@ rm "$W/nosystemctl/systemctl"
 
 # ------------------------------------------------------------------ the fake GitHub
 # what the program's --version says after its "elrs-wifi-joystick <version>" line (install.sh reads line 1)
-LINKS="https://github.com/juricabi/ELRS-Crossfire-WiFi-Joystick-Linux - Ko-fi: https://ko-fi.com/juricabi"
+LINKS="https://github.com/juricabi/ELRS-Crossfire-WiFi-Joystick-Linux - by juricabi: https://github.com/juricabi - Ko-fi: https://ko-fi.com/juricabi"
 fakebin() {  # out version arch [runs|norun|noexec-tmp|noexec]
   case ${4:-runs} in
     runs)

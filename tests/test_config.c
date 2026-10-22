@@ -660,8 +660,9 @@ static void texts(void) {
                                       "--web", "--no-web", "--no-joystick", "--no-buttons", "--name", "--config",
                                       "--no-config", "--daemon", "--list-rates", "--version", "--help" };
   for (size_t i = 0; i < sizeof opts / sizeof opts[0]; i++) CHECK(strstr(buf, opts[i]) != NULL);
-  /* the last line: the project and Ko-fi */
-  static const char links[] = "https://github.com/juricabi/ELRS-Crossfire-WiFi-Joystick-Linux - Ko-fi: https://ko-fi.com/juricabi\n";
+  /* the last line: the project, the author's GitHub profile and Ko-fi */
+  static const char links[] = "https://github.com/juricabi/ELRS-Crossfire-WiFi-Joystick-Linux"
+                              " - by juricabi: https://github.com/juricabi - Ko-fi: https://ko-fi.com/juricabi\n";
   size_t n = strlen(buf);
   CHECK(n > sizeof links && strcmp(buf + n - (sizeof links - 1), links) == 0 && buf[n - sizeof links] == '\n');
   /* --version: the first line is what install.sh and release.yml read */

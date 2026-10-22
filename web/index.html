@@ -139,6 +139,9 @@ footer.wrap {
   text-decoration: underline; text-decoration-color: var(--line-2); text-underline-offset: 3px;
 }
 .links a:hover { color: var(--fg); text-decoration-color: currentColor; }
+/* a link inside a sentence ("Made by juricabi"): room for the focus ring (2px + 2px out), which would
+   otherwise reach past the space and cut into the word before it */
+.links span > a { margin-left: 3px; }
 
 @media (max-width: 560px) {
   .wrap { padding: 0 10px; }

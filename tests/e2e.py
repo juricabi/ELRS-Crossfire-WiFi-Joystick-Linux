@@ -218,8 +218,9 @@ def case_version_help_rates():
     code, out, err = run_simple(["--version"])
     check(code == 0, "--version exit %d" % code)
     want = open(os.path.join(ROOT, "VERSION")).read().strip()
-    # line 1 is what install.sh and release.yml read; then the project and Ko-fi
-    links = "https://github.com/juricabi/ELRS-Crossfire-WiFi-Joystick-Linux - Ko-fi: https://ko-fi.com/juricabi"
+    # line 1 is what install.sh and release.yml read; then the project, the author's GitHub profile and Ko-fi
+    links = ("https://github.com/juricabi/ELRS-Crossfire-WiFi-Joystick-Linux"
+             " - by juricabi: https://github.com/juricabi - Ko-fi: https://ko-fi.com/juricabi")
     check(out == "elrs-wifi-joystick %s\n%s\n" % (want, links), "--version printed %r" % out)
     code, out, _ = run_simple(["-V"])
     check(code == 0 and out.splitlines()[0] == "elrs-wifi-joystick " + want, "-V")

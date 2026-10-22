@@ -907,6 +907,16 @@ def t_footer(br, h):
         assert p.evaluate("document.activeElement.href") == u, (t, p.evaluate("document.activeElement.outerHTML"))
         ring = p.evaluate("() => { const s = getComputedStyle(document.activeElement); return [s.outlineStyle, s.outlineWidth]; }")
         assert ring == ["solid", "2px"], (t, ring)
+        # a link inside a sentence ("Made by juricabi"): the ring stays clear of the text before it
+        clear = p.evaluate("""() => {
+            const a = document.activeElement, t = a.previousSibling, s = getComputedStyle(a);
+            const n = t && t.nodeType === Node.TEXT_NODE ? t.textContent.trimEnd().length : 0;
+            if (!n) return null;
+            const r = document.createRange();
+            r.setStart(t, n - 1); r.setEnd(t, n);
+            return a.getBoundingClientRect().left - parseFloat(s.outlineOffset) - parseFloat(s.outlineWidth)
+                   - r.getBoundingClientRect().right; }""")
+        assert clear is None or clear >= 1.5, (t, clear)
     # nothing came from anywhere else so far (no image, font or script of GitHub or Ko-fi)
     p.wait_for_timeout(500)
     assert not outside, outside

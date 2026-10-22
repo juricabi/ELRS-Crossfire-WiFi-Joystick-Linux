@@ -1,0 +1,107 @@
+# Web API
+
+The program serves its page and this JSON API on `http://127.0.0.1:11000/` by default (`--web`).
+Every response has `Cache-Control: no-store` and `Connection: close`; JSON responses are
+`application/json; charset=utf-8`. Numbers are plain JSON numbers; strings are UTF-8 with control
+characters escaped.
+
+## Security (every request)
+
+| check | failure |
+|---|---|
+| `Host` is `localhost`, `127.0.0.1`, `[::1]` or an IPv4 literal, with an optional `:port` | 403 `{"ok":false,"error":"host not allowed"}` |
+| `Origin`, when present (and not `null`), is `http://<the same host:port as Host>` | 403 `{"ok":false,"error":"origin not allowed"}` |
+| POST has `Content-Type: application/json` (parameters like `; charset=utf-8` allowed) | 415 `{"ok":false,"error":"use Content-Type: application/json"}` |
+| request head ≤ 8 KiB, body ≤ 4 KiB, `Content-Length` given for a POST with a body | 413 / 411 / 400 |
+| method allowed for the path | 405 with `Allow` |
+
+No `Access-Control-*` headers are ever sent. Chunked request bodies are refused (411).
+
+## `GET /`
+
+The page (`text/html; charset=utf-8`). `GET /index.html` is the same. `HEAD` is accepted for both.
+
+## `GET /api/status`
+
+```json
+{
+  "version": "1.0.0",
+  "seq": 1234,
+  "uptime_s": 12.5,
+  "running": true,
+  "listening": true,
+  "state": "streaming",
+  "status": "streaming",
+  "detail": "192.168.1.50",
+  "module": { "ip": "192.168.1.50", "kind": "ELRS", "name": "Unified TX" },
+  "rate_hz": 249.8,
+  "jitter_ms": 0.42,
+  "frames_last_s": 250,
+  "nch": 16,
+  "raw": [16393, 16393, 19, 16393, 0, 0, 0, 0, 32767, 0, 0, 0, 0, 0, 0, 0],
+  "request": { "interval_us": 4000, "rate_hz": 250, "channels": 16 },
+  "config": { "module_ip": "", "port": 11000, "http_port": 80, "interval_us": 4000, "channels": 16 },
+  "counters": { "frames": 3120, "rx": 3125, "beacons": 2, "malformed": 0, "dropped_filter": 0,
+                "dropped_other": 0, "posts": 1, "posts_ok": 1, "posts_failed": 0, "restarts": 0,
+                "gaps": 0, "gap_max_ms": 0 },
+  "joystick": { "enabled": true, "ok": true, "name": "ELRS Crossfire WiFi Joystick",
+                "device": "/dev/input/event7", "buttons": true, "error": "" },
+  "log_seq": 42
+}
+```
+
+- `state`: `stopped` | `searching` | `streaming` | `error` (wifi_proto). `status`: the one-line text of
+  `engine.h` (`eng_snapshot_t.status`). `module`: `null` when not locked; `kind`: `ELRS` | `Crossfire` |
+  `WiFi` (not identified by a beacon yet); `name`: the ELRS device name or `""`.
+- `raw`: always 16 numbers (0 beyond `nch`). `nch` 0 = no frame yet.
+- `rate_hz` / `jitter_ms`: one decimal / two decimals. `request.rate_hz` = round(1e6 / interval_us).
+
+## `GET /api/config`
+
+```json
+{
+  "config": { "module_ip": "", "port": 11000, "http_port": 80, "interval_us": 4000, "channels": 16 },
+  "defaults": { "module_ip": "", "port": 11000, "http_port": 80, "interval_us": 4000, "channels": 16 },
+  "supported": {
+    "interval_us": { "min": 1000, "max": 100000,
+                     "presets": [ { "interval_us": 1000, "rate_hz": 1000 }, { "interval_us": 2000, "rate_hz": 500 },
+                                  { "interval_us": 3000, "rate_hz": 333 }, { "interval_us": 4000, "rate_hz": 250 },
+                                  { "interval_us": 5000, "rate_hz": 200 }, { "interval_us": 6667, "rate_hz": 150 },
+                                  { "interval_us": 10000, "rate_hz": 100 }, { "interval_us": 20000, "rate_hz": 50 } ] },
+    "channels": { "min": 4, "max": 16 },
+    "port": { "min": 1, "max": 65535 },
+    "http_port": { "min": 1, "max": 65535 }
+  },
+  "crossfire": { "channels": 16, "rate_hz": 90, "note": "Crossfire ignores the rate and channel count" }
+}
+```
+
+## `POST /api/config`
+
+Body: a JSON object with any of `module_ip` (string), `port`, `http_port`, `interval_us`, `channels`
+(integers); missing keys keep their current value. Applied live (see `eng_set_config`) and saved to
+the settings file.
+
+- 200 `{"ok":true,"config":{...},"warning":""}` (`warning`: e.g. the settings file could not be written).
+- 400 `{"ok":false,"error":"channels: 3 is not supported - use 4 to 16"}` for an unsupported value,
+  `{"ok":false,"error":"unknown key \"foo\""}`, `{"ok":false,"error":"channels must be a number"}`,
+  `{"ok":false,"error":"the body must be a JSON object"}`. Nothing changes on any error.
+
+## `POST /api/start`, `POST /api/stop`, `POST /api/restart`
+
+Body ignored (send `{}`). `start`/`stop` listen or not; `restart` re-sends our request to the module
+(`eng_restart_stream`). 200 `{"ok":true}`.
+
+## `GET /api/log?since=N`
+
+```json
+{ "seq": 42, "lines": [ { "seq": 41, "time_ms": 1729590000123, "text": "Listening for joystick data on UDP 11000" } ] }
+```
+
+Lines with `seq > since` (default 0), oldest first, at most 200 (the newest 200 when more). `seq` is the
+newest line's seq (pass it as `since` next time). `time_ms`: wall clock, ms since 1970.
+
+## Errors
+
+Unknown `/api/...` path: 404 `{"ok":false,"error":"not found"}`. Anything else unknown: 404 plain text.
+Malformed request: 400 and the connection closes.

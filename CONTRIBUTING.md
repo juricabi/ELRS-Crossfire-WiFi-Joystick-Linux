@@ -43,8 +43,9 @@ problems with the Raspberry Pi simulator to [sticktime-pi](https://github.com/ju
    [Windows app](https://github.com/juricabi/ELRS-Crossfire-WiFi-Joystick-Windows): the axis order,
    the defaults (250 Hz, 16 channels), CH9-CH16 = buttons 1-8, and the rules for the request
    ([docs/USAGE.md](docs/USAGE.md#the-request-rate-and-channels)). A change there should go into both.
-7. A new option or setting goes into `src/config.c` and [docs/USAGE.md](docs/USAGE.md), and, when the
-   web page shows it, into `web/index.html` and [docs/WEB_API.md](docs/WEB_API.md).
+7. A new option or setting goes into `src/config.c` (and `src/engine.h`/`src/engine.c` for an engine
+   setting) and [docs/USAGE.md](docs/USAGE.md), and, when the web page shows it, into `src/web.c`,
+   `web/index.html` and [docs/WEB_API.md](docs/WEB_API.md).
 8. `packaging/install.sh` carries copies of the udev rule, the modules-load file and the service unit in
    `packaging/`: change both (`tests/test_install.sh` compares them byte for byte).
 

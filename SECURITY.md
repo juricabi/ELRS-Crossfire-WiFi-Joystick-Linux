@@ -35,8 +35,9 @@ these defaults:
 
 ## Supported versions
 
-Fixes go into the latest release; update with `sh install.sh` (see
-[docs/INSTALL.md](docs/INSTALL.md#updating)).
+Fixes go into the latest release. Update by running the install script again the way you installed it:
+`sudo sh install.sh` for the default install, `sh install.sh` (without sudo) only for a `~/.local/bin`
+install (see [docs/INSTALL.md](docs/INSTALL.md#updating)).
 
 ## Reporting a vulnerability
 

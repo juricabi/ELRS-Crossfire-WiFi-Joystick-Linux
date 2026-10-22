@@ -72,6 +72,8 @@ jobs:
     name: build and test
     needs: check
     uses: ./.github/workflows/build.yml
+    with:
+      version: ${{ needs.check.outputs.version }}
     permissions:
       contents: read
 

@@ -1,4 +1,4 @@
-# Every push and pull request (and called by release.yml for a tag):
+# Every push and pull request (and called by release.yml, with the version to release):
 #   native     unit tests with gcc and clang (ASan + UBSan, warnings are errors), then the program
 #              end to end against fake modules (tests/e2e.py)
 #   uinput     the virtual joystick through the kernel: packaging/install.sh sets up /dev/uinput for
@@ -19,6 +19,12 @@ on:
   pull_request:
   workflow_dispatch:
   workflow_call:
+    inputs:
+      version:
+        description: "Build exactly this version (release.yml, checked against VERSION); empty = a dev build"
+        required: false
+        type: string
+        default: ""
 
 permissions:
   contents: read
@@ -156,10 +162,13 @@ jobs:
           "$RUNNER_TEMP/zig/bin/python" -c 'import os, ziglang; print(os.path.dirname(ziglang.__file__))' >> "$GITHUB_PATH"
           sudo apt-get update -qq && sudo apt-get install -y -qq --no-install-recommends qemu-user-static file binutils
       - name: Build
+        env:
+          RELEASE_VERSION: ${{ inputs.version }}
         run: |
-          # a tag builds exactly VERSION (release.yml checks the tag against it); anything else is a dev build
+          # a release builds exactly its version (release.yml checked it against VERSION, for a tag and for a
+          # release run by hand); anything else is a dev build
           v=$(tr -d ' \r\n' < VERSION)
-          case "$GITHUB_REF" in refs/tags/v*) ;; *) v="$v-dev.$(git rev-parse --short HEAD)" ;; esac
+          if [ -n "$RELEASE_VERSION" ]; then v=$RELEASE_VERSION; else v="$v-dev.$(git rev-parse --short HEAD)"; fi
           echo "version $v"
           # the unit tests below build with the same flags: nothing is recompiled or relinked with another version
           { echo "VERSION=$v"; echo "WERROR=1"; } >> "$GITHUB_ENV"

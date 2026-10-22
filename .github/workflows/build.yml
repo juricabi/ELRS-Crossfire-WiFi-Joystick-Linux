@@ -46,7 +46,7 @@ jobs:
       matrix:
         cc: [gcc, clang]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: The sanitizer runtime (clang)
         if: matrix.cc == 'clang'
         run: |
@@ -67,7 +67,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Build (ASan + UBSan)
         run: SAN=1 WERROR=1 ./build.sh native prog
       - name: Load uinput
@@ -147,7 +147,7 @@ jobs:
       CPUS: ${{ matrix.cpus }}
       ARM_ARCH: ${{ matrix.arm }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install zig (checked against ZIG_SHA256) and qemu-user
         run: |
           python3 -m venv "$RUNNER_TEMP/zig"
@@ -204,7 +204,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: actions/setup-python@v5
         with: { python-version: "3.12" }
       - name: Playwright
@@ -223,7 +223,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install zig (checked against ZIG_SHA256)
         run: |
           python3 -m venv "$RUNNER_TEMP/zig"
@@ -254,7 +254,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: actions/setup-python@v5
         with: { python-version: "3.12" }
       - name: Tools

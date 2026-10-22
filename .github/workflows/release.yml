@@ -1,0 +1,142 @@
+# A tag vX.Y.Z: check it against VERSION, run all of build.yml (every test; it builds the six static
+# binaries with exactly that version), then publish the GitHub release:
+#   elrs-wifi-joystick-<version>-linux-<arch>   x86_64 i686 aarch64 armv7 armv6 riscv64
+#   install.sh                                  packaging/install.sh
+#   SHA256SUMS                                  of all of them (install.sh checks downloads against it)
+# A version with a "-" (1.1.0-rc1) is published as a pre-release. Running it again for the same tag
+# replaces the assets and the notes.
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  check:
+    name: the tag matches VERSION
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: v
+        run: |
+          tag=$GITHUB_REF_NAME
+          ver=${tag#v}
+          file=$(tr -d ' \r\n' < VERSION)
+          if ! [[ "$ver" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$ ]]; then
+            echo "::error::the tag $tag is not vX.Y.Z (or vX.Y.Z-suffix)"
+            exit 1
+          fi
+          if [ "$ver" != "$file" ]; then
+            echo "::error::the tag $tag does not match the VERSION file ($file): change one of them"
+            exit 1
+          fi
+          echo "version=$ver" >> "$GITHUB_OUTPUT"
+          echo "release $ver"
+
+  ci:
+    name: build and test
+    needs: check
+    uses: ./.github/workflows/build.yml
+    permissions:
+      contents: read
+
+  publish:
+    name: publish the release
+    needs: [check, ci]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    env:
+      VER: ${{ needs.check.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: elrs-wifi-joystick-linux-*
+          path: artifacts
+      - name: The assets
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq --no-install-recommends qemu-user-static
+          mkdir dist
+          for a in x86_64 i686 aarch64 armv7 armv6 riscv64; do
+            src=artifacts/elrs-wifi-joystick-linux-$a/elrs-wifi-joystick
+            dst=dist/elrs-wifi-joystick-$VER-linux-$a
+            install -m 0755 "$src" "$dst"
+            # every binary says the release's version
+            case $a in
+              x86_64|i686) run="" ;;
+              aarch64) run=qemu-aarch64-static ;;
+              armv7) run="qemu-arm-static -cpu cortex-a7" ;;
+              armv6) run="qemu-arm-static -cpu arm1176" ;;
+              riscv64) run=qemu-riscv64-static ;;
+            esac
+            said=$($run "$dst" --version)
+            echo "$a: $said"
+            [ "$said" = "elrs-wifi-joystick $VER" ] || { echo "::error::$dst says \"$said\""; exit 1; }
+          done
+          install -m 0755 packaging/install.sh dist/install.sh
+          (cd dist && sha256sum -- * > SHA256SUMS)
+          cat dist/SHA256SUMS
+      - name: The notes
+        run: |
+          repo=$GITHUB_REPOSITORY
+          prev=$(git describe --tags --abbrev=0 --match 'v[0-9]*' "v$VER^" 2>/dev/null || true)
+          {
+            echo "Linux joystick from the WiFi stream of an ExpressLRS or TBS Crossfire TX module: one static"
+            echo "binary per architecture, no dependencies."
+            echo
+            echo "### Install or update"
+            echo
+            echo '```sh'
+            echo "curl -fsSLO https://github.com/$repo/releases/download/v$VER/install.sh"
+            echo "sudo sh install.sh --version $VER        # or: sh install.sh --version $VER (this user only)"
+            echo '```'
+            echo
+            echo "While the repository is private, the installer needs a token that can read it, e.g."
+            echo "\`gh release download v$VER -R $repo -p install.sh\` and then"
+            echo "\`GITHUB_TOKEN=\$(gh auth token) sudo --preserve-env=GITHUB_TOKEN sh install.sh --version $VER\`."
+            echo
+            echo "### Files"
+            echo
+            echo "| file | for |"
+            echo "|---|---|"
+            echo "| \`elrs-wifi-joystick-$VER-linux-x86_64\` | PCs, laptops, Steam Deck |"
+            echo "| \`elrs-wifi-joystick-$VER-linux-i686\` | old 32-bit PCs |"
+            echo "| \`elrs-wifi-joystick-$VER-linux-aarch64\` | Raspberry Pi 3/4/5 with a 64-bit OS or kernel, 64-bit ARM boards |"
+            echo "| \`elrs-wifi-joystick-$VER-linux-armv7\` | Raspberry Pi 2/3/4 with a 32-bit OS, 32-bit ARM boards |"
+            echo "| \`elrs-wifi-joystick-$VER-linux-armv6\` | Raspberry Pi 1, Zero, Zero W |"
+            echo "| \`elrs-wifi-joystick-$VER-linux-riscv64\` | RISC-V boards |"
+            echo "| \`install.sh\` | picks the right one, checks it, sets up /dev/uinput access |"
+            echo "| \`SHA256SUMS\` | \`sha256sum -c SHA256SUMS --ignore-missing\` |"
+            echo
+            if [ -n "$prev" ]; then
+              echo "### Changes since $prev"
+              echo
+              git log --no-merges --format='- %s' "$prev..v$VER"
+            fi
+          } > notes.md
+          cat notes.md
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          pre=""
+          case $VER in *-*) pre=--prerelease ;; esac
+          if gh release view "v$VER" > /dev/null 2>&1; then
+            gh release upload "v$VER" dist/* --clobber
+            gh release edit "v$VER" --title "v$VER" --notes-file notes.md $pre
+          else
+            gh release create "v$VER" dist/* --verify-tag --title "v$VER" --notes-file notes.md $pre
+          fi

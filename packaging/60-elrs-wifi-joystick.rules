@@ -1,0 +1,7 @@
+# elrs-wifi-joystick: write access to /dev/uinput, which it needs to create its virtual joystick.
+#   uaccess      the user logged in at this machine's screen gets access at once (an ACL; desktops)
+#   GROUP, MODE  members of the "input" group get it too (SSH logins, a service started at boot)
+#   static_node  the same permissions for /dev/uinput before the uinput module is loaded
+# Access to /dev/uinput lets that user's programs create input devices (joysticks, also keyboards).
+# Installed by packaging/install.sh: https://github.com/juricabi/elrs-crossfire-wifi-joystick-linux
+KERNEL=="uinput", SUBSYSTEM=="misc", TAG+="uaccess", GROUP="input", MODE="0660", OPTIONS+="static_node=uinput"

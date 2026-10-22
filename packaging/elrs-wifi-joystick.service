@@ -1,0 +1,23 @@
+# elrs-wifi-joystick as a systemd user service: it runs while you are logged in (and from boot with
+# "sudo loginctl enable-linger $USER"). Installed by packaging/install.sh --service.
+#   systemctl --user status elrs-wifi-joystick       state and the last log lines
+#   systemctl --user stop|start|restart elrs-wifi-joystick
+#   journalctl --user -u elrs-wifi-joystick -f       the log
+# Settings: the web page (http://127.0.0.1:11000/) or ~/.config/elrs-wifi-joystick/config.
+# https://github.com/juricabi/elrs-crossfire-wifi-joystick-linux
+
+[Unit]
+Description=ELRS / Crossfire WiFi joystick
+Documentation=https://github.com/juricabi/elrs-crossfire-wifi-joystick-linux
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/elrs-wifi-joystick --daemon
+Restart=on-failure
+RestartSec=5
+# 2 = bad options, 3 = already running (started by hand): starting again would not help
+RestartPreventExitStatus=2 3
+NoNewPrivileges=yes
+
+[Install]
+WantedBy=default.target

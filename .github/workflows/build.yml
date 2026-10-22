@@ -1,0 +1,255 @@
+# Every push and pull request (and called by release.yml for a tag):
+#   native     unit tests with gcc and clang (ASan + UBSan, warnings are errors), then the program
+#              end to end against fake modules (tests/e2e.py)
+#   uinput     the virtual joystick through the kernel: packaging/install.sh sets up /dev/uinput for
+#              real (udev rule, modules-load file), tests/uinput_e2e.py reads the joystick as a member
+#              of the input group, then the systemd user service and --uninstall
+#   static     the six static binaries (zig cc, musl): checked with file/readelf, every unit test
+#              under qemu-user on the oldest CPU each one is for; uploaded as artifacts
+#   web        the web page in headless Chromium (Playwright), against the program and the demo
+#   core       core/ (shared with sticktime-pi) compiled and linked for Windows and macOS
+#   scripts    shellcheck, the installer tests (tests/test_install.sh), actionlint, Python syntax
+name: build
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+  workflow_call:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  ZIG_VERSION: 0.15.2
+  # UBSan reports must fail the tests, not just print
+  UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+  ASAN_OPTIONS: detect_leaks=1
+
+jobs:
+  native:
+    name: native tests (${{ matrix.cc }}, ASan + UBSan)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        cc: [gcc, clang]
+    steps:
+      - uses: actions/checkout@v4
+      - name: The sanitizer runtime (clang)
+        if: matrix.cc == 'clang'
+        run: |
+          # -print-file-name answers the bare name when the file is not there
+          if [ ! -f "$(clang -print-file-name=libclang_rt.asan-x86_64.a)" ]; then
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq --no-install-recommends "libclang-rt-$(clang -dumpversion | cut -d. -f1)-dev"
+          fi
+      - name: Unit tests
+        env:
+          CC: ${{ matrix.cc }}
+        run: SAN=1 WERROR=1 ./build.sh native test
+      - name: End to end (the program against fake modules)
+        run: python3 tests/e2e.py
+
+  uinput:
+    name: virtual joystick (uinput, udev rule, user service)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build (ASan + UBSan)
+        run: SAN=1 WERROR=1 ./build.sh native prog
+      - name: Load uinput
+        run: |
+          if ! sudo modprobe uinput; then
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq --no-install-recommends "linux-modules-extra-$(uname -r)"
+            sudo modprobe uinput
+          fi
+          ls -l /dev/uinput
+      - name: packaging/install.sh (as root; the udev rule applied at once)
+        run: |
+          udevadm verify --resolve-names=never packaging/60-elrs-wifi-joystick.rules
+          sudo sh packaging/install.sh --file build/native/elrs-wifi-joystick
+          cmp packaging/60-elrs-wifi-joystick.rules /etc/udev/rules.d/60-elrs-wifi-joystick.rules
+          cmp packaging/elrs-wifi-joystick-uinput.conf /etc/modules-load.d/elrs-wifi-joystick-uinput.conf
+          ls -l /dev/uinput
+          test "$(stat -c '%G %a' /dev/uinput)" = "input 660"
+          # a member of the input group can use it (the runner has no desktop seat for uaccess)
+          sudo usermod -aG input "$(id -un)"
+      - name: uinput end to end (as a member of the input group)
+        # sudo -u: a fresh login of the same user, with the new group
+        run: |
+          sudo -u "$(id -un)" env "PATH=$PATH" "BIN=$PWD/build/native/elrs-wifi-joystick" \
+            "UBSAN_OPTIONS=$UBSAN_OPTIONS" "ASAN_OPTIONS=$ASAN_OPTIONS" python3 tests/uinput_e2e.py --require
+      - name: The systemd user service (install.sh --service), then --uninstall
+        run: |
+          uid=$(id -u)
+          rt=/run/user/$uid
+          # the user's systemd manager, started now and with the input group (no login on a runner)
+          sudo loginctl enable-linger "$(id -un)"
+          sudo systemctl restart "user@$uid.service"
+          for _ in $(seq 100); do [ -S "$rt/bus" ] && break; sleep 0.1; done
+          sudo sh packaging/install.sh --file build/native/elrs-wifi-joystick --service
+          export XDG_RUNTIME_DIR=$rt DBUS_SESSION_BUS_ADDRESS=unix:path=$rt/bus
+          systemd-analyze verify /etc/systemd/user/elrs-wifi-joystick.service    # the unit's syntax
+          systemctl --user is-enabled elrs-wifi-joystick.service
+          for _ in $(seq 100); do curl -fsS http://127.0.0.1:11000/api/status > status.json && break; sleep 0.1; done
+          python3 - <<'PY'
+          import json
+          s = json.load(open("status.json"))
+          print("service:", s["status"], s["joystick"])
+          assert s["running"] and s["listening"], s
+          assert s["joystick"]["ok"] and s["joystick"]["device"].startswith("/dev/input/event"), s["joystick"]
+          PY
+          grep -q 'N: Name="ELRS Crossfire WiFi Joystick"' /proc/bus/input/devices
+          systemctl --user --no-pager status elrs-wifi-joystick.service | tail -n 20 || true
+          sudo sh packaging/install.sh --uninstall
+          if systemctl --user is-active --quiet elrs-wifi-joystick.service; then echo "still running"; exit 1; fi
+          for f in /usr/local/bin/elrs-wifi-joystick /etc/systemd/user/elrs-wifi-joystick.service \
+                   /etc/udev/rules.d/60-elrs-wifi-joystick.rules /etc/modules-load.d/elrs-wifi-joystick-uinput.conf \
+                   /usr/local/share/elrs-wifi-joystick "$HOME/.config/systemd/user/default.target.wants/elrs-wifi-joystick.service"; do
+            if [ -e "$f" ] || [ -L "$f" ]; then echo "left behind: $f"; exit 1; fi
+          done
+
+  static:
+    name: static ${{ matrix.target }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        # file: what file(1) must say; cpus: where the unit tests run ("native", or qemu-user:cpu, the
+        # oldest CPU the target is for); arm: the ARM architecture readelf must report
+        include:
+          - { target: x86_64, file: "ELF 64-bit LSB executable, x86-64", cpus: "native qemu-x86_64-static:qemu64", arm: "" }
+          - { target: i686, file: "ELF 32-bit LSB executable, Intel (80386|i386)", cpus: "native qemu-i386-static:pentium2", arm: "" }
+          - { target: aarch64, file: "ELF 64-bit LSB executable, ARM aarch64", cpus: "qemu-aarch64-static:cortex-a53", arm: "" }
+          - { target: armv7, file: "ELF 32-bit LSB executable, ARM, EABI5", cpus: "qemu-arm-static:cortex-a7 qemu-arm-static:cortex-a9,neon=off,vfp-d32=off", arm: "v7" }
+          - { target: armv6, file: "ELF 32-bit LSB executable, ARM, EABI5", cpus: "qemu-arm-static:arm1176", arm: "v6" }
+          - { target: riscv64, file: "ELF 64-bit LSB executable, UCB RISC-V, RVC, double-float ABI", cpus: "qemu-riscv64-static:rv64", arm: "" }
+    env:
+      TARGET: ${{ matrix.target }}
+      FILE_RE: ${{ matrix.file }}
+      CPUS: ${{ matrix.cpus }}
+      ARM_ARCH: ${{ matrix.arm }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install zig and qemu-user
+        run: |
+          curl -fsSL --retry 5 "https://ziglang.org/download/$ZIG_VERSION/zig-x86_64-linux-$ZIG_VERSION.tar.xz" | tar -xJ -C "$RUNNER_TEMP"
+          echo "$RUNNER_TEMP/zig-x86_64-linux-$ZIG_VERSION" >> "$GITHUB_PATH"
+          sudo apt-get update -qq && sudo apt-get install -y -qq --no-install-recommends qemu-user-static file binutils
+      - name: Build
+        run: |
+          # a tag builds exactly VERSION (release.yml checks the tag against it); anything else is a dev build
+          v=$(tr -d ' \r\n' < VERSION)
+          case "$GITHUB_REF" in refs/tags/v*) ;; *) v="$v-dev.$(git rev-parse --short HEAD)" ;; esac
+          echo "version $v"
+          VERSION=$v WERROR=1 ./build.sh "$TARGET" all
+      - name: Check the binary (static, no interpreter, the right architecture)
+        run: |
+          b=build/$TARGET/elrs-wifi-joystick
+          file "$b"
+          file "$b" | grep -Eq "$FILE_RE.*statically linked"
+          if readelf -lW "$b" | grep -q INTERP; then echo "it asks for a dynamic loader"; exit 1; fi
+          if [ -n "$ARM_ARCH" ]; then
+            readelf -A "$b" | grep -E 'Tag_CPU_arch:|Tag_FP_arch|Tag_Advanced_SIMD|Tag_ABI_VFP_args'
+            readelf -A "$b" | grep -Eq "Tag_CPU_arch: $ARM_ARCH\$"
+            readelf -A "$b" | grep -q 'Tag_ABI_VFP_args: VFP registers'     # hard float, like armhf
+          fi
+          if [ "$TARGET" = aarch64 ]; then
+            # kernels with 16 KiB (Pi 5) or 64 KiB pages load only segments aligned to that
+            readelf -lW "$b" | awk '$1 == "LOAD" { print $NF }' | while read -r a; do
+              [ $((a)) -ge 65536 ] || { echo "LOAD segment aligned to $a"; exit 1; }
+            done
+          fi
+      - name: Unit tests
+        run: |
+          for c in $CPUS; do
+            case $c in native) run="" ;; *) run="${c%%:*} -cpu ${c#*:}" ;; esac
+            echo "::group::unit tests on ${run:-this machine}"
+            RUN="$run" ./build.sh "$TARGET" test
+            echo "::endgroup::"
+          done
+      - uses: actions/upload-artifact@v4
+        with:
+          name: elrs-wifi-joystick-linux-${{ matrix.target }}
+          path: build/${{ matrix.target }}/elrs-wifi-joystick
+          if-no-files-found: error
+          retention-days: 30
+
+  web:
+    name: web page (headless Chromium)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - name: Playwright
+        run: |
+          python -m pip install --quiet playwright==1.64.0    # the version the tests are checked with
+          python -m playwright install --with-deps chromium
+      - name: Build the program
+        run: WERROR=1 ./build.sh native prog
+      - name: The page against the program (fake modules)
+        run: python tests/test_ui.py --real
+      - name: The page against the demo engine
+        run: python tests/test_ui.py --demo
+
+  core:
+    name: core/ on Windows and macOS (zig cc)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install zig
+        run: |
+          curl -fsSL --retry 5 "https://ziglang.org/download/$ZIG_VERSION/zig-x86_64-linux-$ZIG_VERSION.tar.xz" | tar -xJ -C "$RUNNER_TEMP"
+          echo "$RUNNER_TEMP/zig-x86_64-linux-$ZIG_VERSION" >> "$GITHUB_PATH"
+      - name: Compile core/*.c (-Wall -Wextra -Werror), link its tests
+        run: |
+          out=$RUNNER_TEMP/core
+          mkdir -p "$out"
+          for t in x86_64-windows-gnu aarch64-macos x86_64-macos; do
+            echo "== $t"
+            for f in core/*.c; do
+              zig cc -target "$t" -std=gnu99 -Wall -Wextra -Werror -O2 -Icore -c "$f" -o "$out/$(basename "$f" .c)-$t.o"
+            done
+            # the tests too (with build.sh's -Wno-unused-parameter): every symbol they need is there
+            net=""
+            case $t in *windows*) net=-lws2_32 ;; esac
+            zig cc -target "$t" -std=gnu99 -Wall -Wextra -Wno-unused-parameter -Werror -O2 -Icore \
+              -o "$out/test_wifi_proto-$t" core/tests/test_wifi_proto.c core/wifi_proto.c
+            zig cc -target "$t" -std=gnu99 -Wall -Wextra -Wno-unused-parameter -Werror -O2 -Icore \
+              -o "$out/test_wifi_net-$t" core/tests/test_wifi_net.c core/wifi_net.c core/wifi_proto.c $net
+          done
+          file "$out"/test_*
+
+  scripts:
+    name: scripts (shellcheck, installer tests, actionlint)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - name: Tools
+        run: |
+          python -m pip install --quiet shellcheck-py==0.11.0.1 actionlint-py==1.7.12.25
+          sudo apt-get update -qq && sudo apt-get install -y -qq --no-install-recommends busybox-static
+      - name: shellcheck
+        run: shellcheck --version && shellcheck build.sh packaging/install.sh tests/test_install.sh
+      - name: The installer (fake root, fake GitHub; dash, bash --posix, busybox tools)
+        run: BUSYBOX=/bin/busybox sh tests/test_install.sh
+      - name: actionlint
+        run: actionlint -color
+      - name: Python syntax
+        run: python -m py_compile tests/*.py

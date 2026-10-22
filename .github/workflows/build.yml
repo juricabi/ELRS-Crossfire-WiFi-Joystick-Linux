@@ -10,6 +10,8 @@
 #   core       core/ (shared with sticktime-pi) compiled and linked for Windows and macOS
 #   scripts    shellcheck, the installer tests (tests/test_install.sh: sh, dash, bash --posix, busybox ash),
 #              actionlint, Python syntax
+# Downloads (apt-get, pip, Playwright) go through .github/ci/retry (apt-get through .github/ci/apt-install):
+# a mirror that stalls is cut off and tried again, rather than hanging a job until its timeout.
 # zig comes from its PyPI wheel (the Zig project's), checked against the pinned hash ZIG_SHA256.
 name: build
 
@@ -58,8 +60,7 @@ jobs:
         run: |
           # -print-file-name answers the bare name when the file is not there
           if [ ! -f "$(clang -print-file-name=libclang_rt.asan-x86_64.a)" ]; then
-            sudo apt-get update -qq
-            sudo apt-get install -y -qq --no-install-recommends "libclang-rt-$(clang -dumpversion | cut -d. -f1)-dev"
+            sudo .github/ci/apt-install "libclang-rt-$(clang -dumpversion | cut -d. -f1)-dev"
           fi
       - name: Unit tests
         env:
@@ -79,8 +80,7 @@ jobs:
       - name: Load uinput
         run: |
           if ! sudo modprobe uinput; then
-            sudo apt-get update -qq
-            sudo apt-get install -y -qq --no-install-recommends "linux-modules-extra-$(uname -r)"
+            sudo .github/ci/apt-install "linux-modules-extra-$(uname -r)"
             sudo modprobe uinput
           fi
           ls -l /dev/uinput
@@ -158,9 +158,9 @@ jobs:
         run: |
           python3 -m venv "$RUNNER_TEMP/zig"
           printf 'ziglang==%s --hash=sha256:%s\n' "$ZIG_VERSION" "$ZIG_SHA256" > "$RUNNER_TEMP/zig.txt"
-          "$RUNNER_TEMP/zig/bin/pip" install --quiet --no-deps --require-hashes -r "$RUNNER_TEMP/zig.txt"
+          .github/ci/retry 3 180 "$RUNNER_TEMP/zig/bin/pip" install --quiet --timeout 30 --no-deps --require-hashes -r "$RUNNER_TEMP/zig.txt"
           "$RUNNER_TEMP/zig/bin/python" -c 'import os, ziglang; print(os.path.dirname(ziglang.__file__))' >> "$GITHUB_PATH"
-          sudo apt-get update -qq && sudo apt-get install -y -qq --no-install-recommends qemu-user-static file binutils
+          sudo .github/ci/apt-install qemu-user-static file binutils
       - name: Build
         env:
           RELEASE_VERSION: ${{ inputs.version }}
@@ -218,8 +218,8 @@ jobs:
         with: { python-version: "3.12" }
       - name: Playwright
         run: |
-          python -m pip install --quiet playwright==1.64.0    # the version the tests are checked with
-          python -m playwright install --with-deps chromium
+          .github/ci/retry 3 180 python -m pip install --quiet --timeout 30 playwright==1.64.0    # the version the tests are checked with
+          .github/ci/retry 3 600 python -m playwright install --with-deps chromium
       - name: Build the program
         run: WERROR=1 ./build.sh native prog
       - name: The page against the program (fake modules)
@@ -237,7 +237,7 @@ jobs:
         run: |
           python3 -m venv "$RUNNER_TEMP/zig"
           printf 'ziglang==%s --hash=sha256:%s\n' "$ZIG_VERSION" "$ZIG_SHA256" > "$RUNNER_TEMP/zig.txt"
-          "$RUNNER_TEMP/zig/bin/pip" install --quiet --no-deps --require-hashes -r "$RUNNER_TEMP/zig.txt"
+          .github/ci/retry 3 180 "$RUNNER_TEMP/zig/bin/pip" install --quiet --timeout 30 --no-deps --require-hashes -r "$RUNNER_TEMP/zig.txt"
           "$RUNNER_TEMP/zig/bin/python" -c 'import os, ziglang; print(os.path.dirname(ziglang.__file__))' >> "$GITHUB_PATH"
       - name: Compile core/*.c (-Wall -Wextra -Werror), link its tests
         run: |
@@ -268,12 +268,12 @@ jobs:
         with: { python-version: "3.12" }
       - name: Tools
         run: |
-          python -m pip install --quiet shellcheck-py==0.11.0.1 actionlint-py==1.7.12.25
+          .github/ci/retry 3 180 python -m pip install --quiet --timeout 30 shellcheck-py==0.11.0.1 actionlint-py==1.7.12.25
           # busybox (not busybox-static): its sh runs the tools on PATH (the fakes), so busybox ash gets the
           # whole installer suite, not only the smoke test of a busybox built with standalone applets
-          sudo apt-get update -qq && sudo apt-get install -y -qq --no-install-recommends busybox
+          sudo .github/ci/apt-install busybox
       - name: shellcheck
-        run: shellcheck --version && shellcheck build.sh packaging/install.sh tests/test_install.sh
+        run: shellcheck --version && shellcheck build.sh packaging/install.sh tests/test_install.sh .github/ci/retry .github/ci/apt-install
       - name: The installer (fake root, fake GitHub; sh, dash, bash --posix, busybox ash, busybox tools)
         run: |
           out=$(BUSYBOX=/usr/bin/busybox sh tests/test_install.sh) || { printf '%s\n' "$out"; exit 1; }

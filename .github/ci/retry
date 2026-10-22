@@ -1,0 +1,33 @@
+#!/bin/sh
+# retry TRIES SECONDS COMMAND [ARG...]
+#
+# The CI jobs' downloads (apt-get, pip, Playwright) go through this. A mirror that stalls would leave a
+# quiet download hanging until the job's timeout; here each try is cut off after SECONDS (TERM, then KILL
+# 10 s later) and a stalled or failed try runs again 10 s later, TRIES tries in all. Each try is logged, so
+# the log says which download stalled. For a root command run this under sudo (sudo .github/ci/retry ...),
+# so that the time limit reaches the command itself.
+set -u
+if [ $# -lt 3 ]; then echo "usage: retry TRIES SECONDS COMMAND [ARG...]" >&2; exit 2; fi
+tries=$1
+secs=$2
+shift 2
+n=1
+while :; do
+  start=$(date +%s)
+  echo "[try $n of $tries, at most ${secs} s] $*"
+  timeout -k 10 "$secs" "$@"
+  rc=$?
+  [ "$rc" -eq 0 ] && exit 0
+  took=$(($(date +%s) - start))
+  case $rc in
+    124|137) why="stalled: cut off after $took s" ;;
+    *) why="failed (exit $rc) after $took s" ;;
+  esac
+  if [ "$n" -ge "$tries" ]; then
+    echo "::error::$1 $why, try $n of $tries: giving up"
+    exit "$rc"
+  fi
+  echo "::warning::$1 $why, try $n of $tries: once more in 10 s"
+  n=$((n + 1))
+  sleep 10
+done

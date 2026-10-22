@@ -83,7 +83,9 @@ GitHub Actions (`.github/workflows/build.yml`) runs all of it on every push and 
 | scripts | shellcheck, the installer tests (sh, dash, bash --posix and busybox ash, each the full suite), actionlint, Python syntax |
 
 zig comes from its PyPI wheel, installed with `pip --require-hashes` against `ZIG_SHA256` in build.yml
-(update it together with `ZIG_VERSION`).
+(update it together with `ZIG_VERSION`). Every download in the jobs (apt-get, pip, Playwright) goes through
+`.github/ci/retry` (apt-get through `.github/ci/apt-install`): a try that stalls is cut off and run again,
+3 tries, so a stalled mirror costs minutes, not the job; the log says which download stalled.
 
 ## Releases
 

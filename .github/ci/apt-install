@@ -1,0 +1,15 @@
+#!/bin/sh
+# apt-install PACKAGE...   (run with sudo)
+#
+# apt-get update and install for the CI jobs. The downloads go through retry: a stalled mirror is cut off
+# and tried again (stalled connections also give up after 30 s inside apt). dpkg then installs from the
+# downloaded files, so a try is never cut off halfway through an install.
+set -eu
+retry=$(dirname "$0")/retry
+opts="-o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 -qq"
+# shellcheck disable=SC2086  # $opts: options without spaces, one word each
+"$retry" 3 120 apt-get $opts update
+# shellcheck disable=SC2086
+"$retry" 3 180 apt-get $opts -y --no-install-recommends install --download-only "$@"
+# shellcheck disable=SC2086
+apt-get $opts -y --no-install-recommends install "$@"

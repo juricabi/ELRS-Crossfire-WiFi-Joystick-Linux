@@ -146,6 +146,7 @@ void wifi_proto_reset(wifi_proto_t *p) {
   p->restart_ip = 0;
   p->nrestarted = 0;
   p->xf_noted = false;
+  p->restart_wait = false;
 }
 
 static void mark_activated(wifi_proto_t *p, uint32_t ip, int64_t now) {
@@ -183,6 +184,24 @@ static void send_restart(wifi_proto_t *p, uint32_t ip, int64_t now) {
   if (r == WIFI_ACT_OK) mark_activated(p, ip, now);
 }
 
+static void note_xf_ignores(wifi_proto_t *p) {
+  if (p->xf_noted) return;
+  char s[16];
+  wifi_ip_str(p->bound_ip, s);
+  plog(p, "Crossfire module %s ignores the rate and channel count: it always sends %d channels at about 90 Hz",
+       s, WIFI_XF_CHANNELS);
+  p->xf_noted = true;
+}
+
+/* Locked, no beacon from it this session yet, 16 channels: it may be Crossfire, which is never sent a
+ * joystick_end (e.g. a Crossfire module still streaming when the host started, relocked by its frames).
+ * Crossfire beacons about every 8 s also while streaming, ELRS never while streaming, so after
+ * WIFI_XF_BEACON_US of lock without one it is ELRS. */
+static bool kind_unsure(const wifi_proto_t *p, int64_t now) {
+  return p->bound && wifi_proto_kind(p, p->bound_ip) == WIFI_KIND_UNKNOWN && p->nch == WIFI_XF_CHANNELS &&
+         now - p->bound_since_us < WIFI_XF_BEACON_US;
+}
+
 bool wifi_proto_restart(wifi_proto_t *p, int64_t now) {
   uint32_t ip = p->bound ? p->bound_ip : p->target;
   char s[16];
@@ -195,6 +214,14 @@ bool wifi_proto_restart(wifi_proto_t *p, int64_t now) {
     plog(p, "Crossfire module %s always sends %d channels at its own rate (about 90 Hz) - nothing to restart",
          s, WIFI_XF_CHANNELS);
     return false;
+  }
+  if (p->bound && ip == p->bound_ip && kind_unsure(p, now)) {
+    if (!p->restart_wait)
+      plog(p, "%s may be Crossfire (no beacon from it yet), which is never sent joystick_end: restarting its stream "
+              "within %d s unless its beacon says Crossfire", s,
+           (int)((p->bound_since_us + WIFI_XF_BEACON_US - now + 999999) / 1000000));
+    p->restart_wait = true;            /* decided on tick */
+    return true;
   }
   plog(p, "Restarting the stream of %s: %d Hz, %d channels", s, wifi_interval_hz(p->interval_us), p->channels);
   /* frames of the old request keep coming until the module has the restart: no mismatch restart then */
@@ -211,17 +238,16 @@ bool wifi_proto_set_request(wifi_proto_t *p, int interval_us, int channels, int6
   p->channels = channels;
   if (!p->bound) return true;          /* the next joystick_begin asks for them */
   if (wifi_proto_kind(p, p->bound_ip) == WIFI_KIND_XF) {
-    if (!p->xf_noted) {
-      char s[16];
-      wifi_ip_str(p->bound_ip, s);
-      plog(p, "Crossfire module %s ignores the rate and channel count: it always sends %d channels at about 90 Hz",
-           s, WIFI_XF_CHANNELS);
-      p->xf_noted = true;
-    }
+    note_xf_ignores(p);
     return true;
   }
-  wifi_proto_restart(p, now);
+  wifi_proto_restart(p, now);          /* may wait for the kind (kind_unsure) */
   return true;
+}
+
+void wifi_proto_store_request(wifi_proto_t *p, int interval_us, int channels) {
+  p->interval_us = wifi_clamp_interval(interval_us);
+  p->channels = wifi_clamp_channels(channels);
 }
 
 void wifi_proto_activation_done(wifi_proto_t *p, uint32_t ip, bool ok, int64_t now) {
@@ -255,6 +281,11 @@ void wifi_proto_tick(wifi_proto_t *p, int64_t now) {
     wifi_proto_set_state(p, WIFI_ST_SEARCHING, "activated, but no data (radio off? another client?)");
   }
   if (p->restart_ip) send_restart(p, p->restart_ip, now);
+  if (p->restart_wait && (!p->bound || !kind_unsure(p, now))) {
+    p->restart_wait = false;           /* lost the lock: the next joystick_begin asks for the request */
+    if (p->bound && wifi_proto_kind(p, p->bound_ip) == WIFI_KIND_XF) note_xf_ignores(p);
+    else if (p->bound) wifi_proto_restart(p, now);
+  }
   if (p->target && !p->bound) wifi_proto_ensure(p, p->target, now);
 }
 
@@ -361,6 +392,8 @@ void wifi_proto_packet(wifi_proto_t *p, const uint8_t *d, size_t n, uint32_t src
     p->nwarned = p->nnostick = 0;
     p->first_act_set = false;
     p->hint_shown = false;
+    p->bound_since_us = now;
+    p->restart_wait = false;
     plog(p, "Joystick source locked to %s", ip);
     wifi_proto_set_state(p, WIFI_ST_STREAMING, ip);
   }

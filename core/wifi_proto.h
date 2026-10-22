@@ -48,6 +48,8 @@
 #define WIFI_INTERVAL_DEFAULT    4000       /* 250 Hz */
 #define WIFI_CHANNELS_DEFAULT    16
 #define WIFI_XF_CHANNELS         16         /* Crossfire always sends 16 */
+#define WIFI_XF_BEACON_US        20000000   /* Crossfire beacons about every 8 s, also while streaming: 20 s
+                                               without one (two lost) means it is not Crossfire */
 /* the rates a UI offers, as intervals in us: 1000, 500, 333, 250, 200, 150, 100 and 50 Hz */
 #define WIFI_INTERVAL_PRESETS    { 1000, 2000, 3000, 4000, 5000, 6667, 10000, 20000 }
 #define WIFI_N_INTERVAL_PRESETS  8
@@ -107,6 +109,8 @@ typedef struct {
   uint32_t restart_ip;                                 /* a restart the host was too busy for: retried on tick */
   uint32_t restarted[WIFI_TABLE]; int nrestarted;      /* modules restarted for a channel mismatch (once each) */
   bool xf_noted;                                       /* "Crossfire ignores the request" logged */
+  int64_t bound_since_us;                              /* when the lock was taken */
+  bool restart_wait;                                   /* a request restart waiting to know it is no Crossfire */
   uint32_t restarts;                                   /* restarts sent (lifetime counter) */
 } wifi_proto_t;
 
@@ -126,9 +130,16 @@ void wifi_proto_ensure(wifi_proto_t *p, uint32_t ip, int64_t now_us);
  * not Crossfire, its stream is restarted so they apply (wifi_proto_restart); locked to Crossfire, that is
  * logged once per session. Returns true when the clamped values differ from the old ones. */
 bool wifi_proto_set_request(wifi_proto_t *p, int interval_us, int channels, int64_t now_us);
+/* Only store the request (clamped), restarting nothing: for a host that changes the target and the
+ * request together. Call it, then wifi_proto_set_target: the new target's joystick_begin asks for it,
+ * and the module being left is not restarted for nothing. */
+void wifi_proto_store_request(wifi_proto_t *p, int interval_us, int channels);
 /* Restart the stream of the locked module, else of the target, so it uses the request now
  * (joystick_end, then joystick_begin; no throttle). Crossfire: logged, nothing sent. Returns false when
- * there is no module or it is Crossfire. When the host is busy, it is retried on every tick.
+ * there is no module or it is Crossfire. When the host is busy, it is retried on every tick. A locked
+ * module that might be Crossfire (16 channels and no beacon yet this session) is restarted only once
+ * WIFI_XF_BEACON_US of lock passed without a Crossfire beacon (decided on tick; dropped when its beacon
+ * says Crossfire or the lock is lost).
  * Also sent by itself, once per module and session, when a module that is surely not Crossfire (ELRS by
  * its beacon, or a channel count other than 16) streams a channel count other than the request. */
 bool wifi_proto_restart(wifi_proto_t *p, int64_t now_us);

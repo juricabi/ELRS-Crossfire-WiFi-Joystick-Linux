@@ -695,7 +695,13 @@ static void apply_config(engine_t *e, const eng_config_t *n, int64_t now) {
   if (n->interval_us != old.interval_us || n->channels != old.channels) {
     eng_log(e, "Asking for %d Hz (%d us) and %d channels", wifi_interval_hz(n->interval_us), n->interval_us,
             n->channels);
-    wifi_proto_set_request(&e->p, n->interval_us, n->channels, now);
+    /* a new module IP while locked to another module: that one is being left, so it is not restarted for
+     * nothing; the new target's joystick_begin (apply_target, below) asks for the request */
+    uint32_t nip = 0;
+    bool leaving = strcmp(n->module_ip, old.module_ip) && e->running && e->p.bound &&
+                   wifi_parse_ip(n->module_ip, &nip) == 1 && nip && nip != e->p.bound_ip;
+    if (leaving) wifi_proto_store_request(&e->p, n->interval_us, n->channels);
+    else wifi_proto_set_request(&e->p, n->interval_us, n->channels, now);
   }
   if (strcmp(n->module_ip, old.module_ip)) apply_target(e, now);
   if (n->http_port != old.http_port) eng_log(e, "The module's web server port is %u now", n->http_port);

@@ -1645,8 +1645,93 @@ static void Request_ChangeWhileStreamingUnknown_Restarts(void) {
   CHECK(P.bound);
   CHECK_INT(nrestarts, 0);
   wifi_proto_set_request(&P, 10000, 16, now_us);
+  CHECK_INT(nrestarts, 0);                           /* may be Crossfire: wait for its beacon */
+  CHECK_INT(count_logs("may be Crossfire (no beacon from it yet)"), 1);
+  CHECK_INT(count_logs("within 20 s"), 1);
+  for (int i = 0; i < 19; i++) { now_us += 1000000; send_same(DEF_IP, 16, 16000); wifi_proto_tick(&P, now_us); }
+  CHECK_INT(nrestarts, 0);
+  now_us += 1000000;
+  send_same(DEF_IP, 16, 16000);
+  wifi_proto_tick(&P, now_us);                       /* 20 s of lock without a Crossfire beacon: ELRS */
   CHECK_INT(nrestarts, 1);
   CHECK_INT(restarts[0].interval_us, 10000);
+  wifi_proto_tick(&P, now_us + 1000);
+  CHECK_INT(nrestarts, 1);
+}
+
+static void Request_ChangeWhileStreamingUnknown_CrossfireBeacon_NoRestart(void) {
+  H();
+  send_same(DEF_IP, 16, 16000);
+  wifi_proto_set_request(&P, 10000, 16, now_us);
+  now_us += 3000000;
+  send_same(DEF_IP, 16, 16000);
+  str("VELOCIDRONE", DEF_IP);
+  wifi_proto_tick(&P, now_us);
+  for (int i = 0; i < 12; i++) { now_us += 1000000; send_same(DEF_IP, 16, 16000); wifi_proto_tick(&P, now_us); }
+  CHECK_INT(nrestarts, 0);                           /* never a joystick_end to Crossfire */
+  CHECK(P.bound);
+}
+
+static void Restart_ExplicitUnknown16_WaitsForTheKind(void) {
+  H();
+  send_same(DEF_IP, 16, 16000);
+  adv(5.0);
+  send_same(DEF_IP, 16, 16000);
+  CHECK(wifi_proto_restart(&P, now_us));             /* accepted, but held */
+  CHECK_INT(nrestarts, 0);
+  CHECK_INT(count_logs("within 15 s"), 1);
+  wifi_proto_restart(&P, now_us);                    /* asked again: logged once */
+  CHECK_INT(count_logs("may be Crossfire"), 1);
+  adv(15.0);
+  send_same(DEF_IP, 16, 16000);
+  tick();
+  CHECK_INT(nrestarts, 1);
+  /* after the window, an explicit restart goes out at once */
+  CHECK(wifi_proto_restart(&P, now_us));
+  CHECK_INT(nrestarts, 2);
+}
+
+static void Restart_Wait_DroppedWhenTheLockIsLost(void) {
+  H();
+  send_same(DEF_IP, 16, 16000);
+  wifi_proto_set_request(&P, 2000, 16, now_us);
+  CHECK(P.restart_wait);
+  adv(3.1);
+  tick();                                            /* lock released */
+  CHECK(!P.bound && !P.restart_wait);
+  adv(30.0);
+  tick();
+  CHECK_INT(nrestarts, 0);
+  /* a new lock (another module) starts clean */
+  send_same("192.168.1.51", 16, 100);
+  CHECK(!P.restart_wait);
+}
+
+static void Request_Store_NoRestart(void) {
+  H();
+  str("ELRS", DEF_IP);
+  send_same(DEF_IP, 16, 16000);
+  CHECK(P.bound);
+  wifi_proto_store_request(&P, 0, 99);               /* clamped, nothing sent */
+  CHECK_INT(P.interval_us, 1000);
+  CHECK_INT(P.channels, 16);
+  CHECK_INT(nrestarts, 0);
+  wifi_proto_store_request(&P, 2000, 8);
+  CHECK_INT(nrestarts, 0);
+  /* the host changes the target next: the new module's joystick_begin asks for the stored request */
+  CHECK_INT(wifi_proto_set_target(&P, "10.0.0.7", now_us), 0);
+  CHECK(last_act.ip == IP("10.0.0.7") && !last_act.restart);
+  CHECK_INT(last_act.interval_us, 2000);
+  CHECK_INT(last_act.channels, 8);
+  CHECK_INT(nrestarts, 0);
+}
+
+static void Request_ChangeWhileStreamingUnknown_Not16_RestartsAtOnce(void) {
+  H();
+  wifi_proto_set_request(&P, 4000, 8, now_us);
+  send_same(DEF_IP, 8, 16000);                       /* 8 channels: surely no Crossfire */
+  wifi_proto_set_request(&P, 10000, 8, now_us);
+  CHECK_INT(nrestarts, 1);
 }
 
 static void Restart_Explicit(void) {
@@ -1660,7 +1745,8 @@ static void Restart_Explicit(void) {
   CHECK(wifi_proto_restart(&P, now_us));
   CHECK_INT(nrestarts, 1);
   CHECK(restarts[0].ip == IP("10.0.0.1"));
-  /* the locked module wins over the target */
+  /* the locked module wins over the target (ELRS by its beacon: no wait for the kind) */
+  str("ELRS", "10.0.0.1");
   send_same("10.0.0.1", 16, 100);
   CHECK(wifi_proto_restart(&P, now_us));
   CHECK_INT(count_restarts(IP("10.0.0.1")), 2);
@@ -1686,6 +1772,7 @@ static void Restart_BypassesAndRestartsTheThrottle(void) {
 
 static void Restart_Busy_RetriedOnTick(void) {
   H();
+  str("ELRS", DEF_IP);                               /* ELRS: no wait for the kind */
   send_same(DEF_IP, 16, 100);
   restart_result = WIFI_ACT_BUSY;
   CHECK(wifi_proto_restart(&P, now_us));
@@ -1941,6 +2028,11 @@ int main(void) {
   Request_ChangeWhileStreamingElrs_RestartsIt();
   Request_ChangeWhileStreamingCrossfire_NoRestart_LoggedOnce();
   Request_ChangeWhileStreamingUnknown_Restarts();
+  Request_ChangeWhileStreamingUnknown_CrossfireBeacon_NoRestart();
+  Request_ChangeWhileStreamingUnknown_Not16_RestartsAtOnce();
+  Restart_ExplicitUnknown16_WaitsForTheKind();
+  Restart_Wait_DroppedWhenTheLockIsLost();
+  Request_Store_NoRestart();
   Restart_Explicit();
   Restart_BypassesAndRestartsTheThrottle();
   Restart_Busy_RetriedOnTick();

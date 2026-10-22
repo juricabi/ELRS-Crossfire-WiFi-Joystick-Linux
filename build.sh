@@ -14,6 +14,7 @@
 #   SAN      1: native build with AddressSanitizer + UBSan (tests)
 #   VERSION  the version compiled in (default: the VERSION file)
 #   RUN      prefix for running cross-built tests (e.g. qemu-aarch64-static); "" = run directly
+#   BUILD    output directory (default build): build/<target>/elrs-wifi-joystick, build/<target>/test_*
 set -e
 HERE=$(cd "$(dirname "$0")" && pwd)
 cd "$HERE"
@@ -51,7 +52,7 @@ else
   LDSTATIC="-static -s"
 fi
 
-OUT="build/$TARGET"
+OUT="${BUILD:-build}/$TARGET"
 mkdir -p "$OUT/obj/core" "$OUT/obj/src" "$OUT/obj/tests" "$OUT/gen"
 if [ "$WHAT" = clean ]; then rm -rf "$OUT"; echo "removed $OUT"; exit 0; fi
 

@@ -96,7 +96,9 @@ check fails the release when the repository's visibility cannot be read; a priva
 gets a warning that it was skipped.
 
 1. Set the new version in `VERSION`, commit it and push.
-2. Tag that commit and push the tag: `git tag v1.1.0 && git push origin v1.1.0`.
+2. Tag that commit and push the tag: `git tag v1.1.0 && git push origin v1.1.0`. Or, without a
+   command line: Actions > release > Run workflow on `main`, with the version (`1.1.0`); the release then
+   makes the tag on that commit (refused when the tag exists on another commit).
 
 Do not run the release again for a published version: running it for the same tag replaces the assets
 in place, and an install during the swap can fail. Fix it with a new patch version instead (`1.1.1`).

@@ -3,6 +3,8 @@
 #   elrs-wifi-joystick-<version>-linux-<arch>   x86_64 i686 aarch64 armv7 armv6 riscv64
 #   install.sh                                  packaging/install.sh
 #   SHA256SUMS                                  of all of them (install.sh checks downloads against it)
+# Or by hand: Actions > release > Run workflow, on the branch to release (main), with the version: the
+# same checks and builds, and the release makes the tag vX.Y.Z on that commit.
 # A version with a "-" (1.1.0-rc1) is published as a pre-release. Running it again for the same tag
 # replaces the assets and the notes: only for a release nobody installs yet. A public release is not
 # run again (an install during the swap could fail): tag a new patch version instead.
@@ -11,6 +13,12 @@ name: release
 on:
   push:
     tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to release, X.Y.Z (must match the VERSION file); the tag vX.Y.Z is made on this commit"
+        required: true
+        type: string
 
 permissions:
   contents: read
@@ -29,9 +37,16 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - id: v
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
         run: |
-          tag=$GITHUB_REF_NAME
-          ver=${tag#v}
+          if [ "$GITHUB_EVENT_NAME" = workflow_dispatch ]; then
+            ver=${INPUT_VERSION#v}
+            tag=v$ver
+          else
+            tag=$GITHUB_REF_NAME
+            ver=${tag#v}
+          fi
           file=$(tr -d ' \r\n' < VERSION)
           if ! [[ "$ver" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$ ]]; then
             echo "::error::the tag $tag is not vX.Y.Z (or vX.Y.Z-suffix)"
@@ -40,6 +55,15 @@ jobs:
           if [ "$ver" != "$file" ]; then
             echo "::error::the tag $tag does not match the VERSION file ($file): change one of them"
             exit 1
+          fi
+          if [ "$GITHUB_EVENT_NAME" = workflow_dispatch ]; then
+            # by hand: the tag must not exist yet, or already be this commit (a run again)
+            # the commit it points at: an annotated tag's peeled line (refs/tags/vX^{}) sorts first in reverse
+            at=$(git ls-remote --tags origin "refs/tags/$tag" "refs/tags/$tag^{}" | sort -r -k2 | awk 'NR==1 {print $1}')
+            if [ -n "$at" ] && [ "$at" != "$GITHUB_SHA" ]; then
+              echo "::error::the tag $tag exists already on another commit ($at): release a new version"
+              exit 1
+            fi
           fi
           echo "version=$ver" >> "$GITHUB_OUTPUT"
           echo "release $ver"
@@ -94,7 +118,9 @@ jobs:
       - name: The notes
         run: |
           repo=$GITHUB_REPOSITORY
-          prev=$(git describe --tags --abbrev=0 --match 'v[0-9]*' "v$VER^" 2>/dev/null || true)
+          # the release's commit: its tag, or (run by hand, the tag not made yet) this commit
+          if git rev-parse -q --verify "refs/tags/v$VER" > /dev/null; then ref="v$VER"; else ref=$GITHUB_SHA; fi
+          prev=$(git describe --tags --abbrev=0 --match 'v[0-9]*' "$ref^" 2>/dev/null || true)
           {
             echo "Linux joystick from the WiFi stream of an ExpressLRS or TBS Crossfire TX module: one static"
             echo "binary per architecture, no dependencies."
@@ -122,7 +148,7 @@ jobs:
             if [ -n "$prev" ]; then
               echo "### Changes since $prev"
               echo
-              git log --no-merges --format='- %s' "$prev..v$VER"
+              git log --no-merges --format='- %s' "$prev..$ref"
             fi
           } > notes.md
           cat notes.md
@@ -135,8 +161,11 @@ jobs:
           if gh release view "v$VER" > /dev/null 2>&1; then
             gh release upload "v$VER" dist/* --clobber
             gh release edit "v$VER" --title "v$VER" --notes-file notes.md $pre
-          else
+          elif git rev-parse -q --verify "refs/tags/v$VER" > /dev/null; then
             gh release create "v$VER" dist/* --verify-tag --title "v$VER" --notes-file notes.md $pre
+          else
+            # run by hand: the release makes the tag on this commit
+            gh release create "v$VER" dist/* --target "$GITHUB_SHA" --title "v$VER" --notes-file notes.md $pre
           fi
       - name: The release installs (install.sh against the real release, as users run it)
         env:

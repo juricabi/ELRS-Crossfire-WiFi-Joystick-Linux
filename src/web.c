@@ -15,8 +15,8 @@
  * and a POST must say Content-Type: application/json, which a cross-site page can only send after a
  * CORS preflight that is never answered (no Access-Control-* headers are ever sent).
  *
- * The engine is read through eng_snapshot / eng_log_read and changed through eng_set_config /
- * eng_start / eng_stop / eng_restart_stream only: all of them return at once (eng_set_config may
+ * The engine is read through eng_snapshot / eng_log_read and changed through eng_update_config /
+ * eng_start / eng_stop / eng_restart_stream only: all of them return at once (eng_update_config may
  * write the settings file through its save hook, on this thread). Numbers are formatted without
  * printf's %f, so a locale set by the program can never put a decimal comma into the JSON. */
 #ifndef _GNU_SOURCE
@@ -42,6 +42,7 @@
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/uio.h>
+#include <time.h>
 #include <unistd.h>
 
 #ifndef APP_VERSION
@@ -231,6 +232,7 @@ struct web {
   int quit;                    /* set by web_stop (__atomic) */
   uint32_t ip;                 /* bound address (network order) */
   uint16_t port;               /* bound port (the real one when 0 was asked for) */
+  char instance[40];           /* this run of the program (status and log): a page sees a restart by it */
   int nconn;
   int64_t accept_pause_until;
   eng_logline_t logbuf[WEB_LOG_MAX];
@@ -741,7 +743,7 @@ static int parse_config(const char *body, size_t n, eng_config_t *cfg, unsigned 
         long long lo = 1, hi = 65535;
         if (f == F_INTERVAL) { lo = WIFI_INTERVAL_MIN; hi = WIFI_INTERVAL_MAX; }
         if (f == F_CHANNELS) { lo = WIFI_MIN_CH; hi = WIFI_MAX_CH; }
-        /* only what the config cannot hold is refused here; eng_set_config checks the rest */
+        /* only what the config cannot hold is refused here; eng_update_config checks the rest */
         bool fits = f == F_PORT || f == F_HTTP ? v >= 0 && v <= 65535 : v >= -1000000000LL && v <= 1000000000LL;
         if (big || !fits) {
           msg_text(t, sizeof t, lit.p, lit.n);
@@ -778,6 +780,8 @@ static void api_status(web_t *w, sb_t *b) {
   eng_snapshot(w->e, &s);
   sb_puts(b, "{\"version\":");
   sb_json_str(b, APP_VERSION);
+  sb_puts(b, ",\"instance\":");
+  sb_json_str(b, w->instance);
   sb_printf(b, ",\"seq\":%u,\"uptime_s\":", (unsigned)s.seq);
   sb_fixed(b, (double)s.uptime_us / 1e6, 1);
   sb_printf(b, ",\"running\":%s,\"listening\":%s,\"state\":", s.running ? "true" : "false", s.listening ? "true" : "false");
@@ -848,18 +852,23 @@ static int api_config_post(web_t *w, const char *body, size_t n, sb_t *b) {
   char err[320];
   unsigned given;
   eng_snapshot(w->e, &s);
-  eng_config_t cfg = s.cfg;
+  eng_config_t cfg = s.cfg, now = s.cfg;
   err[0] = 0;
   if (parse_config(body, n, &cfg, &given, err, sizeof err) != 0) goto fail;
   if (given) {
+    /* only the fields the body names (merged by the engine, so a CLI change meanwhile stays) */
+    static const unsigned BIT[F_N] = { ENG_F_MODULE_IP, ENG_F_PORT, ENG_F_HTTP_PORT, ENG_F_INTERVAL, ENG_F_CHANNELS };
+    unsigned fields = 0;
+    for (int i = 0; i < F_N; i++) if (given & (1u << i)) fields |= BIT[i];
     err[0] = 0;
-    if (eng_set_config(w->e, &cfg, err, sizeof err) != 0) {
+    if (eng_update_config(w->e, &cfg, fields, &now, err, sizeof err) != 0) {
       if (!err[0]) snprintf(err, sizeof err, "the settings were not accepted");
       goto fail;
     }
   }
+  /* the config now asked for, as the engine has it (module_ip in its plain form), not the body's text */
   sb_puts(b, "{\"ok\":true,\"config\":");
-  json_config(b, &cfg);
+  json_config(b, &now);
   sb_puts(b, ",\"warning\":");
   sb_json_arr(b, err, sizeof err);
   sb_puts(b, "}");
@@ -911,7 +920,9 @@ static void api_log(web_t *w, uint32_t since, sb_t *b) {
     SB_JSON_FIELD(b, w->logbuf[i].text);
     sb_puts(b, "}");
   }
-  sb_puts(b, "]}");
+  sb_puts(b, "],\"instance\":");
+  sb_json_str(b, w->instance);
+  sb_puts(b, "}");
 }
 
 /* ================================================================ routing */
@@ -981,6 +992,39 @@ static void dispatch(web_t *w, conn_t *c) {
   respond_sb(w, c, code, NULL, &b);
 }
 
+/* The page asked for by a host name (http://raspberrypi.local:11000/ with --web 0.0.0.0): a person in a
+ * browser, who gets told what to open instead. The name in Host is not repeated (it is the visitor's
+ * text); the address is this server's own. */
+static void refused_page(web_t *w, conn_t *c) {
+  char url[96], here[48];
+  web_url(w, url, sizeof url);
+  snprintf(here, sizeof here, "http://127.0.0.1:%u/", (unsigned)w->port);
+  sb_t b = { 0 };
+  sb_puts(&b, "<!doctype html><html lang=\"en\"><meta charset=\"utf-8\"><meta name=\"viewport\" "
+              "content=\"width=device-width, initial-scale=1\"><title>Open this page by its IP address - "
+              "elrs-wifi-joystick</title><body style=\"font: 16px/1.5 system-ui, sans-serif; margin: 2em; max-width: 40em\">"
+              "<h1 style=\"font-size: 1.3em\">Open this page by its IP address</h1>"
+              "<p>elrs-wifi-joystick answers only to an IP address or localhost, not to a host name: that keeps "
+              "other web sites from reaching it through a name of theirs (DNS rebinding).</p><p>Open <a href=\"");
+  sb_puts(&b, url);
+  sb_puts(&b, "\">");
+  sb_puts(&b, url);
+  sb_puts(&b, "</a>");
+  if (strcmp(url, here)) {
+    sb_puts(&b, " (or ");
+    sb_puts(&b, here);
+    sb_puts(&b, " on that machine)");
+  }
+  sb_puts(&b, ". The program also prints the address when it starts (\"Web page: ...\").</p></body></html>\n");
+  if (b.oom) {
+    free(b.p);
+    respond_err(w, c, 403, "host not allowed", NULL);
+    return;
+  }
+  respond(w, c, 403, HTML_CT, "Content-Security-Policy: default-src 'none'; style-src 'unsafe-inline'\r\n"
+          "X-Frame-Options: DENY\r\n", b.p, b.len, b.p);
+}
+
 /* The head is complete: check it (the table in WEB_API.md) and answer, or wait for the body. */
 static void on_head(web_t *w, conn_t *c) {
   req_t *rq = &c->rq;
@@ -1003,7 +1047,9 @@ static void on_head(web_t *w, conn_t *c) {
     return;
   }
   if (!host_ok(rq->host)) {
-    respond_err(w, c, 403, "host not allowed", NULL);
+    unsigned m = method_bit(rq->method);
+    if ((m == M_GET || m == M_HEAD) && (span_eq(rq->path, "/") || span_eq(rq->path, "/index.html"))) refused_page(w, c);
+    else respond_err(w, c, 403, "host not allowed", NULL);
     return;
   }
   if (rq->norigin > 1 || (rq->norigin && !origin_ok(rq->origin, rq->host))) {
@@ -1208,6 +1254,12 @@ web_t *web_start(engine_t *e, const char *addr, uint16_t port, char *err, size_t
   if (bind(w->lfd, (struct sockaddr *)&a, sizeof a) != 0 || listen(w->lfd, WEB_BACKLOG) != 0) goto sock_fail;
   socklen_t al = sizeof a;
   w->port = getsockname(w->lfd, (struct sockaddr *)&a, &al) == 0 ? ntohs(a.sin_port) : port;
+  {
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    snprintf(w->instance, sizeof w->instance, "%lx-%llx", (unsigned long)getpid(),
+             (unsigned long long)ts.tv_sec * 1000000ULL + (unsigned long long)ts.tv_nsec / 1000);
+  }
   if (pipe2(w->wake, O_NONBLOCK | O_CLOEXEC) != 0) goto sock_fail;
   /* signals go to the other threads (the program's handlers or sigwait) */
   sigset_t all, old;

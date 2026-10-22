@@ -24,6 +24,14 @@ typedef struct {
   int channels;             /* the request: WIFI_MIN_CH..WIFI_MAX_CH (16) */
 } eng_config_t;
 
+/* the fields of eng_config_t, for eng_update_config (the same bits as config.h's CFG_K_* live keys) */
+#define ENG_F_MODULE_IP  (1u << 0)
+#define ENG_F_PORT       (1u << 1)
+#define ENG_F_HTTP_PORT  (1u << 2)
+#define ENG_F_INTERVAL   (1u << 3)
+#define ENG_F_CHANNELS   (1u << 4)
+#define ENG_F_ALL        0x1Fu
+
 void eng_config_default(eng_config_t *c);     /* "", 11000, 80, 4000, 16 */
 /* 0 when every field is supported, else -1 and one line in err naming the field and the supported
  * values, e.g. "channels: 3 is not supported - use 4 to 16" or "module_ip: \"10.0.0\" is not an IPv4
@@ -37,7 +45,8 @@ typedef struct {
   bool joystick;            /* create the virtual joystick (uinput); false = monitor only */
   bool buttons;             /* CH9..CH16 as buttons 1..8 */
   char device_name[64];     /* "" = ENG_DEVICE_NAME */
-  /* called (on the caller's thread) by eng_set_config after it accepted a config; NULL = not saved.
+  /* called (on the caller's thread) by eng_update_config / eng_set_config after it accepted a config;
+   * NULL = not saved.
    * 0 = saved; else -1 with err (the config still applies). */
   int (*save)(void *ud, const eng_config_t *c, char *err, size_t cap);
   void *save_ud;
@@ -52,15 +61,26 @@ engine_t *eng_create(const eng_config_t *cfg, const eng_options_t *opt, char *er
 /* Stop, center the joystick and remove it, end the threads (a POST in flight is aborted), free. */
 void eng_destroy(engine_t *e);
 
-/* ---------------------------------------------------------------- commands */
+/* ---------------------------------------------------------------- commands
+ * Commands are kept as state, never queued, so none is ever lost however many come at once: a stop
+ * given since the last pass is applied first (a stop and a start = a new session), then the latest
+ * config, then the last of start/stop, then a restart. */
 void eng_start(engine_t *e);         /* listen (a new protocol session); no-op while running */
 void eng_stop(engine_t *e);          /* close the socket, forget the lock; the joystick is centered */
-/* Check (eng_config_check), then apply live and save (opt.save): module_ip -> new target (or
- * discovery); port -> rebind; interval/channels -> wifi_proto_set_request (a streaming ELRS module
- * is restarted so they apply); http_port -> the next POST. Returns 0, or -1 with err and nothing
- * changed. A save failure is logged and reported in err with return 0. */
-int  eng_set_config(engine_t *e, const eng_config_t *c, char *err, size_t cap);
+/* Change the fields in `fields` (ENG_F_*) to c's values, the others staying as the latest accepted
+ * config has them; the merge happens under the engine's lock, so concurrent callers (the CLI, the web
+ * page) never undo each other's fields. Check (eng_config_check), then apply live and save (opt.save):
+ * module_ip -> new target (or discovery); port -> rebind; interval/channels -> wifi_proto_set_request
+ * (a streaming ELRS module is restarted so they apply); http_port -> the next POST. Returns 0 (out, when
+ * not NULL, gets the whole config now asked for, module_ip in its plain form), or -1 with err and
+ * nothing changed. A save failure is logged and reported in err with return 0. */
+int  eng_update_config(engine_t *e, const eng_config_t *c, unsigned fields, eng_config_t *out, char *err, size_t cap);
+int  eng_set_config(engine_t *e, const eng_config_t *c, char *err, size_t cap);   /* every field */
 void eng_restart_stream(engine_t *e);   /* wifi_proto_restart: re-send our request to the module */
+/* Block until every command given before this call (start, stop, restart, a config) has been applied
+ * and its snapshot published, at most timeout_ms. true when it has. (For a script's commands in a row:
+ * "s" twice is a stop, then a start; "status" after "stop" says stopped.) */
+bool eng_wait_applied(engine_t *e, int timeout_ms);
 
 /* ---------------------------------------------------------------- state */
 typedef struct {
@@ -70,8 +90,10 @@ typedef struct {
   bool listening;           /* socket bound */
   wifi_state_t state;
   char detail[64];          /* wifi_proto's state detail */
-  /* one line for people: "stopped", "listening", "activating 10.0.0.1", "connecting to 10.0.0.1",
-   * "no data from 10.0.0.1", "no stick data from 10.0.0.1", "streaming", "UDP port 11000 in use" */
+  /* one line for people, every text there is: "stopped"; "opening UDP port 11000" (running, the bind
+   * not done yet), "UDP port 11000 in use", "no permission for UDP port 11000", "cannot open UDP port
+   * 11000" (the bind failed: state error, retried every 5 s); "listening", "activating 10.0.0.1",
+   * "connecting to 10.0.0.1", "no data from 10.0.0.1", "no stick data from 10.0.0.1"; "streaming" */
   char status[80];
   bool bound;               /* locked to a module */
   char source[16];          /* its IP, "" when not bound */
@@ -79,7 +101,7 @@ typedef struct {
   char module_name[32];     /* its ELRS device name from the beacon, or "" */
   double rate_hz, jitter_ms;   /* the last 1 s window (0 when not bound) */
   int frames_last_s;
-  uint8_t nch;              /* channels in the last applied frame (0 = none yet) */
+  uint8_t nch;              /* channels in the last applied frame (0 = none yet, or no module locked) */
   uint16_t raw[WIFI_MAX_CH];   /* the last applied frame, 0..32767, 0 beyond nch */
   uint32_t frames;          /* applied frames, lifetime */
   uint32_t rx, beacons, malformed, dropped_filter, dropped_other;

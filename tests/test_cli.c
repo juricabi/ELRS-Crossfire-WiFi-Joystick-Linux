@@ -87,6 +87,11 @@ static void plain(void) {
   cli_status_plain(&s, out, sizeof out);
   CHECK_STR(out, "streaming from WiFi 192.168.1.50 | 249.8 Hz, jitter 0.42 ms | asked 250 Hz x 16 ch"
                  " | CH1-8 % 50 50 0 100 50 50 50 50");
+  /* the first second after a lock has no rate yet: none shown (not "0.0 Hz, jitter 0.00 ms") */
+  s.rate_hz = 0;
+  s.jitter_ms = 0;
+  cli_status_plain(&s, out, sizeof out);
+  CHECK_STR(out, "streaming from WiFi 192.168.1.50 | asked 250 Hz x 16 ch | CH1-8 % 50 50 0 100 50 50 50 50");
   /* not streaming */
   memset(&s, 0, sizeof s);
   eng_config_default(&s.cfg);

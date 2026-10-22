@@ -9,7 +9,7 @@ characters escaped.
 
 | check | failure |
 |---|---|
-| `Host` is `localhost`, `127.0.0.1`, `[::1]` or an IPv4 literal, with an optional `:port` | 403 `{"ok":false,"error":"host not allowed"}` |
+| `Host` is `localhost`, `127.0.0.1`, `[::1]` or an IPv4 literal, with an optional `:port` | 403 `{"ok":false,"error":"host not allowed"}`; for `GET`/`HEAD` of `/` and `/index.html` (a person who opened the page by a host name) a short `text/html` page that says to open it by its IP address (this server's URL, never the name that was sent) |
 | `Origin`, when present (and not `null`), is `http://<the same host:port as Host>` | 403 `{"ok":false,"error":"origin not allowed"}` |
 | POST has `Content-Type: application/json` (parameters like `; charset=utf-8` allowed) | 415 `{"ok":false,"error":"use Content-Type: application/json"}` |
 | request head ≤ 8 KiB, body ≤ 4 KiB | 413 |
@@ -31,6 +31,7 @@ The page (`text/html; charset=utf-8`). `GET /index.html` is the same. `HEAD` is 
 ```json
 {
   "version": "1.0.0",
+  "instance": "1f3a-6230a4c5e1b2c",
   "seq": 1234,
   "uptime_s": 12.5,
   "running": true,
@@ -55,6 +56,8 @@ The page (`text/html; charset=utf-8`). `GET /index.html` is the same. `HEAD` is 
 }
 ```
 
+- `instance`: the same text for the whole run of the program, another one after it restarted (compare it,
+  not `uptime_s`, to know: then read `/api/config` again and start the log over from `since=0`).
 - `state`: `stopped` | `searching` | `streaming` | `error` (wifi_proto). `status`: the one-line text of
   `engine.h` (`eng_snapshot_t.status`). `module`: `null` when not locked; `kind`: `ELRS` | `Crossfire` |
   `WiFi` (not identified by a beacon yet); `name`: the ELRS device name or `""`.
@@ -84,10 +87,13 @@ The page (`text/html; charset=utf-8`). `GET /index.html` is the same. `HEAD` is 
 ## `POST /api/config`
 
 Body: a JSON object with any of `module_ip` (string), `port`, `http_port`, `interval_us`, `channels`
-(integers); missing keys keep their current value. Applied live (see `eng_set_config`) and saved to
-the settings file.
+(integers); missing keys keep their current value, also when another client (the terminal, another
+page) changed them meanwhile: only the keys named change (`eng_update_config`). Applied live and saved
+to the settings file.
 
-- 200 `{"ok":true,"config":{...},"warning":""}` (`warning`: e.g. the settings file could not be written).
+- 200 `{"ok":true,"config":{...},"warning":""}`: `config` is the whole config now in effect, as the
+  program has it (`module_ip` in its plain form: `" 10.0.0.5\r\n"` answers `"10.0.0.5"`); `warning`: e.g.
+  the settings file could not be written.
 - 400 `{"ok":false,"error":"channels: 3 is not supported - use 4 to 16"}` for an unsupported value,
   `{"ok":false,"error":"unknown key \"foo\""}`, `{"ok":false,"error":"channels must be a number"}`
   (`... must be a whole number` for 16.0 or 1e3, `module_ip must be a string`, `channels is given twice`),
@@ -97,17 +103,22 @@ the settings file.
 ## `POST /api/start`, `POST /api/stop`, `POST /api/restart`
 
 Body ignored (send `{}`). `start`/`stop` listen or not; `restart` re-sends our request to the module
-(`eng_restart_stream`). 200 `{"ok":true}`.
+(`eng_restart_stream`). 200 `{"ok":true}` once the command is taken; what the module gets is in the log:
+a restart (`joystick_end`, then `joystick_begin`); nothing for Crossfire; for a locked module that may be
+Crossfire (16 channels, no beacon from it yet) the restart waits until it has streamed 20 s without a
+Crossfire beacon; the module IP, not locked and not identified by a beacon, only a `joystick_begin`.
 
 ## `GET /api/log?since=N`
 
 ```json
-{ "seq": 42, "lines": [ { "seq": 41, "time_ms": 1729590000123, "text": "Listening for joystick data on UDP 11000" } ] }
+{ "seq": 42, "lines": [ { "seq": 41, "time_ms": 1729590000123, "text": "Listening for joystick data on UDP 11000" } ],
+  "instance": "1f3a-6230a4c5e1b2c" }
 ```
 
 Lines with `seq > since` (default 0), oldest first, at most 200 (the newest 200 when more). `seq` is the
 newest line's seq (pass it as `since` next time); with no new lines, the program's newest seq, which is
-below `since` after the program was restarted (start over from 0). `time_ms`: wall clock, ms since 1970.
+below `since` after the program was restarted (start over from 0). `instance`: as in `/api/status` (lines
+of another instance than the ones shown: start over). `time_ms`: wall clock, ms since 1970.
 `since` that is not a number 0..4294967295: 400 `{"ok":false,"error":"since must be a number"}`.
 
 ## Errors

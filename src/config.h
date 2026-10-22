@@ -72,6 +72,12 @@ int  cfg_rate_to_interval(int hz);
 /* $XDG_CONFIG_HOME/elrs-wifi-joystick/config (an absolute XDG_CONFIG_HOME only), else
  * $HOME/.config/...; -1 when there is no home. */
 int  cfg_default_path(char *out, size_t cap);
+/* The single-instance lock file: <xdg>/elrs-wifi-joystick.lock for an absolute xdg ($XDG_RUNTIME_DIR);
+ * else <run_user>/elrs-wifi-joystick.lock when run_user (/run/user/<uid>) is a directory of uid - what
+ * XDG_RUNTIME_DIR is in a login session, so a shell without it (su -, sudo -u, cron) finds the lock of an
+ * instance started in the session or as the user service; else /tmp/elrs-wifi-joystick-<uid>.lock.
+ * 0, or -1 when it does not fit. */
+int  cfg_lock_path(const char *xdg, const char *run_user, unsigned uid, char *out, size_t cap);
 typedef void (*cfg_warn_fn)(void *ud, const char *msg);
 /* Text -> s (only the keys present change); warn gets one line per ignored line, prefixed with
  * "<fname> line N: ". Returns the CFG_K_* mask of the keys that were applied. */
@@ -85,7 +91,8 @@ int  cfg_render(const char *old, const eng_config_t *c, unsigned keys, char *out
 /* the CFG_K_* live keys whose values differ between a and b */
 unsigned cfg_live_diff(const eng_config_t *a, const eng_config_t *b);
 /* Write the live keys in `keys` (temp file + fsync + rename, directories made as needed; a symlinked
- * file is written where it points). 0, or -1 with err ("cannot save the settings to <path>: <why>"). */
+ * file is written where it points, also when that file does not exist yet; an existing file keeps its
+ * mode, a new one gets 0666 minus the umask). 0, or -1 with err ("cannot save the settings to <path>: <why>"). */
 int  cfg_save(const char *path, const eng_config_t *c, unsigned keys, char *err, size_t cap);
 
 /* ---- text ---- */

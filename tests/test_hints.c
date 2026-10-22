@@ -122,8 +122,15 @@ static void uinput_text(void) {
   CHECK(strstr(out, "packaging/install.sh") != NULL);
   hints_uinput(EACCES, NULL, "pilot", out, sizeof out);
   CHECK(strstr(out, "no permission to use /dev/uinput") != NULL);
-  CHECK(strstr(out, "packaging/install.sh") != NULL);
+  CHECK(strstr(out, "run the install script with sudo") != NULL);       /* a release has install.sh */
+  CHECK(strstr(out, "packaging/") == NULL);
+  /* over SSH or for a service the udev rule's uaccess does not apply: the input group does */
+  CHECK(strstr(out, "sudo usermod -aG input pilot, log in again") != NULL);
   CHECK(strstr(out, "sudo setfacl -m u:pilot:rw /dev/uinput") != NULL);
+  /* a 16-character user name still fits the engine's 256-byte joy_error whole */
+  char big[1024];
+  hints_uinput(EACCES, NULL, "abcdefghijklmnop", big, sizeof big);
+  CHECK(strlen(big) < 256);
   hints_uinput(EPERM, "/tmp/x", NULL, out, sizeof out);
   CHECK(strstr(out, "sudo setfacl -m u:$USER:rw /tmp/x") != NULL);
   hints_uinput(EACCES, "", "", out, sizeof out);

@@ -17,6 +17,8 @@
 #include <netinet/in.h>
 #include <poll.h>
 #include <pthread.h>
+#include <sched.h>
+#include <stdint.h>
 #include <signal.h>
 #include <stdarg.h>
 #include <stdlib.h>
@@ -67,6 +69,7 @@ typedef struct {
   uint16_t values[16];
   int mode;                       /* 0 normal, 1 placeholder, 2 silent */
   int http_delay_ms;
+  bool act_first;                 /* apply a POST, then wait http_delay_ms to answer (ELRS: it stops/starts, then answers) */
   int http_status;
   /* observations */
   char posts[MAXPOSTS][128];
@@ -94,6 +97,30 @@ static int param(const char *body, const char *key, char *out, size_t cap) {
   }
   out[0] = 0;
   return 0;
+}
+
+/* what the module does with a POST it took */
+static void fk_apply(fake_t *f, const char *body, uint32_t from) {
+  char action[32], v[32];
+  param(body, "action", action, sizeof action);
+  fk_lock(f);
+  if (!strcmp(action, "joystick_begin")) {
+    f->remote = from;
+    if (f->xf) {
+      f->active = true;
+    } else if (!f->active) {           /* ELRS: the request only applies while idle */
+      param(body, "interval", v, sizeof v);
+      int iv = atoi(v);
+      f->interval_us = iv < 1000 ? 10000 : iv;
+      param(body, "channels", v, sizeof v);
+      int ch = atoi(v) & 0xFF;
+      f->channels = ch == 0 ? 8 : ch > 16 ? 16 : ch;
+      f->active = true;
+    }
+  } else if (!strcmp(action, "joystick_end")) {
+    if (!f->xf) f->active = false;
+  }
+  fk_unlock(f);
 }
 
 static void *fk_http(void *arg) {
@@ -130,12 +157,14 @@ static void *fk_http(void *arg) {
     body = body ? body + 4 : req + got;
     fk_lock(f);
     int delay = f->http_delay_ms, status = f->http_status;
+    bool first = f->act_first;
     if (f->nposts < MAXPOSTS) {
       snprintf(f->posts[f->nposts], sizeof f->posts[0], "%s", body);
       f->post_from[f->nposts] = peer.sin_addr.s_addr;
     }
     f->nposts++;
     fk_unlock(f);
+    if (first && status == 200) fk_apply(f, body, peer.sin_addr.s_addr);
     bool gone = false;
     for (int t = 0; t < delay && !gone; t += 10) {
       fk_lock(f);
@@ -148,28 +177,7 @@ static void *fk_http(void *arg) {
       if (poll(&cp, 1, 10) > 0 && recv(c, tmp, sizeof tmp, MSG_DONTWAIT) <= 0) gone = true;
     }
     if (gone) { close(c); continue; }
-    if (status == 200) {
-      char action[32], v[32];
-      param(body, "action", action, sizeof action);
-      fk_lock(f);
-      if (!strcmp(action, "joystick_begin")) {
-        f->remote = peer.sin_addr.s_addr;
-        if (f->xf) {
-          f->active = true;
-        } else if (!f->active) {           /* ELRS: the request only applies while idle */
-          param(body, "interval", v, sizeof v);
-          int iv = atoi(v);
-          f->interval_us = iv < 1000 ? 10000 : iv;
-          param(body, "channels", v, sizeof v);
-          int ch = atoi(v) & 0xFF;
-          f->channels = ch == 0 ? 8 : ch > 16 ? 16 : ch;
-          f->active = true;
-        }
-      } else if (!strcmp(action, "joystick_end")) {
-        if (!f->xf) f->active = false;
-      }
-      fk_unlock(f);
-    }
+    if (!first && status == 200) fk_apply(f, body, peer.sin_addr.s_addr);
     char resp[256];
     int n = snprintf(resp, sizeof resp, "HTTP/1.1 %d %s\r\nContent-Type: text/plain\r\nContent-Length: 2\r\n"
                      "Connection: close\r\n\r\nok", status, status == 200 ? "OK" : "Error");
@@ -183,7 +191,9 @@ static void fk_send(fake_t *f, const void *d, size_t n) {
   struct sockaddr_in a;
   memset(&a, 0, sizeof a);
   a.sin_family = AF_INET;
+  pthread_mutex_lock(&f->mu);                     /* a test may move it (a port change) */
   a.sin_port = htons(f->dest_port);
+  pthread_mutex_unlock(&f->mu);
   a.sin_addr.s_addr = htonl(0x7f000001);
   ssize_t r = sendto(f->udp, d, n, 0, (struct sockaddr *)&a, sizeof a);
   if (r < 0 && getenv("TEST_VERBOSE")) fprintf(stderr, "fake %s sendto port %u: %s\n", f->ip, f->dest_port, strerror(errno));
@@ -297,6 +307,7 @@ static int fk_count(fake_t *f, const char *sub) {
   return n;
 }
 static void fk_set(fake_t *f, int idx, uint16_t v) { fk_lock(f); f->values[idx] = v; fk_unlock(f); }
+static int fk_interval(fake_t *f) { fk_lock(f); int v = f->interval_us; fk_unlock(f); return v; }
 static void fk_mode(fake_t *f, int m) { fk_lock(f); f->mode = m; fk_unlock(f); }
 
 /* ================================================================ the joystick sink (ujoy_sys) */
@@ -304,6 +315,7 @@ typedef struct {
   int rd, wr;
   int fail_writes;                /* > 0: the next writes fail with EIO */
   int writes, bad_writes, events;
+  int abs_center;                 /* axis events to the center (16384) */
   int32_t axis[8];
   bool btn[8];
   bool created, destroyed;
@@ -370,8 +382,10 @@ static void sink_pump(void) {
     if (n <= 0) break;
     for (size_t i = 0; i < (size_t)n / sizeof ev[0]; i++) {
       K.events++;
-      if (ev[i].type == EV_ABS)
+      if (ev[i].type == EV_ABS) {
         for (int a = 0; a < 8; a++) if (axes[a] == ev[i].code) K.axis[a] = ev[i].value;
+        if (ev[i].value == 16384) K.abs_center++;
+      }
       if (ev[i].type == EV_KEY && ev[i].code >= BTN_TRIGGER && ev[i].code <= BTN_BASE2) K.btn[ev[i].code - BTN_TRIGGER] = ev[i].value;
     }
   }
@@ -530,6 +544,8 @@ static void set_port(eng_config_t *c) { c->port = g_port; }
 static void inc_rate(eng_config_t *c) { c->interval_us = 2000; }
 static void set_8ch(eng_config_t *c) { c->channels = 8; }
 static void set_16ch(eng_config_t *c) { c->channels = 16; }
+static int g_iv;
+static void set_iv(eng_config_t *c) { c->interval_us = g_iv; }
 static char g_ip[64];
 static void set_ip(eng_config_t *c) { snprintf(c->module_ip, sizeof c->module_ip, "%s", g_ip); }
 static int g_http;
@@ -678,6 +694,11 @@ static void t_flow(void) {
   save_fail = 0;
 
   /* ---- a pause in the stream is counted and logged ---- */
+  /* (no restart of ours under way, and the stream flowing again after the last one: a pause that begins
+   * while our restart is under way is the restart's) */
+  CHECK(WAIT(3000, S.posts_ok + S.posts_failed == S.posts));
+  uint32_t f0 = S.frames;
+  CHECK(WAIT(3000, S.frames > f0 + 20));
   snap();
   uint32_t g0 = S.gaps;
   int gl0 = logged("The stick data paused for");
@@ -763,7 +784,7 @@ static void t_crossfire_and_target(void) {
   eng_snapshot(E, &S);
   CHECK(!S.joy_enabled && !S.joy_ok);
   CHECK_STR(S.joy_error, "");
-  CHECK_INT(logged("No virtual joystick (--no-joystick): monitor only"), 1);
+  CHECK_INT(logged("No virtual joystick (--no-joystick, or joystick = off in the settings file): monitor only"), 1);
   /* Crossfire first: it locks; ELRS is ignored while the lock is fresh */
   fk_beacon(&x);
   CHECK(WAIT(5000, S.bound));
@@ -918,7 +939,12 @@ static void t_bind_error(void) {
   char st[64];
   snprintf(st, sizeof st, "opening UDP port %u", U);
   CHECK_STR(S.status, st);
+  CHECK_INT(S.state, WIFI_ST_SEARCHING);                /* running: never "stopped" (the web banner) */
+  CHECK_STR(S.detail, st);
   CHECK_INT(logged("ERROR"), 0);                        /* 5 quick tries first */
+  sleep_ms(700);
+  snap();
+  CHECK(S.running && !S.listening && S.state == WIFI_ST_SEARCHING);
   snprintf(st, sizeof st, "UDP port %u in use", U);
   CHECK(WAIT(3000, !strcmp(S.status, st)));
   CHECK_INT(S.state, WIFI_ST_ERROR);
@@ -962,7 +988,8 @@ static void t_joystick_fails(void) {
   CHECK(!S.joy_buttons);
   CHECK_STR(S.joy_name, "My Sim Stick");
   CHECK(strstr(S.joy_error, "no permission to use /dev/uinput") != NULL);
-  CHECK(strstr(S.joy_error, "packaging/install.sh") != NULL);
+  CHECK(strstr(S.joy_error, "run the install script with sudo") != NULL);
+  CHECK(strstr(S.joy_error, "usermod -aG input") != NULL);
   CHECK_INT(logged("!! No virtual joystick: no permission"), 1);
   CHECK_INT(logged("Running as a monitor"), 1);
   CHECK(S.listening);                                  /* not fatal */
@@ -1019,6 +1046,8 @@ static void t_log_ring(void) {
   CHECK_INT(l[0].seq, newest - 9);
   CHECK_INT(eng_log_read(E, newest, l, 4), 0);
   CHECK_INT(eng_log_read(E, newest + 50, l, 4), 0);   /* a reader from the future: nothing */
+  CHECK_INT(eng_log_read(E, UINT32_MAX, l, 4), 0);     /* the largest since: nothing (since + 1 must not wrap) */
+  CHECK_INT(eng_log_read(E, UINT32_MAX - 1, l, 4), 0);
   CHECK_INT(eng_log_read(E, 0, l, 0), 0);
   /* eng_wait: a log line wakes it, nothing times out */
   snap();
@@ -1117,6 +1146,298 @@ static void t_joy_write_error(void) {
   fk_stop(&m);
 }
 
+/* A burst of commands (a script, several web clients): none is dropped. A config in the middle of hundreds
+ * of stop/start pairs is applied; the last of start/stop wins. */
+static void t_command_burst(void) {
+  uint16_t U = free_udp(), H = free_tcp();
+  fake_t m;
+  fk_start(&m, "127.0.0.2", false, H, U);
+  start(U, H, "", false);
+  fk_beacon(&m);
+  CHECK(WAIT(5000, S.bound && S.nch == 16));
+  char err[256];
+  for (int i = 0; i < 300; i++) { eng_stop(E); eng_start(E); eng_restart_stream(E); }
+  CHECK_INT(set_cfg(set_8ch, err, sizeof err), 0);
+  for (int i = 0; i < 300; i++) { eng_stop(E); eng_start(E); }
+  eng_stop(E);
+  eng_start(E);
+  CHECK(eng_wait_applied(E, 3000));
+  CHECK(WAIT(3000, logged("Asking for 250 Hz (4000 us) and 8 channels") == 1));
+  CHECK_INT(logged("Too many commands"), 0);
+  CHECK(WAIT(8000, S.running && S.bound && S.nch == 8));          /* applied: the module streams 8 now */
+  CHECK_INT(S.cfg.channels, 8);
+  /* the last one wins: a stop at the end of a burst stops */
+  for (int i = 0; i < 100; i++) { eng_start(E); eng_stop(E); }
+  CHECK(eng_wait_applied(E, 3000));
+  snap();
+  CHECK(!S.running);
+  finish();
+  fk_stop(&m);
+}
+
+/* t_update_config's threads: 0 sets channels 4..16 (last 5), 1 sets the interval (last 3000), each from a
+ * snapshot taken before the other's changes */
+static void *one_field(void *arg) {
+  int who = (int)(intptr_t)arg;
+  char err[256];
+  for (int i = 0; i < 200; i++) {
+    eng_snapshot_t s;
+    eng_snapshot(E, &s);
+    eng_config_t c = s.cfg;
+    if (who == 0) c.channels = i == 199 ? 5 : 4 + i % 13;
+    else c.interval_us = i == 199 ? 3000 : 1000 + 1000 * (i % 50);
+    sched_yield();
+    eng_update_config(E, &c, who == 0 ? ENG_F_CHANNELS : ENG_F_INTERVAL, NULL, err, sizeof err);
+  }
+  return NULL;
+}
+
+/* eng_update_config changes only the fields it is given, merged under the engine's lock: a change made by
+ * someone else (the CLI) after this caller's snapshot is kept; out = the config now asked for */
+static void t_update_config(void) {
+  uint16_t U = free_udp();
+  start(U, 80, "", false);
+  char err[256];
+  eng_snapshot(E, &S);
+  eng_config_t web = S.cfg;                             /* the web page's (stale) view */
+  eng_config_t cli = S.cfg;
+  cli.channels = 8;
+  CHECK_INT(eng_update_config(E, &cli, ENG_F_CHANNELS, NULL, err, sizeof err), 0);
+  web.interval_us = 2000;
+  eng_config_t out;
+  CHECK_INT(eng_update_config(E, &web, ENG_F_INTERVAL, &out, err, sizeof err), 0);
+  CHECK_INT(out.interval_us, 2000);
+  CHECK_INT(out.channels, 8);                           /* the CLI's change stays */
+  eng_snapshot(E, &S);
+  CHECK_INT(S.cfg.interval_us, 2000);
+  CHECK_INT(S.cfg.channels, 8);
+  CHECK_INT(saved.channels, 8);                         /* and is saved with it */
+  CHECK_INT(saved.interval_us, 2000);
+  /* out holds the config in effect: the module IP in its plain form */
+  eng_config_t c;
+  memset(&c, 0, sizeof c);
+  snprintf(c.module_ip, sizeof c.module_ip, "\r\n 127.0.0.2\t\n");
+  CHECK_INT(eng_update_config(E, &c, ENG_F_MODULE_IP, &out, err, sizeof err), 0);
+  CHECK_STR(out.module_ip, "127.0.0.2");
+  CHECK_INT(out.port, U);
+  eng_snapshot(E, &S);
+  CHECK_STR(S.cfg.module_ip, "127.0.0.2");
+  /* an invalid field: -1, nothing changed (the other fields of c are not looked at) */
+  c.channels = 3;
+  c.port = 0;
+  CHECK_INT(eng_update_config(E, &c, ENG_F_CHANNELS, &out, err, sizeof err), -1);
+  CHECK_STR(err, "channels: 3 is not supported - use 4 to 16");
+  CHECK_INT(eng_update_config(E, &c, 0, &out, err, sizeof err), 0);    /* no field: nothing changes */
+  CHECK_INT(out.channels, 8);
+  CHECK_INT(out.port, U);
+  /* two threads at once, each changing only its own field from a stale view of the rest (the CLI and the
+   * web page): the last value of each lands, none is undone by the other */
+  pthread_t th[2];
+  for (int i = 0; i < 2; i++) pthread_create(&th[i], NULL, one_field, (void *)(intptr_t)i);
+  for (int i = 0; i < 2; i++) pthread_join(th[i], NULL);
+  eng_snapshot(E, &S);
+  CHECK_INT(S.cfg.channels, 5);
+  CHECK_INT(S.cfg.interval_us, 3000);
+  CHECK_INT(saved.channels, 5);
+  CHECK_INT(saved.interval_us, 3000);
+  finish();
+}
+
+/* scripted commands in a row see each other: s twice = stop, then start; status after stop says stopped */
+static void t_wait_applied(void) {
+  uint16_t U = free_udp();
+  start(U, 80, "", false);
+  eng_stop(E);
+  CHECK(eng_wait_applied(E, 2000));
+  eng_snapshot(E, &S);
+  CHECK(!S.running);
+  CHECK_STR(S.status, "stopped");
+  eng_start(E);
+  CHECK(eng_wait_applied(E, 2000));
+  eng_snapshot(E, &S);
+  CHECK(S.running && S.listening);
+  uint16_t U2 = free_udp();
+  g_port = U2;
+  char err[256];
+  CHECK_INT(set_cfg(set_port, err, sizeof err), 0);
+  CHECK(eng_wait_applied(E, 2000));
+  eng_snapshot(E, &S);
+  CHECK(S.listening && S.cfg.port == U2);
+  CHECK(udp_port_free(U));
+  CHECK(eng_wait_applied(E, 0));                        /* nothing pending: at once */
+  finish();
+}
+
+/* Our own restart pauses the stream (joystick_end, then joystick_begin): not a gap, not logged as one */
+static void t_own_restart_no_gap(void) {
+  uint16_t U = free_udp(), H = free_tcp();
+  fake_t m;
+  fk_start(&m, "127.0.0.2", false, H, U);
+  start(U, H, "", false);
+  fk_beacon(&m);
+  CHECK(WAIT(5000, S.bound && S.nch == 16));
+  CHECK(WAIT(2000, S.posts_ok == 1));
+  fk_lock(&m);
+  m.http_delay_ms = 300;                                /* a slow module web server: the pause > 250 ms */
+  fk_unlock(&m);
+  char err[256];
+  CHECK_INT(set_cfg(inc_rate, err, sizeof err), 0);
+  CHECK(WAIT(4000, S.restarts == 1 && logged("Activation POST -> 127.0.0.2: 200 OK") == 2));
+  CHECK(WAIT(3000, S.rate_hz > 350));
+  CHECK_INT(fk_interval(&m), 2000);
+  uint32_t g0 = 0;
+  int gl0 = 0;
+  CHECK_INT(S.gaps, 0);
+  CHECK_INT(logged("The stick data paused"), 0);
+  /* a real pause afterwards still counts */
+  fk_mode(&m, 2);
+  sleep_ms(500);
+  fk_mode(&m, 0);
+  CHECK(WAIT(2000, S.gaps == 1));
+  /* a slow rate (50 Hz, 40 Hz: a frame every 20-25 ms) and a module that stops at once on joystick_end and
+   * answers later (ELRS stops, then answers): the pause begins with a frame that came before the restart was
+   * even sent - still ours */
+  fk_lock(&m);
+  m.act_first = true;
+  fk_unlock(&m);
+  static const int IV[] = { 20000, 25000, 20000, 25000 };
+  uint32_t r0 = S.restarts;
+  for (int i = 0; i < 4; i++) {
+    g_iv = IV[i];
+    CHECK_INT(set_cfg(set_iv, err, sizeof err), 0);
+    CHECK(WAIT(5000, S.restarts == r0 + (uint32_t)i + 1 && fk_interval(&m) == IV[i]));
+    CHECK(WAIT(5000, S.posts_ok + S.posts_failed == S.posts));
+    uint32_t f1 = S.frames;
+    CHECK(WAIT(3000, S.frames > f1 + 5));
+    if (i == 0) {
+      snap();
+      g0 = S.gaps;                                      /* (from 500 Hz to 50 Hz: frames came after it was sent) */
+      gl0 = logged("The stick data paused");
+    }
+  }
+  CHECK_INT(S.gaps, g0);
+  CHECK_INT(logged("The stick data paused"), gl0);
+  finish();
+  fk_stop(&m);
+}
+
+/* The module IP and the rate in one change: the module being left gets no joystick_end; the new one gets
+ * a joystick_begin with the new request, and when it already streams what it was asked for before, a
+ * restart at its lock */
+static void t_switch_module_and_rate(void) {
+  uint16_t U = free_udp(), H = free_tcp();
+  fake_t a, b;
+  fk_start(&a, "127.0.0.2", false, H, U);
+  fk_start(&b, "127.0.0.3", false, H, U);
+  start(U, H, "", false);
+  fk_beacon(&a);
+  CHECK(WAIT(5000, S.bound && !strcmp(S.source, "127.0.0.2")));
+  /* B was not streaming: one joystick_begin with the new request */
+  eng_config_t c;
+  memset(&c, 0, sizeof c);
+  snprintf(c.module_ip, sizeof c.module_ip, "127.0.0.3");
+  c.interval_us = 2000;
+  char err[256];
+  CHECK_INT(eng_update_config(E, &c, ENG_F_MODULE_IP | ENG_F_INTERVAL, NULL, err, sizeof err), 0);
+  CHECK(WAIT(5000, S.bound && !strcmp(S.source, "127.0.0.3")));
+  CHECK(WAIT(3000, S.rate_hz > 350));
+  CHECK_INT(fk_count(&a, "joystick_end"), 0);
+  CHECK_INT(fk_nposts(&a), 1);
+  CHECK_INT(fk_count(&b, "action=joystick_begin&interval=2000&channels=16"), 1);
+  CHECK_INT(fk_count(&b, "joystick_end"), 0);
+  /* back to A (it streams on to us at 250 Hz, as first asked) with 200 Hz: A is restarted when it locks */
+  snprintf(c.module_ip, sizeof c.module_ip, "127.0.0.2");
+  c.interval_us = 5000;
+  CHECK_INT(eng_update_config(E, &c, ENG_F_MODULE_IP | ENG_F_INTERVAL, NULL, err, sizeof err), 0);
+  CHECK(WAIT(5000, S.bound && !strcmp(S.source, "127.0.0.2")));
+  CHECK(WAIT(5000, fk_count(&a, "action=joystick_end") == 1));
+  CHECK(WAIT(3000, fk_count(&a, "action=joystick_begin&interval=5000&channels=16") >= 1));
+  CHECK(WAIT(3000, fk_interval(&a) == 5000));
+  CHECK(WAIT(4000, S.rate_hz > 150 && S.rate_hz < 250));
+  CHECK_INT(fk_count(&b, "joystick_end"), 0);           /* the one left now: nothing */
+  CHECK(WAIT(1000, logged("127.0.0.2 still streams 250 Hz, 16 channels from before the change") == 1));
+  finish();
+  fk_stop(&a);
+  fk_stop(&b);
+}
+
+/* Setting the module IP to the module streaming now: the joystick is not centered (no blip), no relock */
+static void t_same_target_no_center(void) {
+  uint16_t U = free_udp(), H = free_tcp();
+  fake_t m;
+  fk_start(&m, "127.0.0.2", false, H, U);
+  for (int i = 0; i < 16; i++) m.values[i] = 1000;
+  m.values[8] = 32767;                                  /* button 1 held */
+  start(U, H, "", true);
+  fk_beacon(&m);
+  CHECK(WAIT(5000, S.bound));
+  CHECK(WAIT(2000, K.axis[0] == 1000 && K.btn[0]));
+  sink_pump();
+  int centers = K.abs_center, locks = logged("Joystick source locked");
+  snprintf(g_ip, sizeof g_ip, "127.0.0.2");
+  char err[256];
+  CHECK_INT(set_cfg(set_ip, err, sizeof err), 0);
+  CHECK(WAIT(1000, logged("Target module set to 127.0.0.2 - streaming from it already") == 1));
+  sleep_ms(300);
+  snap();
+  CHECK_INT(K.abs_center, centers);
+  CHECK(K.btn[0]);
+  CHECK_INT(logged("Joystick source locked"), locks);
+  CHECK_INT(fk_nposts(&m), 1);                          /* nothing sent */
+  CHECK(S.bound);
+  finish();
+  fk_stop(&m);
+}
+
+/* Stop and start (or a port change) keep what the beacons said: an ELRS module streaming on (it sends no
+ * beacon while it streams) stays "ELRS", and a rate change restarts it at once, not after 20 s */
+static void t_kind_after_stop_start(void) {
+  uint16_t U = free_udp(), H = free_tcp();
+  fake_t m;
+  fk_start(&m, "127.0.0.2", false, H, U);
+  start(U, H, "", false);
+  fk_beacon(&m);
+  CHECK(WAIT(5000, S.bound && S.kind == WIFI_KIND_ELRS));
+  eng_stop(E);
+  eng_start(E);
+  CHECK(eng_wait_applied(E, 3000));                     /* (the snapshot is of the new session from here) */
+  CHECK_INT(logged("Stopped."), 1);
+  CHECK(WAIT(3000, S.bound));
+  CHECK_INT(S.kind, WIFI_KIND_ELRS);
+  CHECK_STR(S.module_name, "Unified TX");
+  char err[256];
+  CHECK_INT(set_cfg(inc_rate, err, sizeof err), 0);
+  CHECK(WAIT(2000, S.restarts == 1));
+  CHECK_INT(logged("may be Crossfire"), 0);
+  /* a port change too (a new session on the new port) */
+  uint16_t U2 = free_udp();
+  fk_lock(&m);
+  m.dest_port = U2;
+  fk_unlock(&m);
+  g_port = U2;
+  CHECK_INT(set_cfg(set_port, err, sizeof err), 0);
+  CHECK(WAIT(3000, S.bound && S.cfg.port == U2));
+  CHECK_INT(S.kind, WIFI_KIND_ELRS);
+  CHECK_INT(set_cfg(set_8ch, err, sizeof err), 0);
+  CHECK(WAIT(2000, S.restarts == 2));
+  CHECK_INT(logged("may be Crossfire"), 0);
+  /* the port and the module IP in one change while listening: used at once, said so */
+  uint16_t U3 = free_udp();
+  fk_lock(&m);
+  m.dest_port = U3;
+  fk_unlock(&m);
+  eng_config_t c;
+  memset(&c, 0, sizeof c);
+  c.port = U3;
+  snprintf(c.module_ip, sizeof c.module_ip, "127.0.0.2");
+  CHECK_INT(eng_update_config(E, &c, ENG_F_PORT | ENG_F_MODULE_IP, NULL, err, sizeof err), 0);
+  CHECK(WAIT(3000, logged("Module IP set to 127.0.0.2") == 1));
+  CHECK_INT(logged("used when listening starts"), 0);
+  CHECK(WAIT(3000, S.bound && S.cfg.port == U3));
+  finish();
+  fk_stop(&m);
+}
+
 /* many threads poking the API while frames stream (for the sanitizers) */
 static void *poker(void *arg) {
   (void)arg;
@@ -1130,6 +1451,12 @@ static void *poker(void *arg) {
     eng_set_config(E, &c, err, sizeof err);
     if (i % 50 == 0) eng_restart_stream(E);
     if (i % 70 == 0) { eng_stop(E); eng_start(E); }
+    if (i % 3 == 0) {                                   /* each thread its own field: merged, never undone */
+      eng_config_t u;
+      memset(&u, 0, sizeof u);
+      u.interval_us = 1000 + 1000 * (i % 5);
+      eng_update_config(E, &u, ENG_F_INTERVAL, NULL, err, sizeof err);
+    }
     eng_log_read(E, s.log_seq > 10 ? s.log_seq - 10 : 0, l, 16);
     eng_log(E, "poke %d", i);
     eng_wait(E, s.seq, s.log_seq, 1);
@@ -1159,11 +1486,15 @@ int main(int argc, char **argv) {
   signal(SIGPIPE, SIG_IGN);
   setvbuf(stderr, NULL, _IONBF, 0);
   int64_t t0 = now_us();
-  /* one part: test_engine config|flow|xf|mismatch|status|bind|joyfail|log|shutdown|joywrite|concurrency */
+  /* one part: test_engine config|flow|xf|mismatch|status|bind|joyfail|log|shutdown|joywrite|concurrency|burst|
+   * update|applied|owngap|switch|sametarget|kind */
   static const struct { const char *name; void (*fn)(void); } PARTS[] = {
     { "config", t_config_check }, { "flow", t_flow }, { "xf", t_crossfire_and_target }, { "mismatch", t_mismatch },
     { "status", t_status_texts }, { "bind", t_bind_error }, { "joyfail", t_joystick_fails }, { "log", t_log_ring },
     { "shutdown", t_shutdown_and_stale }, { "joywrite", t_joy_write_error }, { "concurrency", t_concurrency },
+    { "burst", t_command_burst }, { "update", t_update_config }, { "applied", t_wait_applied },
+    { "owngap", t_own_restart_no_gap }, { "switch", t_switch_module_and_rate }, { "sametarget", t_same_target_no_center },
+    { "kind", t_kind_after_stop_start },
   };
   if (argc > 1) {
     for (size_t i = 0; i < sizeof PARTS / sizeof PARTS[0]; i++)
@@ -1183,6 +1514,13 @@ int main(int argc, char **argv) {
   t_shutdown_and_stale();
   t_joy_write_error();
   t_concurrency();
+  t_command_burst();
+  t_update_config();
+  t_wait_applied();
+  t_own_restart_no_gap();
+  t_switch_module_and_rate();
+  t_same_target_no_center();
+  t_kind_after_stop_start();
   fprintf(stderr, "  test_engine took %.1f s\n", (double)(now_us() - t0) / 1e6);
   T_DONE();
 }

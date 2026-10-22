@@ -88,8 +88,11 @@ void hints_uinput(int err, const char *path, const char *user, char *out, size_t
       break;
     case EACCES:
     case EPERM:
-      snprintf(out, cap, "no permission to use %s - run packaging/install.sh once (its udev rule gives you access), "
-               "or for this boot only: sudo setfacl -m u:%s:rw %s", path, user, path);
+      /* the rule's uaccess covers only the user at the machine's screen: over SSH, or for a service
+       * started at boot, access comes from the input group (the fix the installer prints too) */
+      snprintf(out, cap, "no permission to use %s - run the install script with sudo (its udev rule gives access); "
+               "over SSH or for a service also: sudo usermod -aG input %s, log in again (this boot only: "
+               "sudo setfacl -m u:%s:rw %s)", path, user, user, path);
       break;
     case ENODEV:
     case ENXIO:

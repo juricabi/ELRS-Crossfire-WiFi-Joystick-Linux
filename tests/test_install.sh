@@ -6,8 +6,9 @@
 # so a test also fails when the script calls something unexpected.
 #
 #   sh tests/test_install.sh [-v]
-# Every case runs under each shell found among: sh, dash, bash --posix, busybox sh (SHELLS="dash" to
-# pick). Exit status 0 when every check passed.
+# Every case runs under each shell found among: sh, dash, bash --posix, busybox sh (SHELLS to pick: one
+# per line, a name on PATH or a path, with its arguments: SHELLS="dash" or SHELLS="/bin/busybox sh").
+# Exit status 0 when every check passed.
 # shellcheck disable=SC2329  # the check helpers and cases are called through check / the case list
 # shellcheck disable=SC2016  # the fake commands are written with printf: their $ are theirs
 set -u
@@ -20,7 +21,8 @@ VERBOSE=0
 [ "${1:-}" = -v ] && VERBOSE=1
 
 W=$(mktemp -d "${TMPDIR:-/tmp}/test-install.XXXXXX") || exit 1
-trap 'rm -rf "$W"' EXIT
+SOCKDIRS=                     # (set before the trap: with set -u an unset one would keep $W from being removed)
+trap 'rm -rf "$W" $SOCKDIRS' EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
@@ -172,7 +174,7 @@ case "$*" in *is-active*) echo active ;; esac
 exit 0
 EOF
 
-for c in modprobe udevadm; do
+for c in modprobe udevadm sync; do
   printf '#!/bin/sh\necho "%s $*" >> "$FAKE_LOG"\n' "$c" | fake "$c"
 done
 
@@ -185,17 +187,25 @@ done
 printf '#!/bin/sh\n{ printf wget; for a in "$@"; do printf " [%%s]" "$a"; done; echo; } >> "$FAKE_LOG"\nf=$FAKE_WEB/${4#https://}\n[ -f "$f" ] || exit 8\ncp "$f" "$3"\n' > "$W/wget/wget"
 printf '#!/bin/sh\necho "shasum $*" >> "$FAKE_LOG"\n[ "$1 $2" = "-a 256" ] || exit 1\nexec %s "$3"\n' "$SHA256SUM" > "$W/shasum/shasum"
 chmod 755 "$W/wget/wget" "$W/shasum/shasum"
-# the full set; tests drop curl or sha256sum by using another PATH
+# the full set; tests drop curl, sha256sum or systemctl by using another PATH
 cp "$FAKE"/* "$W/nocurl/"
 rm "$W/nocurl/curl"
+mkdir -p "$W/nosystemctl"
+cp "$FAKE"/* "$W/nosystemctl/"
+rm "$W/nosystemctl/systemctl"
 
 # ------------------------------------------------------------------ the fake GitHub
-fakebin() {  # out version arch [runs]
-  if [ "${4:-runs}" = runs ]; then
-    printf '#!/bin/sh\n# fake %s %s for %s\n[ "${1:-}" = --version ] && echo "%s %s"\nexit 0\n' "$APP" "$2" "$3" "$APP" "$2" > "$1"
-  else
-    printf '#!/bin/sh\n# fake %s that does not run here\necho "Illegal instruction" >&2\nexit 132\n' "$APP" > "$1"
-  fi
+fakebin() {  # out version arch [runs|norun|noexec-tmp|noexec]
+  case ${4:-runs} in
+    runs)
+      printf '#!/bin/sh\n# fake %s %s for %s\n[ "${1:-}" = --version ] && echo "%s %s"\nexit 0\n' "$APP" "$2" "$3" "$APP" "$2" > "$1" ;;
+    norun)
+      printf '#!/bin/sh\n# fake %s that does not run here\necho "Illegal instruction" >&2\nexit 132\n' "$APP" > "$1" ;;
+    noexec-tmp)   # what exec does from a TMPDIR mounted noexec: refused there (126), fine elsewhere
+      printf '#!/bin/sh\ncase $0 in "%s"/*) echo "$0: Permission denied" >&2; exit 126 ;; esac\n[ "${1:-}" = --version ] && echo "%s %s"\nexit 0\n' "$W/tmp" "$APP" "$2" > "$1" ;;
+    noexec)
+      printf '#!/bin/sh\necho "$0: Permission denied" >&2\nexit 126\n' > "$1" ;;
+  esac
 }
 
 release() {  # web-dir version: the assets of release v<version>
@@ -303,7 +313,10 @@ unit_for() {  # exec path -> the unit the installer should write
 make_socket() {  # path: a unix socket file (a running systemd user manager), with python3
   command -v python3 >/dev/null 2>&1 || return 1
   mkdir -p "${1%/*}"
-  python3 -c 'import socket, sys; socket.socket(socket.AF_UNIX).bind(sys.argv[1])' "$1"
+  # a unix socket path has at most 107 bytes (a long TMPDIR): made in a short directory, linked from path
+  ms_d=$(mktemp -d /tmp/ti-sock.XXXXXX) || return 1
+  SOCKDIRS="$SOCKDIRS $ms_d"
+  python3 -c 'import socket, sys; socket.socket(socket.AF_UNIX).bind(sys.argv[1])' "$ms_d/s" && ln -s "$ms_d/s" "$1"
 }
 
 BINREL=$WEB/github.com/$REPO/releases/download
@@ -339,7 +352,7 @@ case_options() {
 
 case_arch() {
   begin arch
-  for pair in x86_64:x86_64 amd64:x86_64 i386:i686 i486:i686 i586:i686 i686:i686 aarch64:aarch64 arm64:aarch64 \
+  for pair in x86_64:x86_64 amd64:x86_64 i686:i686 aarch64:aarch64 arm64:aarch64 \
               armv7l:armv7 armv8l:armv7 armv6l:armv6 riscv64:riscv64; do
     T_MACHINE=${pair%%:*}
     inst --dry-run --root "$R"
@@ -348,7 +361,8 @@ case_arch() {
   done
   check "dry run: nothing written" empty_dir "$R"
   check "dry run: nothing downloaded" not_logged curl
-  for m in armv5tel mips64 s390x ppc64le sparc64 aarch64_be; do
+  # i386..i586: a kernel on a CPU before the Pentium Pro (no CMOV): the i686 binary would die (SIGILL)
+  for m in armv5tel mips64 s390x ppc64le sparc64 aarch64_be i386 i486 i586; do
     T_MACHINE=$m
     inst --root "$R"
     check "uname -m $m: exit 1" rc_is 1
@@ -386,15 +400,17 @@ case_system_latest() {
   check "web page hint" has "http://127.0.0.1:11000/"
   check "no temp files left in the root" no_temp "$R"
   check "temp dir cleaned" empty_dir "$W/tmp"
+  check "the binary's data synced before the rename" logged "sync -- $R/usr/local/bin/.$APP.tmp."
+  check "the rule's data synced before the rename" logged "sync -- $R/etc/udev/rules.d/.60-$APP.rules.tmp."
   check "only these files" files_are "$R" "./etc/modules-load.d/$APP-uinput.conf" "./etc/udev/rules.d/60-$APP.rules" \
     "./usr/local/bin/$APP" "./usr/local/share/$APP/installed"
 }
 empty_file() { [ ! -s "$1" ]; }
 no_temp() { [ -z "$(find "$1" -name '.*.tmp.*')" ]; }
-files_are() {
+files_are() {  # dir, the files (and links) it must hold, nothing else (none: no file at all)
   fa_d=$1
   shift
-  printf '%s\n' "$@" | LC_ALL=C sort > "$W/want.files"
+  if [ $# = 0 ]; then : > "$W/want.files"; else printf '%s\n' "$@" | LC_ALL=C sort > "$W/want.files"; fi
   files_in "$fa_d" > "$W/got.files"
   cmp -s "$W/want.files" "$W/got.files"
 }
@@ -419,12 +435,26 @@ case_versions_and_update() {
   check "...and the binary stays" same "$R/usr/local/bin/$APP" "$BINREL/v1.2.3/$APP-1.2.3-linux-armv7"
   inst --root "$R" --no-udev --version latest
   check "--no-udev later: the rule stays on the record" record_is "$R/usr/local/share/$APP/installed" \
-    "file /usr/local/bin/$APP" "file /etc/udev/rules.d/60-$APP.rules" "file /etc/modules-load.d/$APP-uinput.conf"
+    "file /usr/local/bin/$APP" "file /etc/udev/rules.d/60-$APP.rules" "file /etc/modules-load.d/$APP-uinput.conf" \
+    no-udev
   rm -rf "${R:?}"/*
   inst --root "$R" --no-udev
   check "--no-udev: no rule" gone "$R/etc/udev/rules.d/60-$APP.rules"
   check "--no-udev: no modules-load file" gone "$R/etc/modules-load.d/$APP-uinput.conf"
-  check "--no-udev: record" record_is "$R/usr/local/share/$APP/installed" "file /usr/local/bin/$APP"
+  check "--no-udev: record (remembered)" record_is "$R/usr/local/share/$APP/installed" "file /usr/local/bin/$APP" no-udev
+  # the documented update ("run it again") keeps that choice: no rule appears
+  inst --root "$R"
+  check "update after --no-udev: exit 0" rc_is 0
+  check "update after --no-udev: still no rule" gone "$R/etc/udev/rules.d/60-$APP.rules"
+  check "update after --no-udev: still no modules-load file" gone "$R/etc/modules-load.d/$APP-uinput.conf"
+  check "update after --no-udev: said" has "as an earlier --no-udev asked"
+  check "update after --no-udev: record" record_is "$R/usr/local/share/$APP/installed" "file /usr/local/bin/$APP" no-udev
+  # --udev: set up again, forgotten
+  inst --root "$R" --udev
+  check "--udev: exit 0" rc_is 0
+  check "--udev: the rule" same "$R/etc/udev/rules.d/60-$APP.rules" "$PKG/60-$APP.rules"
+  check "--udev: record" record_is "$R/usr/local/share/$APP/installed" "file /usr/local/bin/$APP" \
+    "file /etc/udev/rules.d/60-$APP.rules" "file /etc/modules-load.d/$APP-uinput.conf"
 }
 
 case_bad_downloads() {
@@ -468,6 +498,23 @@ case_bad_downloads() {
   check "--root + a binary for another machine: exit 0" rc_is 0
   check "--root + a binary for another machine: installed" same "$R/usr/local/bin/$APP" "$W/norun"
   check "--root + a binary for another machine: noted" has "not run here"
+  # TMPDIR mounted noexec (hardened systems): the check runs from where it goes
+  T_UID=1000 T_USER=alice T_HOME=$W/home/alice
+  rm -rf "$T_HOME"
+  mkdir -p "$T_HOME"
+  fakebin "$W/nxtmp" 1.2.3 x86_64 noexec-tmp
+  inst --user --file "$W/nxtmp"
+  check "TMPDIR noexec: exit 0" rc_is 0
+  check "TMPDIR noexec: installed" same "$T_HOME/.local/bin/$APP" "$W/nxtmp"
+  check "TMPDIR noexec: version shown" has "Version: 1.2.3"
+  check "TMPDIR noexec: no check file left" files_are "$T_HOME" "./.local/bin/$APP" "./.local/share/$APP/installed"
+  fakebin "$W/nx" 1.2.3 x86_64 noexec
+  rm -rf "$T_HOME"
+  mkdir -p "$T_HOME"
+  inst --user --file "$W/nx"
+  check "not executable anywhere: exit 1" rc_is 1
+  check "not executable anywhere: says noexec" has "mounted noexec"
+  check "not executable anywhere: nothing installed" files_are "$T_HOME"
 }
 
 case_token() {
@@ -487,15 +534,36 @@ case_token() {
   check "token, a tag (one-line JSON): exit 0" rc_is 0
   check "token, a tag: the binary" same "$R/usr/local/bin/$APP" "$BINREL/v1.1.0/$APP-1.1.0-linux-i686"
   check "token, a tag: the tag's API" logged "[https://api.github.com/repos/$REPO/releases/tags/v1.1.0]"
+  # a token that cannot read it (expired, another account's) while the release is public: the public download
   T_TOKEN=wrong
+  rm -rf "${R:?}"/*
+  T_MACHINE=x86_64
   inst --root "$R"
-  check "a wrong token: exit 1" rc_is 1
-  check "a wrong token: said" has "cannot read release latest"
+  check "a wrong token, a public release: exit 0" rc_is 0
+  check "a wrong token, a public release: said" has "GITHUB_TOKEN cannot read release latest"
+  check "a wrong token, a public release: the public binary" same "$R/usr/local/bin/$APP" "$BINREL/v1.2.3/$APP-1.2.3-linux-x86_64"
   T_TOKEN=$TOKEN
   T_PATH=$PATH_WGET
   inst --root "$R"
-  check "token without curl: exit 1" rc_is 1
-  check "token without curl: said" has "needs curl"
+  check "token without curl, a public release: exit 0 (wget)" rc_is 0
+  check "token without curl: said" has "GITHUB_TOKEN is used only with curl"
+  check "token without curl: never given to wget" not_logged "$TOKEN"
+  # a private release (no public download) and a token that cannot read it: said what to do
+  priv=$W/privweb
+  rm -rf "$priv"
+  mkdir -p "$priv"
+  cp -R "$WEB/api.github.com" "$priv/"
+  WEB_SAVE=$WEB
+  WEB=$priv
+  T_PATH=$PATH_STD
+  T_TOKEN=wrong
+  inst --root "$R"
+  check "a wrong token, a private release: exit 1" rc_is 1
+  check "a wrong token, a private release: said" has "GITHUB_TOKEN must be able to read it"
+  T_TOKEN=$TOKEN
+  inst --root "$R"
+  check "the right token, a private release: exit 0" rc_is 0
+  WEB=$WEB_SAVE
 }
 
 case_wget_and_shasum() {
@@ -630,6 +698,55 @@ case_uninstall() {
 }
 
 # without --root: a user install into a temporary HOME runs the user-level commands (fake systemctl)
+# an install that stops halfway (a later step fails, Ctrl-C) is on the record: --uninstall removes what it left
+case_partial() {
+  begin partial
+  T_UID=1000 T_USER=alice T_HOME=$W/home/alice
+  mkdir -p "$R$T_HOME"
+  : > "$R$T_HOME/.config"                  # a file where the unit's directory must go: the unit fails
+  fakebin "$W/mybin" 7.0.0 x86_64
+  inst --root "$R" --user --file "$W/mybin" --service
+  check "partial: exit 1" rc_is 1
+  check "partial: the binary got in" test -f "$R$T_HOME/.local/bin/$APP"
+  inst --root "$R" --user --uninstall
+  check "partial: uninstall exit 0" rc_is 0
+  check "partial: uninstall removed the binary" gone "$R$T_HOME/.local/bin/$APP"
+  check "partial: the unit that never came: skipped" has "(already gone)"
+  check "partial: no record left" gone "$R$T_HOME/.local/share/$APP/installed"
+}
+
+# no systemd here (OpenRC, runit, sysvinit): --service is refused instead of a unit that never starts
+case_no_systemd() {
+  begin no-systemd
+  T_UID=1000 T_USER=alice T_HOME=$W/home/alice
+  mkdir -p "$T_HOME"
+  T_PATH=$W/nosystemctl:$W/sys
+  fakebin "$W/mybin" 7.0.0 x86_64
+  inst --user --file "$W/mybin" --service
+  check "no systemd, --service: exit 1" rc_is 1
+  check "no systemd, --service: said" has "this system has no systemd"
+  check "no systemd, --service: never 'Service enabled'" hasnt "Service enabled"
+  check "no systemd, --service: nothing installed" files_are "$T_HOME"
+  inst --user --file "$W/mybin"
+  check "no systemd, no --service: exit 0" rc_is 0
+}
+
+# a copy for the user (~/.local/bin, first on PATH) and then one with sudo: told, so the old one is not run
+case_two_copies() {
+  begin two-copies
+  T_UID=1000 T_USER=alice T_HOME=/home/alice
+  inst --root "$R"
+  check "user copy: exit 0" rc_is 0
+  check "user copy: the note says sudo installs another copy" has "remove this copy - sh install.sh --uninstall"
+  T_UID=0 T_USER=root T_HOME=/root T_SUDO=alice
+  inst --root "$R"
+  check "system copy next to a user copy: exit 0" rc_is 0
+  check "system copy next to a user copy: warned" has "alice also has a copy in /home/alice/.local/bin"
+  T_SUDO=bob
+  inst --root "$R"
+  check "another user without a copy: no warning" hasnt "also has a copy"
+}
+
 case_live_user() {
   begin live-user
   T_UID=1000 T_USER=alice T_HOME=$W/home/alice T_RT=$W/home/rt
@@ -649,7 +766,11 @@ case_live_user() {
   check "live uninstall, no session: the link is gone" gone "$T_HOME/.config/systemd/user/default.target.wants/$APP.service"
   check "live uninstall, no session: the unit is gone" gone "$T_HOME/.config/systemd/user/$APP.service"
   check "live uninstall: the binary is gone" gone "$T_HOME/.local/bin/$APP"
-  if make_socket "$T_RT/systemd/private"; then
+  if ! command -v python3 >/dev/null 2>&1; then
+    echo "  (python3 is missing: the live session case is skipped)"
+  elif ! make_socket "$T_RT/systemd/private"; then
+    fail "live: cannot make the fake user manager's socket $T_RT/systemd/private"
+  else
     inst --user --file "$W/mybin" --service
     check "live, session: exit 0" rc_is 0
     check "live, session: daemon-reload" logged "systemctl --user daemon-reload (XDG_RUNTIME_DIR=$T_RT)"
@@ -662,14 +783,27 @@ case_live_user() {
     check "live uninstall, session: disable --now" logged "systemctl --user disable --now $APP.service"
     check "live uninstall, session: daemon-reload after" logged "systemctl --user daemon-reload"
     check "live uninstall, session: unit gone" gone "$T_HOME/.config/systemd/user/$APP.service"
-  else
-    echo "  (python3 is missing: the live session case is skipped)"
   fi
 }
 
 # ================================================================== run
 if [ -n "${SHELLS:-}" ]; then
-  LIST=$SHELLS
+  # each its path (a run has only the fakes on PATH): "dash" -> /usr/bin/dash, "bash --posix" -> /bin/bash --posix
+  LIST=
+  while IFS= read -r sl; do
+    [ -n "$sl" ] || continue
+    sl_cmd=${sl%% *}
+    sl_rest=${sl#"$sl_cmd"}
+    case $sl_cmd in
+      /*) ;;
+      *) sl_cmd=$(command -v "$sl_cmd" 2>/dev/null) || sl_cmd=$(ext "${sl%% *}") ||
+           { echo "test_install.sh: SHELLS: no ${sl%% *} here" >&2; exit 2; } ;;
+    esac
+    LIST="$LIST
+$sl_cmd$sl_rest"
+  done <<EOF
+$SHELLS
+EOF
 else
   LIST=
   for s in sh dash bash busybox; do
@@ -706,7 +840,8 @@ case_smoke() {
 }
 suite() {
   for c in case_options case_arch case_system_latest case_versions_and_update case_bad_downloads case_token \
-           case_wget_and_shasum case_file case_user case_system_service case_uninstall case_live_user; do
+           case_wget_and_shasum case_file case_user case_system_service case_uninstall case_partial case_no_systemd \
+           case_two_copies case_live_user; do
     $c
   done
 }

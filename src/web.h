@@ -1,5 +1,5 @@
 /* The web page and its JSON API (docs/WEB_API.md), served on its own thread. It reads the engine
- * through eng_snapshot / eng_log_read and changes it through eng_set_config / eng_start / eng_stop /
+ * through eng_snapshot / eng_log_read and changes it through eng_update_config / eng_start / eng_stop /
  * eng_restart_stream only: it never touches the receive path. */
 #ifndef WEB_H
 #define WEB_H

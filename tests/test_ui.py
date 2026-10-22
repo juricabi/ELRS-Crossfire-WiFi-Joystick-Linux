@@ -19,6 +19,7 @@ import glob
 import json
 import os
 import re
+import shutil
 import socket
 import subprocess
 import sys
@@ -128,6 +129,13 @@ class Demo:
     def module_ip(self):
         return "127.0.0.2"
 
+    def identify(self):
+        pass
+
+    def restart(self, power_cycle=True):
+        """as if the program restarted: a new instance, the log and the uptime from 0"""
+        self.cmd("restart")
+
     def kill(self):
         self.p.kill()
         self.p.wait(5)
@@ -140,6 +148,8 @@ class Demo:
                 self.p.wait(3)
             except (OSError, subprocess.TimeoutExpired):
                 self.p.kill()
+                self.p.wait(3)
+        shutil.rmtree(self.tmp, ignore_errors=True)    # the demo's build
 
 
 class Real:
@@ -155,20 +165,49 @@ class Real:
                                          beacon_to=("127.0.0.1", self.udp)).start()
         self.xf = None
         self.out = []
-        self.p = subprocess.Popen([binary, "--no-joystick", "--no-config", "--daemon", "--port", str(self.udp),
+        self.binary = binary
+        self.url = f"http://127.0.0.1:{self.web}/"
+        self._run()
+
+    def _run(self):
+        self.p = subprocess.Popen([self.binary, "--no-joystick", "--no-config", "--daemon", "--port", str(self.udp),
                                    "--http-port", str(self.http_port), "--web", f"127.0.0.1:{self.web}"],
                                   stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-        threading.Thread(target=self._read, daemon=True).start()
-        self.url = f"http://127.0.0.1:{self.web}/"
+        threading.Thread(target=self._read, args=(self.p,), daemon=True).start()
         try:
             wait_until(lambda: http(self.url, "/api/status")[0] == 200, 8, "the web page of the program")
         except AssertionError:
             self.close()
             raise AssertionError("the program did not serve its page; its output:\n" + "".join(self.out[-30:]))
 
-    def _read(self):
-        for line in self.p.stdout:
+    def _read(self, p):
+        for line in p.stdout:
             self.out.append(line)
+
+    def kind(self):
+        return (http(self.url, "/api/status")[1]["module"] or {}).get("kind")
+
+    def identify(self):
+        """the ELRS module known by its beacon (it beacons only while not streaming): powered off and on when the
+        program does not know it (a new program, while it streamed on)"""
+        if self.kind() == "ELRS":
+            return
+        with self.elrs.lock:
+            self.elrs.active = False
+        wait_until(lambda: self.kind() == "ELRS", 20, "the module identified by its beacon")
+
+    def restart(self, power_cycle=True):
+        """the program ends and starts again (a service restart, an update); power_cycle: the module too (it
+        beacons again), else it streams on to the new program, which then knows nothing about it"""
+        self.p.terminate()
+        self.p.wait(5)
+        if power_cycle:
+            with self.elrs.lock:
+                self.elrs.active = False
+        self._run()
+        if power_cycle:
+            self.wait_streaming()
+            self.identify()
 
     def wait_streaming(self):
         wait_until(lambda: http(self.url, "/api/status")[1]["state"] == "streaming", 10, "streaming")
@@ -190,6 +229,8 @@ class Real:
                 self.xf = None
 
     def make_log_lines(self, n, tag):
+        # each restart of an identified ELRS module logs at once (one that may be Crossfire would wait)
+        self.identify()
         for _ in range(n):
             assert http(self.url, "/api/restart", {})[0] == 200
             time.sleep(0.06)
@@ -487,12 +528,20 @@ def t_start_stop(br, h):
     expect(ss).to_have_text("Stop", timeout=3000)
     wait_streaming_page(pg, h)
     expect(pct(p, 0)).not_to_have_text("--")
+    # the module streamed on (Stop sends no joystick_end) and so sent no beacon: still known as ELRS, and a
+    # restart goes out at once (not after the 20 s wait for a module that may be Crossfire)
+    expect(p.locator("#bDetail")).to_contain_text("127.0.0.2 · ELRS · Unified TX", timeout=3000)
+    before = http(h.url, "/api/status")[1]["counters"]["restarts"]
+    p.get_by_role("button", name="Restart stream").click()
+    expect(p.locator("#actMsg")).to_have_text("Asked the module to restart its stream.", timeout=3000)
+    wait_until(lambda: http(h.url, "/api/status")[1]["counters"]["restarts"] > before, 5, "the restart counter")
     assert not pg.problems(), pg.problems()
     pg.close()
 
 
 def t_restart(br, h):
     """Restart stream: enabled while an ELRS module streams; it asks the module again"""
+    h.identify()                               # (whatever ran before: an ELRS module known by its beacon)
     pg = Page(br, h.url)
     p = pg.page
     wait_streaming_page(pg, h)
@@ -504,6 +553,85 @@ def t_restart(br, h):
     expect(p.locator("#log")).to_contain_text("Restarting the stream", timeout=3000)
     wait_until(lambda: http(h.url, "/api/status")[1]["counters"]["restarts"] > before, 5, "the restart counter")
     wait_streaming_page(pg, h)
+    assert not pg.problems(), pg.problems()
+    pg.close()
+
+
+def t_restart_deferred(br, h):
+    """Restart stream of a module not identified yet (16 channels, no beacon: maybe Crossfire): the page says
+    the restart waits; the program restarts it within 20 s"""
+    if h.name == "demo":
+        h.cmd("kind wifi")
+    else:
+        h.restart(power_cycle=False)           # a new program: the module streams on and sends no beacon
+    try:
+        pg = Page(br, h.url)
+        p = pg.page
+        wait_streaming_page(pg, h)
+        expect(p.locator("#bDetail")).to_contain_text("127.0.0.2 · WiFi", timeout=3000)
+        before = http(h.url, "/api/status")[1]["counters"]["restarts"]
+        p.get_by_role("button", name="Restart stream").click()
+        expect(p.locator("#actMsg")).to_have_text(re.compile(r"^The module has sent no beacon yet, so it may be Crossfire "
+                                                             r"\(never sent joystick_end\): its stream restarts once it has "
+                                                             r"streamed 20 s without a Crossfire beacon"), timeout=3000)
+        if h.name == "real":
+            expect(p.locator("#log")).to_contain_text("may be Crossfire (no beacon from it yet)", timeout=3000)
+            wait_until(lambda: http(h.url, "/api/status")[1]["counters"]["restarts"] > before, 25, "the restart, 20 s on")
+            expect(p.locator("#log")).to_contain_text("Restarting the stream of 127.0.0.2", timeout=3000)
+        assert not pg.problems(), pg.problems()
+        pg.close()
+    finally:
+        if h.name == "demo":
+            h.cmd("kind elrs")
+        else:
+            h.identify()
+
+
+def t_restart_keeps_unapplied(br, h):
+    """the program restarts while a channel change waits for Apply: the field keeps the user's value"""
+    pg = Page(br, h.url)
+    p = pg.page
+    wait_streaming_page(pg, h)
+    p.select_option("#fCh", "8")
+    p.locator("#fPort").focus()                # (not the select being edited)
+    h.restart()
+    wait_streaming_page(pg, h)
+    p.wait_for_timeout(1500)                   # the page sees the new instance and reads the settings again
+    expect(p.locator("#fCh")).to_have_value("8")
+    expect(p.locator("#revert")).to_be_visible()
+    p.get_by_role("button", name="Undo changes").click()
+    expect(p.locator("#fCh")).to_have_value("16")
+    assert not pg.problems(allow=(r"ERR_CONNECTION_REFUSED", r"requestfailed", r"ERR_EMPTY_RESPONSE")), pg.problems()
+    pg.close()
+
+
+def t_log_restart(br, h):
+    """the program restarted while the page was hidden, and has run longer and logged more since: the log shows
+    the new run from its first line and nothing of the old one (demo only: it restarts at once)"""
+    if h.name != "demo":
+        return "skipped (demo only)"
+    h.restart()                                # an uptime and a log both short
+    pg = Page(br, h.url)
+    p = pg.page
+    wait_streaming_page(pg, h)
+    h.cmd("log old-run-marker")
+    log = p.locator("#log")
+    expect(log).to_contain_text("old-run-marker", timeout=3000)
+    hide = """() => { Object.defineProperty(document, 'visibilityState', { configurable: true, get: () => 'hidden' });
+                      document.dispatchEvent(new Event('visibilitychange')); }"""
+    show = hide.replace("'hidden'", "'visible'")
+    p.evaluate(hide)
+    p.wait_for_timeout(1200)                   # the last polls finish
+    h.restart()
+    h.cmd("log new-run-first")
+    for i in range(20):
+        h.cmd(f"log new-run {i}")
+    p.wait_for_timeout(2500)                   # the new run is older than the old one was
+    p.evaluate(show)
+    expect(log).to_contain_text("new-run 19", timeout=3000)
+    expect(log).to_contain_text("new-run-first")
+    expect(log).not_to_contain_text("old-run-marker")
+    expect(log.locator("div").first).to_contain_text("restarted")    # the new run's line 1
     assert not pg.problems(), pg.problems()
     pg.close()
 
@@ -717,12 +845,31 @@ def t_states(br, h):
     h.cmd("state searching connecting to 10.0.0.9")
     expect(p.locator("#bDetail")).to_have_text("connecting to 10.0.0.9", timeout=3000)
     expect(p.locator("#restart")).to_be_enabled()
+    # running but the UDP port cannot be bound: nothing could be sent (the program would only log "Not listening")
+    h.cmd("state error UDP port 11000 in use")
+    expect(p.locator("#restart")).to_be_disabled(timeout=3000)
+    h.cmd("state searching connecting to 10.0.0.9")
+    expect(p.locator("#restart")).to_be_enabled(timeout=3000)
     assert http(h.url, "/api/config", {"module_ip": ""})[0] == 200
     h.cmd("state searching listening")
     expect(p.locator("#restart")).to_be_disabled(timeout=3000)
     h.cmd("present on")
     h.cmd("state streaming streaming")
     wait_streaming_page(pg, h)
+    assert not pg.problems(), pg.problems()
+    pg.close()
+
+
+def t_counters(br, h):
+    """the details: each counter under its own label (frames without stick data vs. another module's)"""
+    pg = Page(br, h.url)
+    p = pg.page
+    wait_streaming_page(pg, h)
+    p.locator("#details summary").click()
+    s = http(h.url, "/api/status")[1]["counters"]
+    value = lambda label: p.locator("#counters div").filter(has=p.locator("dt", has_text=label)).locator("dd")
+    expect(value("Ignored (no stick data)")).to_have_text(str(s["dropped_filter"]), timeout=3000)
+    expect(value("Ignored (other module)")).to_have_text(str(s["dropped_other"]), timeout=3000)
     assert not pg.problems(), pg.problems()
     pg.close()
 
@@ -743,7 +890,8 @@ def t_offline(br, h):
 
 
 TESTS = [t_load, t_bars, t_selects, t_apply, t_errors, t_crossfire, t_start_stop, t_restart, t_log, t_visibility,
-         t_phone, t_keyboard, t_no_shift, t_joystick, t_states, t_offline]
+         t_phone, t_keyboard, t_no_shift, t_joystick, t_states, t_restart_deferred, t_restart_keeps_unapplied,
+         t_log_restart, t_counters, t_offline]
 
 
 def chromium(pw):

@@ -5,10 +5,12 @@
 #              real (udev rule, modules-load file), tests/uinput_e2e.py reads the joystick as a member
 #              of the input group, then the systemd user service and --uninstall
 #   static     the six static binaries (zig cc, musl): checked with file/readelf, every unit test
-#              under qemu-user on the oldest CPU each one is for; uploaded as artifacts
+#              under qemu-user on the oldest CPU each one is for; the checked binaries uploaded as artifacts
 #   web        the web page in headless Chromium (Playwright), against the program and the demo
 #   core       core/ (shared with sticktime-pi) compiled and linked for Windows and macOS
-#   scripts    shellcheck, the installer tests (tests/test_install.sh), actionlint, Python syntax
+#   scripts    shellcheck, the installer tests (tests/test_install.sh: sh, dash, bash --posix, busybox ash),
+#              actionlint, Python syntax
+# zig comes from its PyPI wheel (the Zig project's), checked against the pinned hash ZIG_SHA256.
 name: build
 
 on:
@@ -27,6 +29,9 @@ concurrency:
 
 env:
   ZIG_VERSION: 0.15.2
+  # sha256 of ziglang-0.15.2-py3-none-manylinux_2_12_x86_64.manylinux2010_x86_64.musllinux_1_1_x86_64.whl
+  # (pypi.org/pypi/ziglang/0.15.2/json): the release binaries are built with it, so nothing unchecked
+  ZIG_SHA256: 806316453d1ede7174ed3fefb8e5348154629089c3bb5fe812dfd0e172fac130
   # UBSan reports must fail the tests, not just print
   UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
   ASAN_OPTIONS: detect_leaks=1
@@ -133,7 +138,9 @@ jobs:
           - { target: aarch64, file: "ELF 64-bit LSB executable, ARM aarch64", cpus: "qemu-aarch64-static:cortex-a53", arm: "" }
           - { target: armv7, file: "ELF 32-bit LSB executable, ARM, EABI5", cpus: "qemu-arm-static:cortex-a7 qemu-arm-static:cortex-a9,neon=off,vfp-d32=off", arm: "v7" }
           - { target: armv6, file: "ELF 32-bit LSB executable, ARM, EABI5", cpus: "qemu-arm-static:arm1176", arm: "v6" }
-          - { target: riscv64, file: "ELF 64-bit LSB executable, UCB RISC-V, RVC, double-float ABI", cpus: "qemu-riscv64-static:rv64", arm: "" }
+          # sifive-u54: RV64GC and nothing more (qemu's generic rv64 also runs Zba/Zbb/..., which boards
+          # like the VisionFive 1 or the Allwinner D1 lack)
+          - { target: riscv64, file: "ELF 64-bit LSB executable, UCB RISC-V, RVC, double-float ABI", cpus: "qemu-riscv64-static:sifive-u54", arm: "" }
     env:
       TARGET: ${{ matrix.target }}
       FILE_RE: ${{ matrix.file }}
@@ -141,10 +148,12 @@ jobs:
       ARM_ARCH: ${{ matrix.arm }}
     steps:
       - uses: actions/checkout@v4
-      - name: Install zig and qemu-user
+      - name: Install zig (checked against ZIG_SHA256) and qemu-user
         run: |
-          curl -fsSL --retry 5 "https://ziglang.org/download/$ZIG_VERSION/zig-x86_64-linux-$ZIG_VERSION.tar.xz" | tar -xJ -C "$RUNNER_TEMP"
-          echo "$RUNNER_TEMP/zig-x86_64-linux-$ZIG_VERSION" >> "$GITHUB_PATH"
+          python3 -m venv "$RUNNER_TEMP/zig"
+          printf 'ziglang==%s --hash=sha256:%s\n' "$ZIG_VERSION" "$ZIG_SHA256" > "$RUNNER_TEMP/zig.txt"
+          "$RUNNER_TEMP/zig/bin/pip" install --quiet --no-deps --require-hashes -r "$RUNNER_TEMP/zig.txt"
+          "$RUNNER_TEMP/zig/bin/python" -c 'import os, ziglang; print(os.path.dirname(ziglang.__file__))' >> "$GITHUB_PATH"
           sudo apt-get update -qq && sudo apt-get install -y -qq --no-install-recommends qemu-user-static file binutils
       - name: Build
         run: |
@@ -152,6 +161,8 @@ jobs:
           v=$(tr -d ' \r\n' < VERSION)
           case "$GITHUB_REF" in refs/tags/v*) ;; *) v="$v-dev.$(git rev-parse --short HEAD)" ;; esac
           echo "version $v"
+          # the unit tests below build with the same flags: nothing is recompiled or relinked with another version
+          { echo "VERSION=$v"; echo "WERROR=1"; } >> "$GITHUB_ENV"
           VERSION=$v WERROR=1 ./build.sh "$TARGET" all
       - name: Check the binary (static, no interpreter, the right architecture)
         run: |
@@ -170,6 +181,9 @@ jobs:
               [ $((a)) -ge 65536 ] || { echo "LOAD segment aligned to $a"; exit 1; }
             done
           fi
+          # this file, as checked, is the artifact (whatever the steps below build)
+          mkdir -p "$RUNNER_TEMP/dist"
+          cp "$b" "$RUNNER_TEMP/dist/elrs-wifi-joystick"
       - name: Unit tests
         run: |
           for c in $CPUS; do
@@ -181,7 +195,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: elrs-wifi-joystick-linux-${{ matrix.target }}
-          path: build/${{ matrix.target }}/elrs-wifi-joystick
+          path: ${{ runner.temp }}/dist/elrs-wifi-joystick
           if-no-files-found: error
           retention-days: 30
 
@@ -210,10 +224,12 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
-      - name: Install zig
+      - name: Install zig (checked against ZIG_SHA256)
         run: |
-          curl -fsSL --retry 5 "https://ziglang.org/download/$ZIG_VERSION/zig-x86_64-linux-$ZIG_VERSION.tar.xz" | tar -xJ -C "$RUNNER_TEMP"
-          echo "$RUNNER_TEMP/zig-x86_64-linux-$ZIG_VERSION" >> "$GITHUB_PATH"
+          python3 -m venv "$RUNNER_TEMP/zig"
+          printf 'ziglang==%s --hash=sha256:%s\n' "$ZIG_VERSION" "$ZIG_SHA256" > "$RUNNER_TEMP/zig.txt"
+          "$RUNNER_TEMP/zig/bin/pip" install --quiet --no-deps --require-hashes -r "$RUNNER_TEMP/zig.txt"
+          "$RUNNER_TEMP/zig/bin/python" -c 'import os, ziglang; print(os.path.dirname(ziglang.__file__))' >> "$GITHUB_PATH"
       - name: Compile core/*.c (-Wall -Wextra -Werror), link its tests
         run: |
           out=$RUNNER_TEMP/core
@@ -244,11 +260,17 @@ jobs:
       - name: Tools
         run: |
           python -m pip install --quiet shellcheck-py==0.11.0.1 actionlint-py==1.7.12.25
-          sudo apt-get update -qq && sudo apt-get install -y -qq --no-install-recommends busybox-static
+          # busybox (not busybox-static): its sh runs the tools on PATH (the fakes), so busybox ash gets the
+          # whole installer suite, not only the smoke test of a busybox built with standalone applets
+          sudo apt-get update -qq && sudo apt-get install -y -qq --no-install-recommends busybox
       - name: shellcheck
         run: shellcheck --version && shellcheck build.sh packaging/install.sh tests/test_install.sh
-      - name: The installer (fake root, fake GitHub; dash, bash --posix, busybox tools)
-        run: BUSYBOX=/bin/busybox sh tests/test_install.sh
+      - name: The installer (fake root, fake GitHub; sh, dash, bash --posix, busybox ash, busybox tools)
+        run: |
+          out=$(BUSYBOX=/usr/bin/busybox sh tests/test_install.sh) || { printf '%s\n' "$out"; exit 1; }
+          printf '%s\n' "$out"
+          # busybox ash ran the whole suite (not the smoke test only)
+          printf '%s\n' "$out" | grep -qx '== install.sh under /usr/bin/busybox sh'
       - name: actionlint
         run: actionlint -color
       - name: Python syntax

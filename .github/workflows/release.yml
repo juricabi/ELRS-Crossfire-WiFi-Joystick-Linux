@@ -140,3 +140,23 @@ jobs:
           else
             gh release create "v$VER" dist/* --verify-tag --title "v$VER" --notes-file notes.md $pre
           fi
+      - name: The release installs (install.sh against the real release, as users run it)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # the GitHub API path (a private repository: GITHUB_TOKEN), then the public URLs once it is public;
+          # what lands must be the published binary, byte for byte
+          check() {  # label, then install.sh's environment
+            root=$(mktemp -d)
+            label=$1
+            shift
+            env "$@" HOME=/home/u sh dist/install.sh --root "$root" --user --version "$VER" --arch x86_64
+            cmp "$root/home/u/.local/bin/elrs-wifi-joystick" "dist/elrs-wifi-joystick-$VER-linux-x86_64"
+            echo "$label: ok"
+          }
+          check "with GITHUB_TOKEN" GITHUB_TOKEN="$GH_TOKEN"
+          if [ "$(gh repo view "$GITHUB_REPOSITORY" --json visibility -q .visibility)" = PUBLIC ]; then
+            check "public download" -u GITHUB_TOKEN
+          else
+            echo "(the repository is private: the public download is not tried)"
+          fi

@@ -13,6 +13,7 @@
 #include <string.h>
 #include <strings.h>
 #include <sys/ioctl.h>
+#include <sys/stat.h>
 #include <termios.h>
 #include <time.h>
 #include <unistd.h>
@@ -27,6 +28,7 @@ static int sig_pipe[2] = { -1, -1 };
 static volatile sig_atomic_t g_quit;      /* how many quit signals came */
 static volatile sig_atomic_t g_raw;       /* the terminal is in raw mode: handlers put it back */
 static volatile sig_atomic_t g_redraw;
+static volatile sig_atomic_t g_suspend;   /* Ctrl+Z: the main loop stops listening, then the process */
 static struct termios g_orig, g_rawt;     /* written before g_raw is set */
 
 static void wake_main(void) {
@@ -36,8 +38,17 @@ static void wake_main(void) {
   errno = e;
 }
 
+/* tcgetpgrp and getpgrp are async-signal-safe */
+static bool foreground(void) { return tcgetpgrp(STDIN_FILENO) == getpgrp(); }
+
+/* The terminal is changed only from the foreground: from the background tcsetattr stops the process
+ * (SIGTTOU), and the shell has put its own modes back when the job stopped. */
+static void tty_set(const struct termios *t) {
+  if (foreground()) tcsetattr(STDIN_FILENO, TCSANOW, t);
+}
+
 static void tty_restore_now(void) {
-  if (g_raw) tcsetattr(STDIN_FILENO, TCSANOW, &g_orig);
+  if (g_raw) tty_set(&g_orig);
 }
 
 static void on_quit(int sig) {
@@ -49,33 +60,26 @@ static void on_quit(int sig) {
   wake_main();
 }
 
+/* SIGSEGV & co, and SIGQUIT (the Ctrl and backslash keys, which raw mode keeps): the terminal back, then
+ * the default action */
 static void on_fatal(int sig) {
   tty_restore_now();
   signal(sig, SIG_DFL);
   raise(sig);
 }
 
-static bool foreground(void) { return tcgetpgrp(STDIN_FILENO) == getpgrp(); }
-
-/* Ctrl+Z: a normal terminal while stopped, raw mode again after fg */
+/* Ctrl+Z: the main loop stops listening first (the joystick centered: nothing stays held while the whole
+ * process is stopped), gives the terminal back and stops; fg or bg starts listening again (suspend) */
 static void on_tstp(int sig) {
   (void)sig;
-  int e = errno;
-  if (g_raw) {
-    tcsetattr(STDIN_FILENO, TCSANOW, &g_orig);
-    if (write(STDOUT_FILENO, "\r\n", 2) < 0) {}
-  }
-  kill(getpid(), SIGSTOP);
-  if (g_raw && foreground()) tcsetattr(STDIN_FILENO, TCSANOW, &g_rawt);
-  g_redraw = 1;
+  g_suspend = 1;
   wake_main();
-  errno = e;
 }
 
 static void on_cont(int sig) {
   (void)sig;
   int e = errno;
-  if (g_raw && foreground()) tcsetattr(STDIN_FILENO, TCSANOW, &g_rawt);
+  if (g_raw) tty_set(&g_rawt);
   g_redraw = 1;
   wake_main();
   errno = e;
@@ -90,12 +94,20 @@ static void handle(int sig, void (*fn)(int)) {
   sigaction(sig, &sa, NULL);
 }
 
+/* A signal ignored when the program started stays ignored: nohup ignores SIGHUP (closing the SSH session
+ * must not end the program), a shell script starts "cmd &" with SIGINT and SIGQUIT ignored. */
+static void handle_unless_ignored(int sig, void (*fn)(int)) {
+  struct sigaction old;
+  if (sigaction(sig, NULL, &old) == 0 && old.sa_handler == SIG_IGN) return;
+  handle(sig, fn);
+}
+
 int cli_signals_init(void) {
   if (sig_pipe[0] < 0 && pipe2(sig_pipe, O_NONBLOCK | O_CLOEXEC) != 0) return -1;
   signal(SIGPIPE, SIG_IGN);
-  handle(SIGINT, on_quit);
+  handle_unless_ignored(SIGINT, on_quit);
   handle(SIGTERM, on_quit);
-  handle(SIGHUP, on_quit);
+  handle_unless_ignored(SIGHUP, on_quit);
   return 0;
 }
 
@@ -191,7 +203,9 @@ void cli_status_plain(const eng_snapshot_t *s, char *out, size_t cap) {
   if (s->bound) {
     lb_fmt(&b, "streaming from %s %s", wifi_kind_name(s->kind), s->source);
     if (s->module_name[0]) lb_fmt(&b, " (%s)", s->module_name);
-    lb_fmt(&b, " | %.1f Hz, jitter %.2f ms | asked %d Hz x %d ch", s->rate_hz, s->jitter_ms, hz, s->cfg.channels);
+    /* the first second after a lock has no rate yet (like the interactive status line) */
+    if (s->rate_hz > 0) lb_fmt(&b, " | %.1f Hz, jitter %.2f ms", s->rate_hz, s->jitter_ms);
+    lb_fmt(&b, " | asked %d Hz x %d ch", hz, s->cfg.channels);
     if (s->nch) {
       lb_text(&b, " | CH1-8 %");
       for (int i = 0; i < 8 && i < s->nch; i++) lb_fmt(&b, " %d", wifi_raw_percent(s->raw[i]));
@@ -303,7 +317,8 @@ typedef struct {
   const cli_opts_t *o;
   engine_t *e;
   int mode;
-  bool read_stdin;          /* commands (keys or lines) come from stdin */
+  bool read_stdin;          /* commands (keys or lines) come from stdin, while it has not ended */
+  bool in_tty;              /* stdin is a terminal: read (and the terminal drawn on) only in the foreground */
   bool color, utf8, ansi;
   bool quit;
   uint32_t since;
@@ -418,12 +433,17 @@ static void help(cli_t *c) {
   }
 }
 
+#define APPLY_WAIT_MS 2000          /* a command that reads the state waits this long for the ones before it */
+
 static void run_cmd(cli_t *c, cli_cmd_t cmd, const char *arg) {
   eng_snapshot_t s;
+  /* commands in a row (a script) see what the ones before them did: "s" twice is a stop, then a start */
+  if (cmd == CLI_TOGGLE || cmd == CLI_STATUS) eng_wait_applied(c->e, APPLY_WAIT_MS);
   eng_snapshot(c->e, &s);
   eng_config_t n = s.cfg;
   char err[256] = "";
   int r = 0;
+  unsigned field = 0;
   const char *name = NULL;
   switch (cmd) {
     case CLI_NONE: return;
@@ -433,12 +453,12 @@ static void run_cmd(cli_t *c, cli_cmd_t cmd, const char *arg) {
       if (s.running) eng_stop(c->e);
       else eng_start(c->e);
       return;
-    case CLI_TARGET: name = "module IP"; r = cfg_value_module_ip(arg, n.module_ip, err, sizeof err); break;
-    case CLI_RATE: name = "rate"; r = cfg_value_rate(arg, &n.interval_us, err, sizeof err); break;
-    case CLI_INTERVAL: name = "interval"; r = cfg_value_interval(arg, &n.interval_us, err, sizeof err); break;
-    case CLI_CHANNELS: name = "channels"; r = cfg_value_channels(arg, &n.channels, err, sizeof err); break;
-    case CLI_PORT: name = "port"; r = cfg_value_port(arg, &n.port, err, sizeof err); break;
-    case CLI_HTTP_PORT: name = "http-port"; r = cfg_value_port(arg, &n.http_port, err, sizeof err); break;
+    case CLI_TARGET: name = "module IP"; field = ENG_F_MODULE_IP; r = cfg_value_module_ip(arg, n.module_ip, err, sizeof err); break;
+    case CLI_RATE: name = "rate"; field = ENG_F_INTERVAL; r = cfg_value_rate(arg, &n.interval_us, err, sizeof err); break;
+    case CLI_INTERVAL: name = "interval"; field = ENG_F_INTERVAL; r = cfg_value_interval(arg, &n.interval_us, err, sizeof err); break;
+    case CLI_CHANNELS: name = "channels"; field = ENG_F_CHANNELS; r = cfg_value_channels(arg, &n.channels, err, sizeof err); break;
+    case CLI_PORT: name = "port"; field = ENG_F_PORT; r = cfg_value_port(arg, &n.port, err, sizeof err); break;
+    case CLI_HTTP_PORT: name = "http-port"; field = ENG_F_HTTP_PORT; r = cfg_value_port(arg, &n.http_port, err, sizeof err); break;
     case CLI_RESTART: eng_restart_stream(c->e); return;
     case CLI_STATUS: {
       char line[512];
@@ -464,12 +484,14 @@ static void run_cmd(cli_t *c, cli_cmd_t cmd, const char *arg) {
     else if (cmd == CLI_RATE || cmd == CLI_INTERVAL)
       say(c, "Asking for %d Hz (%d us) already", wifi_interval_hz(n.interval_us), n.interval_us);
     else if (cmd == CLI_CHANNELS) say(c, "Asking for %d channels already", n.channels);
-    else if (cmd == CLI_PORT) say(c, "Listening on UDP port %u already", n.port);
+    else if (cmd == CLI_PORT && s.listening) say(c, "Listening on UDP port %u already", n.port);
+    else if (cmd == CLI_PORT) say(c, "The UDP port is %u already%s", n.port, s.running ? "" : " (used when listening starts)");
     else say(c, "The module's web server port is %u already", n.http_port);
     return;
   }
-  /* a failed save is logged by the engine itself */
-  if (eng_set_config(c->e, &n, err, sizeof err) < 0) say(c, "%s", err);
+  /* only this field: a change made meanwhile elsewhere (the web page) stays; a failed save is logged by the
+   * engine itself */
+  if (eng_update_config(c->e, &n, field, NULL, err, sizeof err) < 0) say(c, "%s", err);
 }
 
 /* ---- line commands (stdin not a terminal) ---- */
@@ -528,10 +550,10 @@ static void read_lines(cli_t *c) {
 /* ---- keys (interactive) ---- */
 static void tty_raw(bool on) {
   if (on) {
-    if (tcsetattr(STDIN_FILENO, TCSANOW, &g_rawt) == 0) g_raw = 1;
+    if (foreground() && tcsetattr(STDIN_FILENO, TCSANOW, &g_rawt) == 0) g_raw = 1;
   } else if (g_raw) {
     g_raw = 0;
-    tcsetattr(STDIN_FILENO, TCSANOW, &g_orig);
+    tty_set(&g_orig);
   }
 }
 
@@ -568,6 +590,10 @@ static void prompt_answer(cli_t *c) {
   if (n < 0 && (errno == EAGAIN || errno == EINTR)) return;
   int key = c->prompt;
   c->prompt = 0;
+  if (n > 0 && !memchr(buf, '\n', (size_t)n)) {
+    /* a line longer than buf (a paste): the rest of it must not become keys in raw mode */
+    tcflush(STDIN_FILENO, TCIFLUSH);
+  }
   tty_raw(true);
   if (n <= 0) { fputc('\n', stdout); return; }           /* Ctrl+D: cancelled */
   buf[n] = 0;
@@ -645,6 +671,35 @@ static void header(cli_t *c) {
   fflush(stdout);
 }
 
+/* Ctrl+Z (on_tstp): stop listening (the joystick centers) and give the terminal back, then stop the
+ * process; when it goes on (fg, or bg), listen again if it was listening */
+static void suspend(cli_t *c) {
+  eng_snapshot_t s;
+  eng_snapshot(c->e, &s);
+  bool was = s.running;
+  if (was) {
+    eng_stop(c->e);
+    eng_wait_applied(c->e, STOP_WAIT_MS);
+  }
+  bool fg = !c->in_tty || foreground();
+  if (fg) {
+    if (c->prompt) {                                   /* an open prompt is cancelled */
+      fputc('\n', stdout);
+      c->prompt = 0;
+      tty_raw(true);
+    }
+    print_logs(c);
+    clear_status(c);
+    if (was) say(c, "Suspended: not listening (the joystick is centered) until the program goes on (fg)");
+  }
+  fflush(stdout);
+  if (g_raw) tty_set(&g_orig);
+  kill(getpid(), SIGSTOP);
+  /* going on: on_cont put raw mode back when this is the foreground */
+  if (was) eng_start(c->e);
+  g_redraw = 1;
+}
+
 int cli_run(const cli_opts_t *o) {
   cli_t c;
   memset(&c, 0, sizeof c);
@@ -655,41 +710,58 @@ int cli_run(const cli_opts_t *o) {
   if (o->daemon) c.mode = M_DAEMON;
   else if (in_tty && out_tty && fg && tcgetattr(STDIN_FILENO, &g_orig) == 0) c.mode = M_TTY;
   else c.mode = M_LINES;
-  /* a terminal on stdin read in the background would stop the program (SIGTTIN) */
-  c.read_stdin = c.mode == M_TTY || (c.mode == M_LINES && (!in_tty || fg));
+  c.in_tty = in_tty;
+  c.read_stdin = c.mode != M_DAEMON;
   const char *term = getenv("TERM"), *nocolor = getenv("NO_COLOR");
   c.ansi = c.mode == M_TTY && term && *term && strcmp(term, "dumb");
   c.color = c.ansi && !(nocolor && *nocolor);
   c.utf8 = env_utf8();
   if (!out_tty) setvbuf(stdout, NULL, _IOLBF, 0);
+  /* stdout a pipe (| head, | grep -m1): when its reader is gone, nobody sees the program - it quits (poll
+   * reports POLLERR on the write end of a pipe without readers) */
+  struct stat ost;
+  bool out_pipe = c.mode != M_DAEMON && fstat(STDOUT_FILENO, &ost) == 0 && S_ISFIFO(ost.st_mode);
   if (c.mode == M_TTY) {
     g_rawt = g_orig;
     g_rawt.c_lflag &= (tcflag_t) ~(ICANON | ECHO);
     g_rawt.c_cc[VMIN] = 1;
     g_rawt.c_cc[VTIME] = 0;
-    handle(SIGTSTP, on_tstp);
     handle(SIGCONT, on_cont);
     int fatal[] = { SIGSEGV, SIGBUS, SIGFPE, SIGILL, SIGABRT };
     for (int i = 0; i < 5; i++) handle(fatal[i], on_fatal);
+    handle_unless_ignored(SIGQUIT, on_fatal);
     tty_raw(true);
   }
+  if (c.mode != M_DAEMON) handle_unless_ignored(SIGTSTP, on_tstp);
   header(&c);
   int64_t now = mono_ms(), next_draw = now;
   c.next_status = now + (c.mode == M_DAEMON ? STATUS_DAEMON_MS : STATUS_LINES_MS);
   while (!c.quit && !cli_quit_requested()) {
-    struct pollfd pf[2] = { { sig_pipe[0], POLLIN, 0 }, { STDIN_FILENO, POLLIN, 0 } };
-    int nfd = c.read_stdin ? 2 : 1;
-    int timeout = c.mode == M_TTY && !c.prompt ? (int)(next_draw - mono_ms()) : c.mode == M_TTY ? DRAW_MS : 200;
+    /* stdin a terminal: read it (and in M_TTY draw on it) only in the foreground - a read from the
+     * background stops the whole program (SIGTTIN), drawing would write over the shell's line */
+    bool fg_now = !c.in_tty || foreground();
+    bool rd = c.read_stdin && fg_now;
+    struct pollfd pf[3] = { { sig_pipe[0], POLLIN, 0 }, { STDOUT_FILENO, 0, 0 }, { STDIN_FILENO, POLLIN, 0 } };
+    nfds_t nfd = rd ? 3 : 2;
+    if (!out_pipe) pf[1].fd = -1;                       /* (ignored by poll) */
+    bool draws = c.mode == M_TTY && fg_now;
+    int timeout = draws && !c.prompt ? (int)(next_draw - mono_ms()) : draws ? DRAW_MS : 200;
     if (timeout < 0) timeout = 0;
-    if (timeout > DRAW_MS) timeout = DRAW_MS;
-    int r = poll(pf, (nfds_t)nfd, timeout);
+    if (timeout > DRAW_MS && draws) timeout = DRAW_MS;
+    int r = poll(pf, nfd, timeout);
     if (r > 0 && pf[0].revents) {
       char b[64];
       while (read(sig_pipe[0], b, sizeof b) > 0) {}
     }
     if (cli_quit_requested()) break;
-    if (r > 0 && nfd == 2 && pf[1].revents) {
-      if (pf[1].revents & POLLNVAL) c.read_stdin = false;
+    if (r > 0 && pf[1].revents & (POLLERR | POLLHUP)) break;   /* the reader of stdout is gone */
+    if (g_suspend) {
+      g_suspend = 0;
+      suspend(&c);
+      continue;
+    }
+    if (r > 0 && rd && pf[2].revents) {
+      if (pf[2].revents & POLLNVAL) c.read_stdin = false;
       else if (c.mode == M_TTY) {
         if (c.prompt) prompt_answer(&c);
         else read_keys(&c);
@@ -698,28 +770,34 @@ int cli_run(const cli_opts_t *o) {
       }
     }
     if (c.prompt) { fflush(stdout); continue; }        /* the prompt line stays clean */
-    print_logs(&c);
     now = mono_ms();
     if (c.mode == M_TTY) {
+      if (!foreground()) continue;                     /* in the background: the log lines wait */
+      print_logs(&c);
       if (now >= next_draw || g_redraw) {
         g_redraw = 0;
         draw_status(&c);
         next_draw = now + DRAW_MS;
       }
-    } else if (now >= c.next_status) {
-      c.next_status = now + (c.mode == M_DAEMON ? STATUS_DAEMON_MS : STATUS_LINES_MS);
-      eng_snapshot_t s;
-      eng_snapshot(c.e, &s);
-      if (s.bound) {
-        char line[512];
-        cli_status_plain(&s, line, sizeof line);
-        say(&c, "%s", line);
+    } else {
+      print_logs(&c);
+      if (now >= c.next_status) {
+        c.next_status = now + (c.mode == M_DAEMON ? STATUS_DAEMON_MS : STATUS_LINES_MS);
+        eng_snapshot_t s;
+        eng_snapshot(c.e, &s);
+        if (s.bound) {
+          char line[512];
+          cli_status_plain(&s, line, sizeof line);
+          say(&c, "%s", line);
+        }
       }
     }
     fflush(stdout);
   }
   /* quitting: stop (the joystick centers), show the last lines, give the terminal back */
-  if (c.prompt) { fputc('\n', stdout); c.prompt = 0; }
+  bool show = c.mode != M_TTY || foreground();         /* the interactive UI says nothing from the background */
+  if (c.prompt && show) fputc('\n', stdout);
+  c.prompt = 0;
   eng_snapshot_t s;
   eng_snapshot(c.e, &s);
   if (s.running) {
@@ -731,8 +809,10 @@ int cli_run(const cli_opts_t *o) {
       eng_wait(c.e, s.seq, s.log_seq, 50);
     }
   }
-  print_logs(&c);
-  clear_status(&c);
+  if (show) {
+    print_logs(&c);
+    clear_status(&c);
+  }
   fflush(stdout);
   if (c.mode == M_TTY) tty_raw(false);
   return 0;

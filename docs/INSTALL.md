@@ -36,8 +36,9 @@ sh install.sh [options]
 | `--version X` | install release X (`1.2.3` or `v1.2.3`; default: the latest) |
 | `--file PATH` | install this binary (one you already have) instead of downloading one |
 | `--user` | install for this user only, in `~/.local/bin` (the default without root; with sudo it is refused - run it as the user) |
-| `--service` | the systemd user service, for the user who ran sudo (or you, without sudo); enabled, and started when that user has a running systemd user session (else at the next login) |
-| `--no-udev` | leave `/dev/uinput` access and the uinput module alone |
+| `--service` | the systemd user service, for the user who ran sudo (or you, without sudo); enabled, and started when that user has a running systemd user session (else at the next login). Refused on a system without systemd (no `systemctl`): start `elrs-wifi-joystick --daemon` from its init system or the session's autostart instead |
+| `--no-udev` | leave `/dev/uinput` access and the uinput module alone; remembered, so an update (running the script again) leaves them alone too |
+| `--udev` | set them up again after an earlier `--no-udev` |
 | `--uninstall` | remove what this script installed |
 | `--arch A` | the binary for A instead of this machine's: `x86_64 i686 aarch64 armv7 armv6 riscv64` |
 | `--root DIR` | install into DIR instead of / (images, tests): nothing is loaded, reloaded or started, the commands are printed instead |
@@ -46,7 +47,7 @@ sh install.sh [options]
 
 | environment | |
 |---|---|
-| `GITHUB_TOKEN` | a token that can read the repository: needed while it is private (with curl) |
+| `GITHUB_TOKEN` | a token that can read the repository: needed while it is private (with curl); when it cannot read the release (expired, another account's), the public download is tried |
 | `ELRS_WIFI_JOYSTICK_REPO` | `owner/name` to install from (default `juricabi/elrs-crossfire-wifi-joystick-linux`) |
 | `TMPDIR` | where the download is checked before it is installed |
 
@@ -70,9 +71,10 @@ As root: `/usr/local/bin/elrs-wifi-joystick`, `/etc/udev/rules.d/60-elrs-wifi-jo
 `--service` `~/.config/systemd/user/elrs-wifi-joystick.service`, and the list in
 `~/.local/share/elrs-wifi-joystick/installed`.
 
-- The architecture comes from `uname -m`: `x86_64`/`amd64`, `i386`..`i686`, `aarch64`/`arm64`,
+- The architecture comes from `uname -m`: `x86_64`/`amd64`, `i686`, `aarch64`/`arm64`,
   `armv7l`/`armv8l` (a 32-bit system on a 64-bit ARM CPU), `armv6l`, `riscv64`. Anything else stops
-  with a message ([build from source](#building-from-source) then).
+  with a message ([build from source](#building-from-source) then), also `i386`..`i586`: the i686
+  binary needs a Pentium Pro or later (CMOV).
 - A download is checked against the release's `SHA256SUMS` (with `sha256sum` or `shasum -a 256`), and
   the program must run here (`--version`) before it replaces anything (unless `--arch` or `--root` says
   it is for another machine). Files are installed atomically

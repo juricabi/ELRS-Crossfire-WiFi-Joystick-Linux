@@ -245,8 +245,8 @@ footer { padding: 4px 0 24px; font-size: 12.5px; color: var(--muted); }
 
   let info = null;            /* GET /api/config: defaults, supported values, Crossfire */
   let st = null;              /* the last status */
-  let fails = 0, offline = false, lastUptime = -1, reqNo = 0, shownNo = 0;
-  let logSince = 0, logBusy = false;
+  let fails = 0, offline = false, lastInstance = null, reqNo = 0, shownNo = 0;
+  let logSince = 0, logBusy = false, logGen = 0, logInstance = null;
   const touched = new Set();  /* fields the user changed and has not applied yet */
 
   /* ---------------------------------------------------------------- the API */
@@ -391,11 +391,17 @@ footer { padding: 4px 0 24px; font-size: 12.5px; color: var(--muted); }
     }
   }
 
+  /* rebuilt only when the choices change, keeping the selection (a change not applied yet stays when the
+     program restarts and the settings are read again) */
   function fillChannels() {
-    const sel = F.channels, sup = info.supported.channels, def = info.defaults.channels;
+    const sel = F.channels, keep = sel.value, sup = info.supported.channels, def = info.defaults.channels;
+    const sig = sup.min + '-' + sup.max + '-' + def;
+    if (sel.dataset.sig === sig) return;
+    sel.dataset.sig = sig;
     const opts = [];
     for (let n = sup.min; n <= sup.max; n++) opts.push(new Option(n + (n === def ? ' – default' : ''), String(n)));
     sel.replaceChildren(...opts);
+    if (keep) sel.value = keep;
   }
 
   /* untouched fields follow the program's settings (the CLI or another page may change them) */
@@ -505,7 +511,17 @@ footer { padding: 4px 0 24px; font-size: 12.5px; color: var(--muted); }
     const run = st && st.running;
     action($('startStop'), run ? '/api/stop' : '/api/start', run ? 'Stopped.' : 'Started.');
   });
-  $('restart').addEventListener('click', () => action($('restart'), '/api/restart', 'Asked the module to restart its stream.'));
+  /* what the program does with it: a module with no beacon yet that sends 16 channels may be Crossfire, which
+     is never sent joystick_end: its restart waits (up to 20 s of streaming) for a beacon that says so */
+  function restartText(s) {
+    const m = s && s.module;
+    if (!m) return 'Sent our request to ' + (s && s.config.module_ip ? s.config.module_ip : 'the module') + ' - see the log.';
+    if (m.kind === 'WiFi' && s.nch === 16)
+      return 'The module has sent no beacon yet, so it may be Crossfire (never sent joystick_end): its stream ' +
+             'restarts once it has streamed 20 s without a Crossfire beacon - see the log.';
+    return 'Asked the module to restart its stream.';
+  }
+  $('restart').addEventListener('click', () => action($('restart'), '/api/restart', restartText(st)));
 
   /* ---------------------------------------------------------------- rendering */
   function isXf(s) { return !!(s.module && s.module.kind === 'Crossfire'); }
@@ -514,8 +530,9 @@ footer { padding: 4px 0 24px; font-size: 12.5px; color: var(--muted); }
     const ss = $('startStop');
     setText(ss, s.running ? 'Stop' : 'Start');
     ss.disabled = offline;
-    /* restart: a module to restart (the locked one, else the module IP), and it is not Crossfire */
-    const can = !offline && s.running && (s.module ? !isXf(s) : s.config.module_ip !== '');
+    /* restart: listening (else the program has no socket to send from: "Not listening - nothing to restart"),
+       a module to restart (the locked one, else the module IP), and it is not Crossfire */
+    const can = !offline && s.running && s.listening && (s.module ? !isXf(s) : s.config.module_ip !== '');
     $('restart').disabled = !can;
     const xf = isXf(s);
     F.interval_us.disabled = xf;
@@ -529,7 +546,7 @@ footer { padding: 4px 0 24px; font-size: 12.5px; color: var(--muted); }
     let cls, text;
     if (!j.enabled) {
       cls = 'box info';
-      text = 'Monitor only: no virtual joystick (started with --no-joystick). The sticks still show here.';
+      text = 'Monitor only: no virtual joystick (--no-joystick, or joystick = off in the settings file). The sticks still show here.';
     } else if (j.ok) {
       cls = '';
       text = null;
@@ -553,7 +570,7 @@ footer { padding: 4px 0 24px; font-size: 12.5px; color: var(--muted); }
 
   const COUNTERS = [
     ['frames', 'Frames used'], ['rx', 'Datagrams received'], ['beacons', 'Beacons'], ['malformed', 'Malformed'],
-    ['dropped_filter', 'Ignored (other module)'], ['dropped_other', 'Ignored (no stick data)'], ['posts', 'Activations sent'],
+    ['dropped_filter', 'Ignored (no stick data)'], ['dropped_other', 'Ignored (other module)'], ['posts', 'Activations sent'],
     ['posts_ok', 'Activations ok'], ['posts_failed', 'Activations failed'], ['restarts', 'Stream restarts'],
     ['gaps', 'Gaps ≥ 250 ms'], ['gap_max_ms', 'Longest gap (ms)'],
   ];
@@ -624,9 +641,10 @@ footer { padding: 4px 0 24px; font-size: 12.5px; color: var(--muted); }
     setText(cnt.listening, s.config.port + (s.listening ? ' (listening)' : s.running ? ' (not bound yet)' : ' (stopped)'));
     setText(cnt.uptime, uptimeText(s.uptime_s));
     setText($('foot'), 'elrs-wifi-joystick ' + s.version + ' · ' + location.host);
-    /* the program was restarted: start the log over, read the settings again */
-    if (s.uptime_s < lastUptime) { loadInfo().catch(() => {}); resetLog(); }
-    lastUptime = s.uptime_s;
+    /* the program was restarted (another instance, whatever its uptime): start the log over, read the
+       settings again */
+    if (lastInstance !== null && s.instance !== lastInstance) { loadInfo().catch(() => {}); resetLog(); }
+    lastInstance = s.instance;
   }
 
   function renderOffline() {
@@ -693,15 +711,20 @@ footer { padding: 4px 0 24px; font-size: 12.5px; color: var(--muted); }
     d.append(text);
     logEl.append(d);
   }
-  function resetLog() { logSince = 0; logEl.replaceChildren(); }
+  /* logGen: an answer asked for before a reset belongs to the old log (dropped) */
+  function resetLog() { logSince = 0; logInstance = null; logGen++; logEl.replaceChildren(); }
 
   async function pollLog() {
     if (logBusy) return;
     logBusy = true;
     try {
       for (let again = 0; again < 3; again++) {
+        const gen = logGen;
         const r = await api('/api/log?since=' + logSince);
-        if (r.seq < logSince) { resetLog(); continue; }   /* the program restarted: its lines start at 1 again */
+        if (gen !== logGen) continue;                      /* reset meanwhile: ask again from 0 */
+        /* lines of another run of the program than the ones shown (it restarted): start over */
+        if ((logInstance !== null && r.instance !== logInstance) || r.seq < logSince) { resetLog(); continue; }
+        logInstance = r.instance;
         if (!r.lines.length) { logSince = r.seq; break; }
         /* stay at the bottom unless the reader scrolled up */
         const atEnd = logEl.scrollTop + logEl.clientHeight >= logEl.scrollHeight - 8;

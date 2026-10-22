@@ -18,7 +18,7 @@ bool hints_ufw_enabled(const char *conf_text);
 /* One line: what to run so UDP port reaches this program, for that firewall. Returns the length. */
 int  hints_firewall(hints_fw_t fw, unsigned port, char *out, size_t cap);
 /* Why the virtual joystick can't be made and what to run, for an open() errno on path (NULL =
- * "/dev/uinput"). user: the login name for the setfacl example (NULL or "" = "$USER"). */
+ * "/dev/uinput"). user: the login name for the usermod and setfacl examples (NULL or "" = "$USER"). */
 void hints_uinput(int err, const char *path, const char *user, char *out, size_t cap);
 
 #endif

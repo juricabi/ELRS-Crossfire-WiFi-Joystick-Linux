@@ -57,16 +57,19 @@ int cfg_parse_int(const char *s, long min, long max, long *out) {
   bool neg = false;
   if (*p == '+' || *p == '-') neg = *p++ == '-';
   if (!*p) return -1;
-  long v = 0;
+  /* 64 bits whatever long is (32 on i686/armv7/armv6): 18 digits can't overflow it, and a 10-digit
+   * number never wraps into range */
+  long long v = 0;
   int nd = 0;
   for (; *p; p++) {
     if (*p < '0' || *p > '9') return -1;
-    if (++nd > 12) return -2;              /* far out of any range (and no overflow) */
+    if (++nd > 18) return -2;              /* far out of any range (and no overflow) */
     v = v * 10 + (*p - '0');
   }
   if (neg) v = -v;
-  if (out) *out = v;
-  return v < min || v > max ? -2 : 0;
+  if (v < min || v > max) return -2;
+  if (out) *out = (long)v;
+  return 0;
 }
 
 static int num_err(int r, const char *s, const char *use, char *err, size_t cap) {
@@ -188,7 +191,8 @@ int cfg_value_name(const char *s, char out[64], char *err, size_t cap) {
   bool ok = n >= 1 && n <= 63 && strlen(s ? s : "") < sizeof t - 1;
   for (size_t i = 0; ok && i < n; i++) ok = (unsigned char)t[i] >= 0x20 && t[i] != 0x7f;
   if (!ok) {
-    snprintf(err, cap, "the name must be 1 to 63 characters, without control characters");
+    snprintf(err, cap, "the name must be 1 to 63 bytes long (a letter outside ASCII takes 2 to 4), without control "
+             "characters");
     return -1;
   }
   memcpy(out, t, n + 1);
@@ -348,6 +352,17 @@ static const cfg_key_t KEYS[] = {
   { "joystick", CFG_K_JOYSTICK }, { "buttons", CFG_K_BUTTONS }, { "name", CFG_K_NAME },
 };
 #define NKEYS ((int)(sizeof KEYS / sizeof KEYS[0]))
+
+int cfg_lock_path(const char *xdg, const char *run_user, unsigned uid, char *out, size_t cap) {
+  int n;
+  struct stat st;
+  if (xdg && xdg[0] == '/') n = snprintf(out, cap, "%s/" CFG_APP ".lock", xdg);
+  else if (run_user && run_user[0] == '/' && stat(run_user, &st) == 0 && S_ISDIR(st.st_mode) && st.st_uid == uid)
+    n = snprintf(out, cap, "%s/" CFG_APP ".lock", run_user);
+  else n = snprintf(out, cap, "/tmp/" CFG_APP "-%u.lock", uid);
+  if (n < 0 || (size_t)n >= cap) { if (cap) out[0] = 0; return -1; }
+  return 0;
+}
 
 int cfg_default_path(char *out, size_t cap) {
   const char *x = getenv("XDG_CONFIG_HOME");
@@ -607,25 +622,42 @@ static int write_all(int fd, const char *s, size_t n) {
   return 0;
 }
 
+/* Where a symlinked settings file points (dotfiles kept elsewhere), also when that file does not exist yet
+ * (realpath fails then): the link's target, relative to the link's directory, followed up to 8 links. */
+static void link_target(const char *in, char *out, size_t cap) {
+  snprintf(out, cap, "%s", in);
+  struct stat st;
+  for (int depth = 0; depth < 8 && lstat(out, &st) == 0 && S_ISLNK(st.st_mode); depth++) {
+    char real[PATH_MAX];
+    if (realpath(out, real)) { snprintf(out, cap, "%s", real); return; }
+    char t[PATH_MAX];
+    ssize_t k = readlink(out, t, sizeof t - 1);
+    if (k <= 0) return;
+    t[k] = 0;
+    char next[PATH_MAX];
+    const char *slash = strrchr(out, '/');
+    int m = t[0] == '/' || !slash ? snprintf(next, sizeof next, "%s", t)
+                                  : snprintf(next, sizeof next, "%.*s%s", (int)(slash - out + 1), out, t);
+    if (m < 0 || (size_t)m >= sizeof next || (size_t)m >= cap) return;     /* too long: the link itself */
+    memcpy(out, next, (size_t)m + 1);
+  }
+}
+
 int cfg_save(const char *path_in, const eng_config_t *c, unsigned keys, char *err, size_t cap) {
   if (cap) err[0] = 0;
   keys &= CFG_K_LIVE;
   if (!keys) return 0;
   char path[PATH_MAX];
-  snprintf(path, sizeof path, "%s", path_in);
-  /* a symlinked settings file (dotfiles kept elsewhere) is written where it points */
+  link_target(path_in, path, sizeof path);
   struct stat st;
-  if (lstat(path_in, &st) == 0 && S_ISLNK(st.st_mode)) {
-    char real[PATH_MAX];
-    if (realpath(path_in, real)) snprintf(path, sizeof path, "%s", real);
-  }
   char *old = malloc(CFG_MAX_FILE), *out = malloc(CFG_MAX_FILE + 1024);
   int e = 0;
   const char *why = NULL;
-  char tmp[PATH_MAX + 16];
+  char tmp[PATH_MAX + 48];
   tmp[0] = 0;
   int fd = -1;
-  mode_t mode = 0644;
+  bool keep_mode = false;
+  mode_t mode = 0;
   if (!old || !out) { e = ENOMEM; goto fail; }
   if (make_dirs(path) != 0) { e = errno; goto fail; }
   int r = read_file(path, old, CFG_MAX_FILE);
@@ -634,18 +666,22 @@ int cfg_save(const char *path_in, const eng_config_t *c, unsigned keys, char *er
     e = errno;
     goto fail;
   }
-  if (r > 0 && stat(path, &st) == 0) mode = st.st_mode & 07777;
+  if (r > 0 && stat(path, &st) == 0) { keep_mode = true; mode = st.st_mode & 07777; }
   int n = cfg_render(r > 0 ? old : NULL, c, keys, out, CFG_MAX_FILE + 1024);
   if (n < 0) { why = "the file is too big"; goto fail; }
-  /* temp file next to it (same file system), then fsync + rename: never half a file */
+  /* temp file next to it (same file system), then fsync + rename: never half a file. An existing file keeps
+   * its mode; a new one gets 0666 minus the umask, like any file the user makes (O_EXCL: never an old file) */
   {
     const char *slash = strrchr(path, '/');
     size_t dl = slash ? (size_t)(slash - path) + 1 : 0;
-    snprintf(tmp, sizeof tmp, "%.*s.%s.XXXXXX", (int)dl, path, slash ? slash + 1 : path);
+    for (int k = 0; k < 100 && fd < 0; k++) {
+      snprintf(tmp, sizeof tmp, "%.*s.%s.%ld.%d.tmp", (int)dl, path, slash ? slash + 1 : path, (long)getpid(), k);
+      fd = open(tmp, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, keep_mode ? 0600 : 0666);
+      if (fd < 0 && errno != EEXIST) break;
+    }
   }
-  fd = mkostemp(tmp, O_CLOEXEC);
   if (fd < 0) { e = errno; tmp[0] = 0; goto fail; }
-  if (write_all(fd, out, (size_t)n) != 0 || fchmod(fd, mode) != 0 || fsync(fd) != 0) { e = errno; goto fail; }
+  if (write_all(fd, out, (size_t)n) != 0 || (keep_mode && fchmod(fd, mode) != 0) || fsync(fd) != 0) { e = errno; goto fail; }
   if (close(fd) != 0) { fd = -1; e = errno; goto fail; }
   fd = -1;
   if (rename(tmp, path) != 0) { e = errno; goto fail; }

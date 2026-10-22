@@ -51,11 +51,22 @@ See the header comment of `core/wifi_proto.h`. In short:
   ELRS applies it only while not streaming, so changing it while an ELRS module streams restarts the
   stream (`joystick_end`, then `joystick_begin`). Crossfire ignores it (16 channels, ~90 Hz) and, once
   its beacon says Crossfire, is never sent `joystick_end`; a locked 16-channel module with no beacon yet
-  is restarted only after 20 s of lock without a Crossfire beacon. A module that is surely not Crossfire
-  and streams a channel count other than the request is restarted once per session (another app's
-  leftover request); a leftover rate is not detected (startup values apply at the next joystick_begin).
+  is restarted only after 20 s of lock without a Crossfire beacon (the held restart survives a lock loss
+  of that module and goes out when it locks again, unless its ELRS beacon meanwhile got it a
+  `joystick_begin` with the request). The module IP, not locked and not identified by a
+  beacon, gets only a `joystick_begin` (it may be Crossfire; a module that is not streaming takes the
+  request from it). A module that is surely not Crossfire and streams a channel count other than the
+  request is restarted once per session (another app's leftover request). A module that streams an
+  older request of ours as far as is known is restarted when it locks: a change made while it was not
+  locked (during the activation, a WiFi dropout, a stop, before a switch to it) reaches it, as it streams
+  on with the old one. What it streams: what a restart or an activation after its ELRS beacon asked it
+  for; else, from its first lock on, what the last activation sent to it asked for, or the request when
+  it locked. A leftover rate of a module found streaming (another app's) is not detected.
+- What beacons said (kind, name) and what each module was asked for survive a stop and start or a port
+  change: an ELRS module streams on after a stop, and it never beacons while it streams.
 - Source lock: the first module with real channel data; others are ignored until it is silent for 3 s.
-  With a module IP set, only that IP counts.
+  With a module IP set, only that IP counts. Setting the module IP to the module streaming now keeps the
+  lock (no centering of the joystick, nothing sent).
 - Crossfire placeholder frames (any channel = 0xF26A) and all-out-of-range frames are dropped.
 
 ## 3. Threads and data flow
@@ -79,13 +90,24 @@ module ───────────────▶ receive thread ───
   ring under a mutex).
 - **Worker thread**: takes requests from the `wifi_actq_t`, runs `wifi_net_post` (5 s timeout per
   POST, abort when the session changes or on shutdown), puts results back, wakes the receive thread.
-- **CLI** (main thread) and **web** (its own thread) only use `engine.h`.
+- **CLI** (main thread) and **web** (its own thread) only use `engine.h`. Commands are kept as state, not
+  queued, so none is lost however many come at once (a stop before a start still ends the session); a
+  config change names the fields it changes and is merged under the engine's lock, so the CLI and the web
+  page never undo each other's fields. `eng_wait_applied` lets a script's commands see each other.
 - Bind: UDP `INADDR_ANY:port`, no `SO_REUSEADDR` (a second instance must fail), 256 KiB receive buffer,
   `FD_CLOEXEC`. Bind failures: 5 tries 300 ms apart, then state Error "UDP port N in use" and a try
   every 5 s.
-- Single instance: an exclusive `flock` on `$XDG_RUNTIME_DIR/elrs-wifi-joystick.lock` (else
-  `/tmp/elrs-wifi-joystick-<uid>.lock`); a second instance exits with a clear message (exit code 3).
-- Signals: SIGINT/SIGTERM/SIGHUP end the program cleanly (joystick centered and removed); SIGPIPE ignored.
+- Single instance: an exclusive `flock` on `$XDG_RUNTIME_DIR/elrs-wifi-joystick.lock`, else on
+  `/run/user/<uid>/elrs-wifi-joystick.lock` when that directory is the user's (what `XDG_RUNTIME_DIR` is in
+  a session: an instance started from `su -`, `sudo -u` or cron finds the one of the session or the user
+  service), else `/tmp/elrs-wifi-joystick-<uid>.lock`; a second instance exits with a clear message (exit
+  code 3). Closed fds 0-2 at the start are opened on `/dev/null` first (the lock never becomes stdout).
+- Signals: SIGINT/SIGTERM/SIGHUP end the program cleanly (joystick centered and removed); the third one
+  ends it at once (exit code 128 + the signal). SIGHUP and SIGINT ignored at the start stay ignored
+  (nohup, a script's `cmd &`). SIGPIPE ignored; not `--daemon`, a stdout pipe whose reader is gone ends
+  the program. Ctrl+Z (SIGTSTP) stops listening first (the joystick centers: nothing stays held while the
+  process is stopped), then the process; it listens again when it goes on (fg or bg). Interactive, SIGQUIT
+  (`Ctrl+\`) and the fatal signals restore the terminal before the default action.
 
 ## 4. The virtual joystick (uinput)
 
@@ -104,8 +126,9 @@ module ───────────────▶ receive thread ───
   its axis goes to the center and its button is released, so nothing stays held from a longer frame.
 - Each applied frame = one `write()` of the changed axes/buttons + `SYN_REPORT` (nothing when nothing
   changed). The kernel timestamps events at that write.
-- When the lock is released (3 s of silence), on stop, and at exit: every axis to 16384, every button
-  released (what vJoy's ResetVJD does in the Windows app). Short gaps hold the last values.
+- When the lock is released (3 s of silence), on stop (also Ctrl+Z), and at exit: every axis to 16384,
+  every button released. The Windows app centers its vJoy device on lock loss, stop and exit the same way.
+  Short gaps hold the last values; setting the module IP to the module streaming now is no lock loss.
 - `/dev/uinput` missing or not writable: not fatal. The program runs as a monitor (CLI + web still
   show the sticks) and says exactly why and what to run (`sudo modprobe uinput`, the udev rule from
   `packaging/`, or the install script). Device node discovery: after `UI_DEV_CREATE`, `UI_GET_SYSNAME`
@@ -146,26 +169,37 @@ elrs-wifi-joystick [options]
   `s` start/stop, `t` module IP (prompt; empty = discovery), `r` rate (prompt listing the presets),
   `c` channels (prompt 4-16), `p` UDP port, `a` restart the stream (re-send our request), `w` print the
   web address, `h`/`?` help, `q` quit (also Ctrl+C). Prompts use cooked mode with echo; Esc/empty input
-  cancels where noted.
+  cancels where noted; the rest of an answer longer than the prompt reads (a paste) is dropped, never
+  taken as keys. In the background (Ctrl+Z, then bg) it neither reads nor draws on the terminal (a read
+  would stop it, drawing would write over the shell's line): it runs on, the log lines wait for fg.
 - Not interactive (stdin or stdout not a terminal, or `--daemon`): log lines only, plus a status line
   every 2 s while streaming (like the Windows CLI when redirected); `--daemon` adds ISO timestamps
-  to every line and prints the status line only every 60 s. Line commands on stdin (when stdin is not
-  a terminal and not `--daemon`), like the Windows CLI's scripted stdin: `start`, `stop`, `s`
-  (toggle), `t <ip>` / `t` (discovery), `rate <hz>`, `interval <us>`, `channels <n>`, `port <n>`,
-  `restart`, `status` (prints one status line), `q`/`quit`; a UTF-8 BOM before the first command is
-  ignored; unknown commands print an error line. EOF on stdin ends the command reading, not the
-  program (so `cmd < /dev/null` keeps running).
+  to every line and prints the status line only every 60 s. Line commands on stdin (not `--daemon`;
+  also when stdin is a terminal and stdout is not, read only while in the foreground: a start with `&`
+  reads them after `fg`), like the Windows CLI's scripted stdin: `start`, `stop`, `s` (toggle),
+  `t <ip>` / `t` (discovery; also `module`), `rate <hz>` (`r`), `interval <us>` (`i`), `channels <n>`
+  (`c`), `port <n>` (`p`), `http-port <n>`, `restart` (`a`), `status` (prints one status line), `web`
+  (`w`), `help` (`h`, `?`), `quit` (`q`, `exit`); case does not matter; a UTF-8 BOM before the first
+  command is ignored; unknown commands print an error line. Commands in a row see each other: `s`
+  twice is a stop, then a start; `status` after `stop` says stopped. A value that is already in effect
+  is said so ("Asking for 8 channels already", "Listening on UDP port 11000 already", "The UDP port is
+  11000 already (used when listening starts)") and changes nothing. EOF on stdin ends the command
+  reading, not the program (so `cmd < /dev/null` keeps running).
 - Settings changed through the keys, stdin commands or the web page are saved to the settings file
   (unless `--no-config`): temp file + fsync + rename, directory created as needed.
-- Exit codes: 0 normal, 2 bad command-line options, 3 already running, 1 anything else fatal.
+- Exit codes: 0 normal, 2 bad command-line options, 3 already running, 1 anything else fatal; the third
+  quit signal while quitting: 128 + the signal.
 
 ## 6. Settings file
 
 `$XDG_CONFIG_HOME/elrs-wifi-joystick/config` (default `~/.config/...`): `key = value` lines, `#`
 comments; an unknown key or a bad value is a warning (that line is ignored), never fatal, and is
 dropped on the next save. Keys: `module_ip`, `port`, `http_port`, `interval_us`, `channels`, `web` (`ADDR:PORT` or
-`off`), `joystick` (`on`/`off`), `buttons` (`on`/`off`), `name`. The live keys (first five) are
-rewritten on every change; the others are kept as they are.
+`off`), `joystick` (`on`/`off`), `buttons` (`on`/`off`), `name` (1 to 63 bytes). A save rewrites only the
+live keys (the first five) that changed while the program ran, so a value given once on the command
+line is not made permanent by an unrelated change; every other line is kept as it is. An existing file
+keeps its mode, a new one gets 0666 minus the umask; a symlinked file is written where the link points,
+also when that file does not exist yet.
 
 ## 7. Web page and API
 
@@ -174,12 +208,14 @@ Default `http://127.0.0.1:11000/` (this machine only). The contract is `docs/WEB
 - `GET /` the page; `GET /api/status`, `GET /api/config`, `POST /api/config`, `POST /api/start`,
   `POST /api/stop`, `POST /api/restart`, `GET /api/log?since=N`.
 - Security: `Host` must be `localhost`, `127.0.0.1`, `[::1]` or an IPv4 literal (with an optional
-  port), else 403 (DNS rebinding). An `Origin` header, when present, must name the same host:port as
+  port), else 403 (DNS rebinding); the page itself asked for by a host name (`raspberrypi.local`) gets a
+  short HTML page that says to open it by the IP address. An `Origin` header, when present, must name the same host:port as
   `Host` (else 403). POSTs need `Content-Type: application/json` (else 415): a cross-site form can't
   send that without a CORS preflight, which is never answered. No CORS headers. Limits: head 8 KiB,
   body 4 KiB, 32 connections, 5 s idle per connection, `Connection: close` after each response.
 - The page polls `/api/status` every 100 ms while visible and `/api/log` every second; it never loads
-  anything from the internet.
+  anything from the internet. Both answers carry the program's `instance`: when it changes (the program
+  restarted, whatever its uptime), the page starts its log over and reads the settings again.
 
 ## 8. Builds
 

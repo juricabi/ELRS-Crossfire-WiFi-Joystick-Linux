@@ -73,15 +73,16 @@ root: the program in ~/.local/bin only; it prints the commands that need root. R
   --user           install for this user only, in ~/.local/bin (the default without root)
   --service        also a systemd user service that runs the program (as the user who ran sudo,
                    or as you without root); enabled and started when that user has a session
-  --no-udev        leave /dev/uinput access and the uinput module alone
+  --no-udev        leave /dev/uinput access and the uinput module alone (remembered for updates)
+  --udev           set them up again after an earlier --no-udev
   --uninstall      remove what this script installed (the settings in ~/.config stay)
   --arch A         the binary for A instead of this machine's: $ARCHES
   --root DIR       install into DIR instead of / (images, tests): nothing is loaded or started
   -n, --dry-run    only print what would be done
   -h, --help       this help
 
-Environment: GITHUB_TOKEN (needed while the repository is private; needs curl),
-ELRS_WIFI_JOYSTICK_REPO (owner/name, default $REPO).
+Environment: GITHUB_TOKEN (needed while the repository is private; needs curl; when it cannot read
+the release, the public download is tried), ELRS_WIFI_JOYSTICK_REPO (owner/name, default $REPO).
 EOF
 }
 
@@ -97,6 +98,7 @@ FILE=
 USER_MODE=0
 SERVICE=0
 UDEV=1
+UDEV_SET=0
 UNINSTALL=0
 ROOT=
 ROOT_SET=0
@@ -122,12 +124,13 @@ while [ $# -gt 0 ]; do
         --arch) ARCH_OPT=$val ;;
       esac
       ;;
-    --user|--service|--no-udev|--uninstall|--dry-run|--help)
+    --user|--service|--no-udev|--udev|--uninstall|--dry-run|--help)
       [ "$has_val" = 0 ] || bad "$opt takes no value"
       case $opt in
         --user) USER_MODE=1 ;;
         --service) SERVICE=1 ;;
-        --no-udev) UDEV=0 ;;
+        --no-udev) UDEV=0; UDEV_SET=1 ;;
+        --udev) UDEV=1; UDEV_SET=1 ;;
         --uninstall) UNINSTALL=1 ;;
         --dry-run) DRY=1 ;;
         --help) usage; exit 0 ;;
@@ -256,13 +259,21 @@ mkdirs() {  # logical dir
   mkdir -p "$ROOT$1" || die "cannot create $ROOT$1"
 }
 
-# write text to a file: temp file next to it, then rename (nobody ever sees half a file)
+# the data of a new file on disk before the rename that makes it the real one (a power cut right after
+# an install must not leave an empty program or rule); sync with a file is coreutils 8.24+ / busybox
+# 1.28+, a plain sync anywhere
+sync_file() {  # path
+  sync -- "$1" 2>/dev/null || sync 2>/dev/null || :
+}
+
+# write text to a file: temp file next to it, synced, then rename (nobody ever sees half a file)
 put_text() {  # logical path, mode, text
   if [ "$DRY" = 1 ]; then say "  would write $ROOT$1"; return 0; fi
   mkdirs "${1%/*}"
   PENDING=$ROOT${1%/*}/.${1##*/}.tmp.$$
   printf '%s\n' "$3" > "$PENDING" || die "cannot write $ROOT$1"
   chmod "$2" "$PENDING" || die "cannot set the mode of $ROOT$1"
+  sync_file "$PENDING"
   mv -f "$PENDING" "$ROOT$1" || die "cannot write $ROOT$1"
   PENDING=
 }
@@ -273,6 +284,7 @@ put_file() {  # source, logical path, mode
   PENDING=$ROOT${2%/*}/.${2##*/}.tmp.$$
   cp "$1" "$PENDING" || die "cannot write $ROOT$2"
   chmod "$3" "$PENDING" || die "cannot set the mode of $ROOT$2"
+  sync_file "$PENDING"
   mv -f "$PENDING" "$ROOT$2" || die "cannot write $ROOT$2"
   PENDING=
 }
@@ -360,12 +372,14 @@ known_file() {
   esac
 }
 
-read_record() {  # -> OLD_FILES, OLD_SERVICES (newline-separated); unknown lines are ignored
+read_record() {  # -> OLD_FILES, OLD_SERVICES (newline-separated), OLD_NOUDEV; unknown lines are ignored
   OLD_FILES=
   OLD_SERVICES=
+  OLD_NOUDEV=0
   [ -f "$ROOT$REC" ] || return 0
   while IFS= read -r rr_line || [ -n "$rr_line" ]; do
     case $rr_line in
+      no-udev) OLD_NOUDEV=1 ;;
       "file "*)
         rr_p=${rr_line#file }
         if known_file "$rr_p"; then OLD_FILES="$OLD_FILES
@@ -398,7 +412,7 @@ uname_arch() {
   ua_m=$(uname -m)
   case $ua_m in
     x86_64|amd64) echo x86_64 ;;
-    i386|i486|i586|i686|x86) echo i686 ;;
+    i686) echo i686 ;;   # i386..i586: a CPU before the Pentium Pro (no CMOV), which the i686 binary needs
     aarch64|arm64) echo aarch64 ;;
     armv7l|armv7|armv7hl|armv8l) echo armv7 ;;   # armv8l: a 32-bit program on a 64-bit ARM CPU
     armv6l|armv6) echo armv6 ;;
@@ -420,8 +434,9 @@ sha256_of() {
 DL=
 pick_downloader() {
   if command -v curl >/dev/null 2>&1; then DL=curl
-  elif [ -n "${GITHUB_TOKEN:-}" ]; then die "downloading with GITHUB_TOKEN needs curl: install curl"
-  elif command -v wget >/dev/null 2>&1; then DL=wget
+  elif command -v wget >/dev/null 2>&1; then
+    DL=wget
+    [ -z "${GITHUB_TOKEN:-}" ] || warn "GITHUB_TOKEN is used only with curl (there is none here): trying the public download"
   else die "neither curl nor wget is here: install one, or use --file"
   fi
 }
@@ -523,6 +538,12 @@ if [ "$SERVICE" = 1 ] && [ -z "$SVC_USER" ]; then
   die "--service makes a systemd user service, and root has no user to run it as: run this with sudo from \
 the account that should run it, or as that user without sudo (installs in ~/.local/bin)"
 fi
+# a system without systemd (OpenRC, runit, sysvinit: Alpine, Void, Devuan, Gentoo, ...) would never start the
+# unit: say so instead of claiming it starts at login (with --root it is for another system's image)
+if [ "$SERVICE" = 1 ] && [ "$LIVE" = 1 ] && ! command -v systemctl >/dev/null 2>&1; then
+  die "--service makes a systemd user service, and this system has no systemd (no systemctl): start \
+\"$APP --daemon\" from your init system or your session's autostart instead - nothing was installed"
+fi
 ARCH=$ARCH_OPT
 if [ -z "$FILE" ]; then
   if [ -z "$ARCH" ]; then
@@ -543,6 +564,28 @@ done <<EOF
 $OLD_FILES
 EOF
 for u in $OLD_SERVICES; do rec_add "service $u"; done
+# --no-udev is remembered: an update ("run it again") leaves /dev/uinput alone until --udev says otherwise
+if [ "$MODE" = system ] && [ "$UDEV_SET" = 0 ] && [ "$OLD_NOUDEV" = 1 ]; then
+  UDEV=0
+  say "Leaving /dev/uinput access alone, as an earlier --no-udev asked (--udev sets it up)."
+fi
+
+# the services: asked for now, or installed before (then updated)
+SERVICES=
+if [ "$SERVICE" = 1 ]; then SERVICES=$SVC_USER; fi
+for u in $OLD_SERVICES; do
+  case " $SERVICES " in *" $u "*) ;; *) SERVICES="${SERVICES:+$SERVICES }$u" ;; esac
+done
+
+# A copy installed for the invoking user without sudo (~/.local/bin) comes first on PATH (and its user unit
+# before this one): it would keep running the old version after every update of this one.
+if [ "$MODE" = system ] && [ -n "$INVOKER" ] && inv_home=$(user_home "$INVOKER") && [ -n "$inv_home" ]; then
+  inv_home=${inv_home%/}
+  if [ -f "$ROOT$inv_home/.local/share/$APP/installed" ] || [ -e "$ROOT$inv_home/.local/bin/$APP" ]; then
+    warn "$INVOKER also has a copy in $inv_home/.local/bin (installed without sudo): it comes first on PATH, so this \
+one would not run. Remove it: sh install.sh --uninstall (as $INVOKER, without sudo)"
+  fi
+fi
 
 # ---- the binary
 if [ "$DRY" = 0 ]; then
@@ -563,12 +606,20 @@ elif [ "$DRY" = 1 ]; then
 else
   pick_downloader
   SUMS=$TMPD/SHA256SUMS
-  if [ -n "${GITHUB_TOKEN:-}" ]; then
+  VIA_API=0
+  if [ -n "${GITHUB_TOKEN:-}" ] && [ "$DL" = curl ]; then
     # private repository: the API names the assets; an asset is fetched by its id
     if [ -n "$WANT" ]; then api=https://api.github.com/repos/$REPO/releases/tags/v$WANT
     else api=https://api.github.com/repos/$REPO/releases/latest; fi
-    fetch "$api" "$TMPD/release.json" api ||
-      die "cannot read release ${WANT:-latest} of $REPO (no such release, or GITHUB_TOKEN cannot read the repository)"
+    if fetch "$api" "$TMPD/release.json" api; then
+      VIA_API=1
+    else
+      # an expired token, or one exported for another account: a public repository needs none
+      warn "GITHUB_TOKEN cannot read release ${WANT:-latest} of $REPO (no such release, an expired token, or one \
+for another account): trying the public download"
+    fi
+  fi
+  if [ "$VIA_API" = 1 ]; then
     # shellcheck disable=SC2020  # one field per line, whatever the JSON layout
     tr ',{}[]' '\n\n\n\n\n' < "$TMPD/release.json" > "$TMPD/fields"
     tag=$(sed -n 's/^ *"tag_name": *"\([^"]*\)" *$/\1/p' "$TMPD/fields" | head -n 1)
@@ -588,13 +639,15 @@ else
     fetch "https://api.github.com/repos/$REPO/releases/assets/$sums_id" "$SUMS" asset || die "cannot download SHA256SUMS of $tag"
     fetch "https://api.github.com/repos/$REPO/releases/assets/$bin_id" "$TMPD/$APP" asset || die "cannot download $NAME"
   else
+    tok="set GITHUB_TOKEN"
+    [ -z "${GITHUB_TOKEN:-}" ] || tok="GITHUB_TOKEN must be able to read it, and curl is needed"
     if [ -n "$WANT" ]; then
       fetch "https://github.com/$REPO/releases/download/v$WANT/SHA256SUMS" "$SUMS" ||
-        die "cannot download release v$WANT of $REPO (no such release - or the repository is private: set GITHUB_TOKEN)"
+        die "cannot download release v$WANT of $REPO (no such release - or the repository is private: $tok)"
       VER=$WANT
     else
       fetch "https://github.com/$REPO/releases/latest/download/SHA256SUMS" "$SUMS" ||
-        die "cannot download the latest release of $REPO (none yet - or the repository is private: set GITHUB_TOKEN)"
+        die "cannot download the latest release of $REPO (none yet - or the repository is private: $tok)"
       # the asset names carry the version: the checksum list tells which one is the latest
       VER=$(awk '{ f = $2; sub(/^\*/, "", f); print f }' "$SUMS" |
             sed -n "s/^$APP-\\([0-9][0-9A-Za-z.+-]*\\)-linux-$ARCH\$/\\1/p" | head -n 1)
@@ -620,11 +673,26 @@ fi
 if [ -n "$NEWBIN" ]; then
   # it must run here, unless it is meant for another machine (--root, --arch)
   chmod 0755 "$NEWBIN"
-  if out=$("$NEWBIN" --version 2>&1) && [ "${out%% *}" = "$APP" ]; then
+  rv=0
+  out=$("$NEWBIN" --version 2>&1) || rv=$?
+  if [ "$rv" = 126 ]; then
+    # not executable from $TMPDIR (mounted noexec on hardened systems): try again from where it goes
+    mkdirs "$BIN_DIR"
+    PENDING=$ROOT$BIN_DIR/.$APP.check.$$
+    if cp "$NEWBIN" "$PENDING" 2>/dev/null && chmod 0755 "$PENDING"; then
+      rv=0
+      out=$("$PENDING" --version 2>&1) || rv=$?
+    fi
+    rm -f "$PENDING"
+    PENDING=
+  fi
+  if [ "$rv" = 0 ] && [ "${out%% *}" = "$APP" ]; then
     say "Version: ${out#"$APP "}"
     [ -z "$VER" ] || [ "${out#"$APP "}" = "$VER" ] || warn "the release is $VER but the program says ${out#"$APP "}"
   elif [ -z "$ROOT" ] && [ -z "$ARCH_OPT" ]; then
-    die "the program does not run on this machine (${out:-no output}) - nothing was installed"
+    why=${out:-no output}
+    [ "$rv" != 126 ] || why="$why - it may not be executed there: is $ROOT$BIN_DIR on a file system mounted noexec?"
+    die "the program does not run on this machine ($why) - nothing was installed"
   else
     say "(not run here: it may be for another machine)"
   fi
@@ -632,21 +700,36 @@ if [ -n "$NEWBIN" ]; then
     say "Replacing ${old#"$APP "} in $ROOT$BIN"
   fi
 fi
+# The record first, with everything this run will install: an install that stops halfway (Ctrl-C, a full
+# disk, a later error) leaves nothing that --uninstall does not know about. --uninstall skips what is not there.
+rec_add "file $BIN"
+if [ "$UDEV" = 1 ] && [ "$MODE" = system ]; then
+  rec_add "file $RULE"
+  rec_add "file $MODLOAD"
+fi
+[ "$MODE" != system ] || [ "$UDEV" = 1 ] || rec_add no-udev
+if [ -n "$SERVICES" ]; then
+  rec_add "file $UNIT"
+  for u in $SERVICES; do rec_add "service $u"; done
+fi
+write_record() {
+  if [ "$DRY" = 1 ]; then return 0; fi
+  put_text "$REC" 0644 "# elrs-wifi-joystick install.sh: what it installed (sh install.sh --uninstall removes it)$REC_LINES"
+}
+write_record
+
 if [ "$DRY" = 1 ]; then
   say "  would install $ROOT$BIN"
 else
   put_file "$NEWBIN" "$BIN" 0755
   say "Installed $ROOT$BIN"
 fi
-rec_add "file $BIN"
 
 # ---- /dev/uinput access and the uinput module
 UINPUT_NOTE=
 if [ "$UDEV" = 1 ] && [ "$MODE" = system ]; then
   put_text "$RULE" 0644 "$RULE_TEXT"
-  rec_add "file $RULE"
   put_text "$MODLOAD" 0644 "$MODLOAD_TEXT"
-  rec_add "file $MODLOAD"
   [ "$DRY" = 1 ] || say "Installed $ROOT$RULE and $ROOT$MODLOAD"
   if [ "$LIVE" = 1 ]; then
     if MODPROBE=$(find_cmd modprobe); then
@@ -685,26 +768,20 @@ elif [ "$UDEV" = 1 ]; then
     printf '%s\\n' '$rule_line' | sudo tee $RULE >/dev/null
     echo uinput | sudo tee $MODLOAD >/dev/null
     sudo modprobe uinput && sudo udevadm control --reload && sudo udevadm trigger --action=change --subsystem-match=misc --sysname-match=uinput
-  (or run this script with sudo, which does the same). Over SSH or for a service started at boot, also:
+  (or remove this copy - sh install.sh --uninstall - and run this script with sudo, which installs to
+  /usr/local/bin and does this too). Over SSH or for a service started at boot, also:
     sudo usermod -aG input $CUR_USER   (then log in again)"
   fi
 fi
 
 # ---- the systemd user service (asked for now, or installed before: then it is updated)
-SERVICES=
-if [ "$SERVICE" = 1 ]; then SERVICES=$SVC_USER; fi
-for u in $OLD_SERVICES; do
-  case " $SERVICES " in *" $u "*) ;; *) SERVICES="${SERVICES:+$SERVICES }$u" ;; esac
-done
 SVC_NOTE=
 svc_first=${SERVICES%% *}
 if [ -n "$SERVICES" ]; then
   unit_text=$(printf '%s\n' "$UNIT_TEXT" | sed "s|^ExecStart=/usr/local/bin/$APP |ExecStart=$EXEC_PATH |")
   put_text "$UNIT" 0644 "$unit_text"
-  rec_add "file $UNIT"
   [ "$DRY" = 1 ] || say "Installed $ROOT$UNIT"
   for u in $SERVICES; do
-    rec_add "service $u"
     asked=0
     [ "$SERVICE" = 0 ] || [ "$u" != "$SVC_USER" ] || asked=1
     if [ "$LIVE" = 0 ]; then
@@ -725,7 +802,9 @@ if [ -n "$SERVICES" ]; then
       # no user manager runs now: enable it the way systemctl does (the link), it starts at the next login
       wl=$(wants_link "$u") || die "cannot find the home directory of $u"
       if as_user "$u" mkdir -p "${wl%/*}" && as_user "$u" ln -sf "$UNIT" "$wl"; then
-        say "Service enabled for $u: it starts when $u logs in."
+        if [ -d /run/systemd/system ]; then say "Service enabled for $u: it starts when $u logs in."
+        else say "Service enabled for $u: it starts when $u logs in with systemd running (it does not run here now)."
+        fi
       else
         warn "could not enable the service for $u: log in as $u and run: systemctl --user enable --now $UNIT_NAME"
       fi
@@ -735,11 +814,12 @@ if [ -n "$SERVICES" ]; then
   It runs while its user is logged in; to run it from boot without a login: sudo loginctl enable-linger $svc_first"
 fi
 
-# ---- the record
+# ---- the record (as written before the files; again, so it is the last word)
 if [ "$DRY" = 1 ]; then
   say "  would write $ROOT$REC"
 else
-  put_text "$REC" 0644 "# elrs-wifi-joystick install.sh: what it installed (sh install.sh --uninstall removes it)$REC_LINES"
+  write_record
+  sync 2>/dev/null || :            # the renames too
 fi
 
 # ---- next steps

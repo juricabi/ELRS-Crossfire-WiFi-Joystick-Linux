@@ -13,6 +13,8 @@
  *   joy ok|off|err <text>    the virtual joystick (\n in text: a new line)   buttons on|off  CH9-16 as buttons
  *   raw <ch 1-16> <0..32767|auto>   pin a channel       nch <n|auto>      channels per frame
  *   log <text>               a log line                 warn <text>       the next saves "fail" with this
+ *   restart                  as if the program restarted: a new web server (a new instance), the log and
+ *                            the uptime from 0
  *   quit
  * End of input keeps it running (Ctrl+C ends it). */
 #include "engine.h"
@@ -150,10 +152,24 @@ void eng_stop(engine_t *e) {
   pthread_mutex_unlock(&e->mu);
 }
 
-int eng_set_config(engine_t *e, const eng_config_t *c, char *err, size_t cap) {
-  if (eng_config_check(c, err, cap)) return -1;
+int eng_update_config(engine_t *e, const eng_config_t *cin, unsigned fields, eng_config_t *out, char *err, size_t cap) {
   pthread_mutex_lock(&e->mu);
-  eng_config_t old = e->cfg;
+  eng_config_t old = e->cfg, n = e->cfg;
+  pthread_mutex_unlock(&e->mu);
+  if (fields & ENG_F_MODULE_IP) memcpy(n.module_ip, cin->module_ip, sizeof n.module_ip);
+  if (fields & ENG_F_PORT) n.port = cin->port;
+  if (fields & ENG_F_HTTP_PORT) n.http_port = cin->http_port;
+  if (fields & ENG_F_INTERVAL) n.interval_us = cin->interval_us;
+  if (fields & ENG_F_CHANNELS) n.channels = cin->channels;
+  if (eng_config_check(&n, err, cap)) return -1;
+  uint32_t ip;
+  char plain[16] = "";
+  if (wifi_parse_ip(n.module_ip, &ip) == 1) wifi_ip_str(ip, plain);
+  memset(n.module_ip, 0, sizeof n.module_ip);
+  memcpy(n.module_ip, plain, strlen(plain));
+  if (out) *out = n;
+  const eng_config_t *c = &n;
+  pthread_mutex_lock(&e->mu);
   e->cfg = *c;
   if (strcmp(old.module_ip, c->module_ip))
     dlog(e, c->module_ip[0] ? "Module IP set to %s" : "Module IP cleared: finding the module by its broadcast%s", c->module_ip);
@@ -173,6 +189,12 @@ int eng_set_config(engine_t *e, const eng_config_t *c, char *err, size_t cap) {
   pthread_mutex_unlock(&e->mu);
   return 0;
 }
+
+int eng_set_config(engine_t *e, const eng_config_t *c, char *err, size_t cap) {
+  return eng_update_config(e, c, ENG_F_ALL, NULL, err, cap);
+}
+
+bool eng_wait_applied(engine_t *e, int timeout_ms) { (void)e; (void)timeout_ms; return true; }
 
 void eng_restart_stream(engine_t *e) {
   pthread_mutex_lock(&e->mu);
@@ -200,7 +222,7 @@ void eng_snapshot(engine_t *e, eng_snapshot_t *o) {
   double t = (double)(now - e->t0_us) / 1e6;
   o->cfg = e->cfg;
   o->running = e->running;
-  o->listening = e->running;
+  o->listening = e->running && e->state != WIFI_ST_ERROR;     /* as the engine: an error state is a failed bind */
   o->state = e->state;
   snprintf(o->detail, sizeof o->detail, "%s", e->detail);
   snprintf(o->status, sizeof o->status, "%s", e->status);
@@ -226,6 +248,8 @@ void eng_snapshot(engine_t *e, eng_snapshot_t *o) {
     o->frames = e->frames_base;
   }
   o->rx = o->frames + 3;
+  o->dropped_filter = 7;                         /* distinct numbers: each shows under its own label */
+  o->dropped_other = 11;
   o->beacons = (uint32_t)(t / 5) + 1;
   o->posts = e->posts;
   o->posts_ok = e->posts;
@@ -378,9 +402,24 @@ int main(int argc, char **argv) {
   web_url(w, url, sizeof url);
   printf("URL %s\n", url);
   fflush(stdout);
+  unsigned bound = 0;
+  sscanf(strrchr(url, ':') + 1, "%u", &bound);
   char line[512];
   while (!quit_sig && fgets(line, sizeof line, stdin)) {
     line[strcspn(line, "\r\n")] = 0;
+    if (!strcmp(line, "restart")) {
+      web_stop(w);
+      pthread_mutex_lock(&e->mu);
+      e->log_seq = 0;
+      e->t0_us = wifi_net_now_us();
+      dlog(e, "elrs-wifi-joystick web demo (fake engine), restarted");
+      pthread_mutex_unlock(&e->mu);
+      w = web_start(e, addr, (uint16_t)bound, err, sizeof err);
+      if (!w) { fprintf(stderr, "%s\n", err); return 1; }
+      printf("ok\n");
+      fflush(stdout);
+      continue;
+    }
     int rc = command(e, line);
     if (rc > 0) break;
     printf(rc ? "error %s\n" : "ok\n", line);

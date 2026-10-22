@@ -2,7 +2,8 @@
  *
  * Name configurable (default ENG_DEVICE_NAME), BUS_VIRTUAL, vendor/product 0, version 1; 8 axes
  * 0..32767 with fuzz 0 and flat 0 (the kernel must neither drop small moves nor add a dead zone),
- * starting at the center; buttons BTN_TRIGGER..BTN_BASE2 only when asked for. Created with
+ * starting at the center; buttons BTN_TRIGGER..BTN_BASE2 always declared (without EV_KEY, udev and SDL
+ * take a device with X/Y/Z axes for an accelerometer), and with buttons=false never pressed. Created with
  * UI_DEV_SETUP / UI_ABS_SETUP (kernel 4.5+), else the legacy struct uinput_user_dev write. The event
  * node (/dev/input/eventN) is found through UI_GET_SYSNAME and sysfs, best effort.
  *

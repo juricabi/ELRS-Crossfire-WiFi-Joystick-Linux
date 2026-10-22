@@ -37,11 +37,8 @@
 #define GAP_US 250000                 /* a pause in the stick data this long is counted (and logged) */
 #define GAP_LOG_US 5000000            /* at most one gap line per this */
 #define RCVBUF (256 * 1024)
-#define NCMD 32
 #define SIGNAL_PERIOD_MS 2000         /* the WiFi signal sample for the gap log, while streaming */
 #define TS_MAX_AGE_US 2000000         /* an older kernel receive time is not believed */
-
-typedef enum { CMD_START, CMD_STOP, CMD_RESTART, CMD_CONFIG } cmd_t;
 
 struct engine {
   eng_options_t opt;
@@ -70,19 +67,28 @@ struct engine {
   char name[48];                  /* "ELRS 192.168.1.50" */
   int64_t gap_prev;               /* arrival of the previous frame of gap_src, 0 = none */
   uint32_t gap_src;
+  /* our own restart (joystick_end, then joystick_begin) pauses the stream: a pause that overlaps one
+   * (queued at rs_at, its result taken at rs_done_at) is no gap */
+  uint32_t rs_ip;
+  int64_t rs_at, rs_done_at;      /* rs_at 0 = none */
+  bool rs_done;
   uint32_t gaps, gaps_unlogged;
   int64_t gap_max_us, gap_logged_at;
   uint32_t posts, posts_ok, posts_failed;
   uint8_t buf[2048];
   eng_snapshot_t work;            /* built each pass, published when it differs */
+  uint32_t cmd_taken;             /* cmd_seq of the commands applied in this pass */
 
-  /* ---- commands (mu) ---- */
+  /* ---- commands (mu): what was asked, as state (nothing is ever dropped, however many come) ---- */
   pthread_mutex_t mu;
-  cmd_t cmds[NCMD];
-  int ncmd;
+  bool stop_req;                  /* a stop was asked since the last pass (applied first) */
+  int run_req;                    /* the last of eng_start / eng_stop: 1 start, 0 stop, -1 none */
+  bool restart_req;
+  bool cfg_req_new;               /* cfg_req is to be applied */
+  uint32_t cmd_seq;               /* commands given so far (eng_wait_applied) */
   bool quit;
-  eng_config_t cfg_req;           /* the latest accepted config: what CMD_CONFIG applies */
-  pthread_mutex_t set_mu;         /* one eng_set_config at a time (saves in order) */
+  eng_config_t cfg_req;           /* the latest accepted config */
+  pthread_mutex_t set_mu;         /* one config update at a time (merges and saves in order) */
   int wake_rd, wake_wr;
 
   /* ---- the worker (qmu) ---- */
@@ -101,6 +107,7 @@ struct engine {
   pthread_mutex_t smu;
   pthread_cond_t scv;
   eng_snapshot_t snap;
+  uint32_t cmd_done;              /* cmd_seq of the commands applied and published */
   eng_logline_t ring[ENG_LOG_LINES];
   uint32_t log_seq;
 };
@@ -220,9 +227,10 @@ int eng_log_read(engine_t *e, uint32_t since, eng_logline_t *out, int max) {
   pthread_mutex_lock(&e->smu);
   uint32_t newest = e->log_seq;
   uint32_t oldest = newest >= ENG_LOG_LINES ? newest - ENG_LOG_LINES + 1 : 1;
-  uint32_t s = since + 1 < oldest || since + 1 == 0 ? oldest : since + 1;
   int k = 0;
-  for (; s <= newest && s != 0 && k < max; s++) out[k++] = e->ring[s % ENG_LOG_LINES];
+  /* since < newest: since + 1 cannot wrap (since = 4294967295 asks for nothing) */
+  uint32_t s = since >= newest ? 0 : since + 1 < oldest ? oldest : since + 1;
+  for (; s && s <= newest && k < max; s++) out[k++] = e->ring[s % ENG_LOG_LINES];
   pthread_mutex_unlock(&e->smu);
   return k;
 }
@@ -262,34 +270,73 @@ static void wake(engine_t *e) {
   if (write(e->wake_wr, &c, 1) < 0) { /* EAGAIN */ }
 }
 
-static void push_cmd(engine_t *e, cmd_t c) {
+/* A command is state, not a queue entry: any number of them in a burst is applied, the last start/stop
+ * wins (a stop before it still ends the session first), and a config is the latest one. */
+void eng_start(engine_t *e) {
+  if (!e) return;
   pthread_mutex_lock(&e->mu);
-  bool dropped = false;
-  /* a queued config applies the latest one anyway; the same command twice in a row is one */
-  bool dup = false;
-  for (int i = 0; i < e->ncmd && c == CMD_CONFIG; i++) dup = dup || e->cmds[i] == CMD_CONFIG;
-  if (c != CMD_CONFIG && e->ncmd && e->cmds[e->ncmd - 1] == c) dup = true;
-  if (!dup) {
-    if (e->ncmd < NCMD) e->cmds[e->ncmd++] = c;
-    else dropped = true;
-  }
+  e->run_req = 1;
+  e->cmd_seq++;
   pthread_mutex_unlock(&e->mu);
-  if (dropped) eng_log(e, "Too many commands at once - one was dropped");
   wake(e);
 }
 
-void eng_start(engine_t *e) { if (e) push_cmd(e, CMD_START); }
-void eng_stop(engine_t *e) { if (e) push_cmd(e, CMD_STOP); }
-void eng_restart_stream(engine_t *e) { if (e) push_cmd(e, CMD_RESTART); }
+void eng_stop(engine_t *e) {
+  if (!e) return;
+  pthread_mutex_lock(&e->mu);
+  e->run_req = 0;
+  e->stop_req = true;
+  e->cmd_seq++;
+  pthread_mutex_unlock(&e->mu);
+  wake(e);
+}
 
-int eng_set_config(engine_t *e, const eng_config_t *cin, char *err, size_t cap) {
+void eng_restart_stream(engine_t *e) {
+  if (!e) return;
+  pthread_mutex_lock(&e->mu);
+  e->restart_req = true;
+  e->cmd_seq++;
+  pthread_mutex_unlock(&e->mu);
+  wake(e);
+}
+
+bool eng_wait_applied(engine_t *e, int timeout_ms) {
+  pthread_mutex_lock(&e->mu);
+  uint32_t want = e->cmd_seq;
+  pthread_mutex_unlock(&e->mu);
+  if (timeout_ms < 0) timeout_ms = 0;
+  struct timespec dl;
+  abs_deadline(&dl, timeout_ms);
+  pthread_mutex_lock(&e->smu);
+  while ((int32_t)(e->cmd_done - want) < 0)
+    if (pthread_cond_timedwait(&e->scv, &e->smu, &dl) == ETIMEDOUT) break;
+  bool done = (int32_t)(e->cmd_done - want) >= 0;
+  pthread_mutex_unlock(&e->smu);
+  return done;
+}
+
+int eng_update_config(engine_t *e, const eng_config_t *cin, unsigned fields, eng_config_t *out, char *err, size_t cap) {
   if (cap) err[0] = 0;
-  if (eng_config_check(cin, err, cap)) return -1;
-  eng_config_t c = *cin;
-  config_normalize(&c);
+  /* merged onto the latest accepted config under set_mu: another update (the CLI, the web page) between
+   * a caller's snapshot and this call is never undone by fields this one did not give */
   pthread_mutex_lock(&e->set_mu);
   pthread_mutex_lock(&e->mu);
+  eng_config_t c = e->cfg_req;
+  pthread_mutex_unlock(&e->mu);
+  if (fields & ENG_F_MODULE_IP) memcpy(c.module_ip, cin->module_ip, sizeof c.module_ip);
+  if (fields & ENG_F_PORT) c.port = cin->port;
+  if (fields & ENG_F_HTTP_PORT) c.http_port = cin->http_port;
+  if (fields & ENG_F_INTERVAL) c.interval_us = cin->interval_us;
+  if (fields & ENG_F_CHANNELS) c.channels = cin->channels;
+  if (eng_config_check(&c, err, cap)) {
+    pthread_mutex_unlock(&e->set_mu);
+    return -1;
+  }
+  config_normalize(&c);
+  pthread_mutex_lock(&e->mu);
   e->cfg_req = c;
+  e->cfg_req_new = true;
+  e->cmd_seq++;
   pthread_mutex_unlock(&e->mu);
   pthread_mutex_lock(&e->smu);
   if (memcmp(&e->snap.cfg, &c, sizeof c)) {
@@ -298,7 +345,8 @@ int eng_set_config(engine_t *e, const eng_config_t *cin, char *err, size_t cap) 
     pthread_cond_broadcast(&e->scv);
   }
   pthread_mutex_unlock(&e->smu);
-  push_cmd(e, CMD_CONFIG);
+  wake(e);
+  if (out) *out = c;
   if (e->opt.save) {
     char serr[256] = "";
     if (e->opt.save(e->opt.save_ud, &c, serr, sizeof serr) != 0) {
@@ -309,6 +357,10 @@ int eng_set_config(engine_t *e, const eng_config_t *cin, char *err, size_t cap) 
   }
   pthread_mutex_unlock(&e->set_mu);
   return 0;
+}
+
+int eng_set_config(engine_t *e, const eng_config_t *c, char *err, size_t cap) {
+  return eng_update_config(e, c, ENG_F_ALL, NULL, err, cap);
 }
 
 /* ================================================================ worker */
@@ -458,7 +510,11 @@ static void h_frame(void *ud, uint32_t src, const uint16_t *raw, int n) {
     joy_send(e, ev, k);
   }
   int64_t arr = e->p.last_arrival_us;           /* this frame's (set just before the hook) */
-  if (e->gap_prev && src == e->gap_src && arr - e->gap_prev >= GAP_US) note_gap(e, arr - e->gap_prev, e->now);
+  /* a pause that overlaps our own restart of this module (it ends after the restart was queued and began
+   * before its result was in) is that restart's, not the WiFi's: at a slow rate its last frame often came
+   * before the restart was even sent (ELRS stops at once on joystick_end) */
+  bool ours = src == e->rs_ip && e->rs_at && arr >= e->rs_at && (!e->rs_done || e->gap_prev <= e->rs_done_at);
+  if (e->gap_prev && src == e->gap_src && !ours && arr - e->gap_prev >= GAP_US) note_gap(e, arr - e->gap_prev, e->now);
   e->gap_prev = arr;
   e->gap_src = src;
   wifi_kind_t k = wifi_proto_kind(&e->p, src);
@@ -484,6 +540,11 @@ static int h_activate(void *ud, const wifi_act_t *a) {
   pthread_mutex_unlock(&e->qmu);
   /* a restart that took over a queued request is still one POST */
   if (r == WIFI_ACT_QUEUED && !was_pending) e->posts++;
+  if (r == WIFI_ACT_QUEUED && a->restart) {
+    e->rs_ip = a->ip;                             /* under way until its result is in (collect_results) */
+    e->rs_at = e->now;
+    e->rs_done = false;
+  }
   return r;
 }
 
@@ -634,6 +695,10 @@ static void collect_results(engine_t *e, int64_t now) {
       eng_log(e, "Activation failed for %s: %s", ip, r->err[0] ? r->err : "failed");
     if (r->ok) e->posts_ok++;
     else e->posts_failed++;
+    if (r->restart && r->ip == e->rs_ip && !e->rs_done) {
+      e->rs_done = true;
+      e->rs_done_at = now;
+    }
     wifi_proto_activation_done(&e->p, r->ip, r->ok, now);
   }
 }
@@ -650,6 +715,11 @@ static void do_start(engine_t *e, int64_t now) {
   e->bind_error = false;
   e->last_arr = 0;
   e->gap_prev = 0;
+  e->rs_at = 0;
+  /* running, not listening yet: searching (the quick bind retries), not the stopped state of before */
+  char d[64];
+  snprintf(d, sizeof d, "opening UDP port %u", e->cfg.port);
+  wifi_proto_set_state(&e->p, WIFI_ST_SEARCHING, d);
   try_bind(e, now);
 }
 
@@ -667,11 +737,13 @@ static void do_stop(engine_t *e, bool quiet) {
   joy_center(e);
   e->was_bound = false;
   e->gap_prev = 0;
+  e->rs_at = 0;
   if (!quiet) eng_log(e, "Stopped. (The module keeps broadcasting until powered off.)");
 }
 
-/* the module IP of e->cfg as the target: at once while running, else at the next bind */
-static void apply_target(engine_t *e, int64_t now) {
+/* the module IP of e->cfg as the target: at once while running, else at the next bind (rebinding: the
+ * listening that starts right after this, with the new port) */
+static void apply_target(engine_t *e, int64_t now, bool rebinding) {
   uint32_t ip = 0;
   bool set = wifi_parse_ip(e->cfg.module_ip, &ip) == 1 && ip;
   if (e->running) {
@@ -683,8 +755,13 @@ static void apply_target(engine_t *e, int64_t now) {
     return;
   }
   e->p.target = set ? ip : 0;
-  if (set) eng_log(e, "Module IP set to %s (used when listening starts)", e->cfg.module_ip);
-  else eng_log(e, "Module IP cleared - the module will be found by its broadcast");
+  if (rebinding) {
+    if (set) eng_log(e, "Module IP set to %s", e->cfg.module_ip);
+    else eng_log(e, "Module IP cleared - finding the module by its broadcast");
+  } else {
+    if (set) eng_log(e, "Module IP set to %s (used when listening starts)", e->cfg.module_ip);
+    else eng_log(e, "Module IP cleared - the module will be found by its broadcast");
+  }
 }
 
 static void apply_config(engine_t *e, const eng_config_t *n, int64_t now) {
@@ -703,7 +780,7 @@ static void apply_config(engine_t *e, const eng_config_t *n, int64_t now) {
     if (leaving) wifi_proto_store_request(&e->p, n->interval_us, n->channels);
     else wifi_proto_set_request(&e->p, n->interval_us, n->channels, now);
   }
-  if (strcmp(n->module_ip, old.module_ip)) apply_target(e, now);
+  if (strcmp(n->module_ip, old.module_ip)) apply_target(e, now, rebind);
   if (n->http_port != old.http_port) eng_log(e, "The module's web server port is %u now", n->http_port);
   if (port) {
     eng_log(e, "UDP port %u%s", n->port, rebind ? "" : " (used when listening starts)");
@@ -711,32 +788,23 @@ static void apply_config(engine_t *e, const eng_config_t *n, int64_t now) {
   }
 }
 
-/* true: quit */
+/* true: quit. Order: a stop (the session ends), the config, a start, a restart. */
 static bool run_commands(engine_t *e, int64_t now) {
-  cmd_t cmds[NCMD];
   pthread_mutex_lock(&e->mu);
-  int n = e->ncmd;
-  memcpy(cmds, e->cmds, sizeof cmds[0] * (size_t)n);
-  e->ncmd = 0;
+  bool stop = e->stop_req, cfg_new = e->cfg_req_new, restart = e->restart_req;
+  int run = e->run_req;
+  e->stop_req = e->cfg_req_new = e->restart_req = false;
+  e->run_req = -1;
+  e->cmd_taken = e->cmd_seq;
   bool quit = e->quit;
   eng_config_t req = e->cfg_req;
   pthread_mutex_unlock(&e->mu);
-  for (int i = 0; i < n; i++) {
-    switch (cmds[i]) {
-      case CMD_START:
-        if (!e->running) do_start(e, now);
-        break;
-      case CMD_STOP:
-        do_stop(e, false);
-        break;
-      case CMD_RESTART:
-        if (e->sock < 0) eng_log(e, "Not listening - nothing to restart");
-        else wifi_proto_restart(&e->p, now);
-        break;
-      case CMD_CONFIG:
-        if (memcmp(&req, &e->cfg, sizeof req)) apply_config(e, &req, now);
-        break;
-    }
+  if (stop) do_stop(e, false);
+  if (cfg_new && memcmp(&req, &e->cfg, sizeof req)) apply_config(e, &req, now);
+  if (run == 1 && !e->running) do_start(e, now);
+  if (restart) {
+    if (e->sock < 0) eng_log(e, "Not listening - nothing to restart");
+    else wifi_proto_restart(&e->p, now);
   }
   return quit;
 }
@@ -821,11 +889,14 @@ static void publish(engine_t *e) {
   w->log_seq = e->snap.log_seq;
   w->uptime_us = e->snap.uptime_us;
   memcpy(&w->cfg, &e->snap.cfg, sizeof w->cfg);
+  bool changed = e->cmd_done != e->cmd_taken;   /* eng_wait_applied waits for this */
+  e->cmd_done = e->cmd_taken;
   if (memcmp(w, &e->snap, sizeof *w)) {
     memcpy(&e->snap, w, sizeof *w);
     e->snap.seq++;
-    pthread_cond_broadcast(&e->scv);
+    changed = true;
   }
+  if (changed) pthread_cond_broadcast(&e->scv);
   pthread_mutex_unlock(&e->smu);
 }
 
@@ -974,6 +1045,7 @@ engine_t *eng_create(const eng_config_t *cfg, const eng_options_t *opt, char *er
   e->wake_wr = pfd[1];
   e->cfg = c;
   e->cfg_req = c;
+  e->run_req = -1;
   memcpy(&e->snap.cfg, &c, sizeof c);
   wifi_actq_init(&e->q);
   wifi_net_init();
@@ -1001,7 +1073,7 @@ engine_t *eng_create(const eng_config_t *cfg, const eng_options_t *opt, char *er
       eng_log(e, "Running as a monitor: the sticks show here and on the web page, but no game sees them.");
     }
   } else {
-    eng_log(e, "No virtual joystick (--no-joystick): monitor only");
+    eng_log(e, "No virtual joystick (--no-joystick, or joystick = off in the settings file): monitor only");
   }
 
   if (start_thread(&e->wth, worker_main, e) != 0) {

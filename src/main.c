@@ -54,17 +54,18 @@ static int save_settings(void *ud, const eng_config_t *c, char *err, size_t cap)
 /* -1: could not tell (warned, go on); -2: another one runs (message printed); else the lock's fd,
  * held until exit (the kernel lets go of it when the process ends, however it ends). */
 static int instance_lock(void) {
-  char path[PATH_MAX];
-  const char *rt = getenv("XDG_RUNTIME_DIR");
+  char path[PATH_MAX], run_user[64];
+  unsigned uid = (unsigned)getuid();
   int fd = -1;
-  if (rt && rt[0] == '/') {
-    snprintf(path, sizeof path, "%s/elrs-wifi-joystick.lock", rt);
+  /* $XDG_RUNTIME_DIR, else /run/user/<uid> (what it is in a session), else /tmp: the same file for an
+   * instance with and one without XDG_RUNTIME_DIR (su -, sudo -u, cron next to the user service) */
+  snprintf(run_user, sizeof run_user, "/run/user/%u", uid);
+  if (cfg_lock_path(getenv("XDG_RUNTIME_DIR"), run_user, uid, path, sizeof path) == 0)
     fd = open(path, O_RDWR | O_CREAT | O_CLOEXEC | O_NOFOLLOW, 0600);
-  }
   if (fd < 0) {
-    /* no runtime directory (a plain su, cron, an old system): one lock per user in /tmp. O_NOFOLLOW: /tmp
-     * is shared, a planted symlink must not point the lock (and its truncation) elsewhere */
-    snprintf(path, sizeof path, "/tmp/elrs-wifi-joystick-%u.lock", (unsigned)getuid());
+    /* no usable runtime directory: one lock per user in /tmp. O_NOFOLLOW: /tmp is shared, a planted
+     * symlink must not point the lock (and its truncation) elsewhere */
+    snprintf(path, sizeof path, "/tmp/elrs-wifi-joystick-%u.lock", uid);
     fd = open(path, O_RDWR | O_CREAT | O_CLOEXEC | O_NOFOLLOW, 0600);
   }
   struct stat st;
@@ -98,7 +99,21 @@ static int instance_lock(void) {
   return fd;
 }
 
+/* fds 0-2 closed at the start (some init scripts and daemonizers do that): /dev/null there, or the next
+ * file opened (the lock) would become stdin or stdout - its pid read as a command, the output written in it */
+static void std_fds_open(void) {
+  for (int fd = 0; fd < 3; fd++) {
+    if (fcntl(fd, F_GETFD) >= 0 || errno != EBADF) continue;
+    int n = open("/dev/null", fd == 0 ? O_RDONLY : O_WRONLY);
+    if (n >= 0 && n != fd) {
+      dup2(n, fd);
+      close(n);
+    }
+  }
+}
+
 int main(int argc, char **argv) {
+  std_fds_open();
   cfg_args_t a;
   char err[600];
   if (cfg_parse_args(argc, argv, &a, err, sizeof err) != 0) {

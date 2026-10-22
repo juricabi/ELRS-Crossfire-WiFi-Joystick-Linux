@@ -30,6 +30,7 @@ static pthread_mutex_t smu = PTHREAD_MUTEX_INITIALIZER;
 static eng_snapshot_t S;                       /* what eng_snapshot returns */
 static int n_start, n_stop, n_restart, n_set;
 static eng_config_t last_set;
+static unsigned last_fields;                   /* eng_update_config's fields */
 static char set_warning[160];                  /* eng_set_config: 0 with this in err */
 #define NLOGMAX 1200
 static eng_logline_t LOGS[NLOGMAX];
@@ -44,8 +45,9 @@ void eng_config_default(eng_config_t *c) {
 }
 
 int eng_config_check(const eng_config_t *c, char *err, size_t cap) {
-  uint32_t ip;
-  if (c->module_ip[0] && wifi_parse_ip(c->module_ip, &ip) != 1) {
+  uint32_t ip = 0;
+  int r = wifi_parse_ip(c->module_ip, &ip);       /* as the engine: blank (spaces, line ends) = discovery */
+  if (r < 0 || (r > 0 && !ip)) {
     snprintf(err, cap, "module_ip: \"%s\" is not an IPv4 address - use a.b.c.d, or leave it empty to find the "
              "module by its broadcast", c->module_ip);
     return -1;
@@ -69,16 +71,37 @@ void eng_start(engine_t *e) { pthread_mutex_lock(&smu); n_start++; S.running = t
 void eng_stop(engine_t *e) { pthread_mutex_lock(&smu); n_stop++; S.running = false; pthread_mutex_unlock(&smu); }
 void eng_restart_stream(engine_t *e) { pthread_mutex_lock(&smu); n_restart++; pthread_mutex_unlock(&smu); }
 
-int eng_set_config(engine_t *e, const eng_config_t *c, char *err, size_t cap) {
-  if (eng_config_check(c, err, cap)) return -1;
+/* like the engine: the given fields onto the current config, checked, module_ip in its plain form */
+int eng_update_config(engine_t *e, const eng_config_t *c, unsigned fields, eng_config_t *out, char *err, size_t cap) {
   pthread_mutex_lock(&smu);
-  S.cfg = *c;
-  last_set = *c;
+  eng_config_t n = S.cfg;
+  pthread_mutex_unlock(&smu);
+  if (fields & ENG_F_MODULE_IP) memcpy(n.module_ip, c->module_ip, sizeof n.module_ip);
+  if (fields & ENG_F_PORT) n.port = c->port;
+  if (fields & ENG_F_HTTP_PORT) n.http_port = c->http_port;
+  if (fields & ENG_F_INTERVAL) n.interval_us = c->interval_us;
+  if (fields & ENG_F_CHANNELS) n.channels = c->channels;
+  if (eng_config_check(&n, err, cap)) return -1;
+  uint32_t ip;
+  char plain[16] = "";
+  if (wifi_parse_ip(n.module_ip, &ip) == 1) wifi_ip_str(ip, plain);
+  memset(n.module_ip, 0, sizeof n.module_ip);
+  memcpy(n.module_ip, plain, strlen(plain));
+  pthread_mutex_lock(&smu);
+  S.cfg = n;
+  last_set = n;
+  last_fields = fields;
   n_set++;
   snprintf(err, cap, "%s", set_warning);
   pthread_mutex_unlock(&smu);
+  if (out) *out = n;
   return 0;
 }
+
+int eng_set_config(engine_t *e, const eng_config_t *c, char *err, size_t cap) {
+  return eng_update_config(e, c, ENG_F_ALL, NULL, err, cap);
+}
+bool eng_wait_applied(engine_t *e, int timeout_ms) { return true; }
 
 void eng_snapshot(engine_t *e, eng_snapshot_t *out) {
   pthread_mutex_lock(&smu);
@@ -154,6 +177,7 @@ static void reset_snapshot(void) {
 
 /* the stub's state as the tests see it (under its lock: the server thread writes it) */
 static int geti(const int *v) { pthread_mutex_lock(&smu); int x = *v; pthread_mutex_unlock(&smu); return x; }
+static unsigned getfields(void) { pthread_mutex_lock(&smu); unsigned x = last_fields; pthread_mutex_unlock(&smu); return x; }
 static eng_config_t last(void) { pthread_mutex_lock(&smu); eng_config_t c = last_set; pthread_mutex_unlock(&smu); return c; }
 static void set_warn(const char *w) { pthread_mutex_lock(&smu); snprintf(set_warning, sizeof set_warning, "%s", w); pthread_mutex_unlock(&smu); }
 
@@ -252,6 +276,7 @@ static bool json_valid(const char *s, size_t n) {
 /* ================================================================ an HTTP client */
 static uint16_t PORT;
 static char HOSTHDR[64];                        /* "127.0.0.1:<port>" */
+static char INST[64];                           /* "instance" of /api/status and /api/log */
 static int acao_seen;                           /* responses with Access-Control-* headers */
 
 typedef struct {
@@ -512,8 +537,36 @@ static void test_host(void) {
     check_err(&r, 403, "host not allowed");
     resp_free(&r);
   }
-  /* the page and POSTs are checked too, before anything else */
-  raws("GET / HTTP/1.1\r\nHost: evil.example\r\n\r\n", &r);
+  /* the page and POSTs are checked too, before anything else. The page asked for by a host name (a person
+   * who opened http://raspberrypi.local:11000/) is told, in HTML, to open it by its IP address; the name
+   * they used is not repeated (hostile text) */
+  char v[200], self[64];
+  snprintf(self, sizeof self, "http://127.0.0.1:%u/", (unsigned)PORT);
+  static const char *const PAGES[] = { "/", "/index.html" };
+  for (int i = 0; i < 2; i++) {
+    snprintf(req, sizeof req, "GET %s HTTP/1.1\r\nHost: raspberrypi.local:%u\r\n\r\n", PAGES[i], (unsigned)PORT);
+    raws(req, &r);
+    CHECK_INT(r.status, 403);
+    CHECK_STR(hdr(&r, "Content-Type", v, sizeof v), "text/html; charset=utf-8");
+    CHECK(starts(hdr(&r, "Content-Security-Policy", v, sizeof v), "default-src 'none'"));
+    CHECK(strstr(r.body, "Open this page by its IP address") != NULL);
+    CHECK(strstr(r.body, self) != NULL);
+    CHECK(strstr(r.body, "raspberrypi") == NULL);
+    CHECK_INT((long)r.body_len, r.clen);
+    resp_free(&r);
+  }
+  raws("HEAD / HTTP/1.1\r\nHost: <script>evil.example\r\n\r\n", &r);
+  CHECK_INT(r.status, 403);
+  CHECK_INT((long)r.body_len, 0);
+  resp_free(&r);
+  raws("GET /api/status HTTP/1.1\r\nHost: raspberrypi.local\r\n\r\n", &r);
+  check_err(&r, 403, "host not allowed");                /* the API stays JSON */
+  resp_free(&r);
+  /* the HTML is for a person opening the page (GET, HEAD); anything else to it stays JSON */
+  raws("POST / HTTP/1.1\r\nHost: raspberrypi.local\r\nContent-Type: application/json\r\nContent-Length: 2\r\n\r\n{}", &r);
+  check_err(&r, 403, "host not allowed");
+  resp_free(&r);
+  raws("DELETE /index.html HTTP/1.1\r\nHost: raspberrypi.local\r\n\r\n", &r);
   check_err(&r, 403, "host not allowed");
   resp_free(&r);
   int before = geti(&n_stop);
@@ -752,7 +805,7 @@ static void test_status(void) {
   CHECK(json_valid(r.body, r.body_len));
   char want[2048];
   snprintf(want, sizeof want,
-           "{\"version\":\"%s\",\"seq\":7,\"uptime_s\":12.5,\"running\":true,\"listening\":true,\"state\":\"streaming\","
+           "{\"version\":\"%s\",\"instance\":\"%s\",\"seq\":7,\"uptime_s\":12.5,\"running\":true,\"listening\":true,\"state\":\"streaming\","
            "\"status\":\"streaming\",\"detail\":\"192.168.1.50\",\"module\":{\"ip\":\"192.168.1.50\",\"kind\":\"ELRS\","
            "\"name\":\"Unified TX\"},\"rate_hz\":249.8,\"jitter_ms\":0.42,\"frames_last_s\":250,\"nch\":16,"
            "\"raw\":[7,2007,4007,6007,8007,10007,12007,14007,16007,18007,20007,22007,24007,26007,28007,30007],"
@@ -761,7 +814,7 @@ static void test_status(void) {
            "\"counters\":{\"frames\":3120,\"rx\":3125,\"beacons\":2,\"malformed\":1,\"dropped_filter\":3,\"dropped_other\":4,"
            "\"posts\":5,\"posts_ok\":4,\"posts_failed\":1,\"restarts\":6,\"gaps\":2,\"gap_max_ms\":313},"
            "\"joystick\":{\"enabled\":true,\"ok\":true,\"name\":\"ELRS Crossfire WiFi Joystick\",\"device\":\"/dev/input/event7\","
-           "\"buttons\":true,\"error\":\"\"},\"log_seq\":%d}", APP_VERSION, nlog);
+           "\"buttons\":true,\"error\":\"\"},\"log_seq\":%d}", APP_VERSION, INST, nlog);
   CHECK_STR(r.body, want);
   resp_free(&r);
 
@@ -900,9 +953,22 @@ static void test_config_post(void) {
   CHECK_INT(last().channels, 8);
   CHECK_INT(last().interval_us, 4000);
   CHECK_INT(last().port, 11000);
+  CHECK_INT(getfields(), ENG_F_CHANNELS);       /* only what the body named: a CLI change meanwhile stays */
+  resp_free(&r);
+  /* the answer is the config in effect (as the engine has it), not the body's text */
+  post_json("/api/config", "{\"module_ip\":\"\\r\\n127.0.0.2\\n\"}", &r);
+  CHECK_INT(r.status, 200);
+  CHECK(strstr(r.body, "\"module_ip\":\"127.0.0.2\",") != NULL);
+  CHECK_STR(last().module_ip, "127.0.0.2");
+  CHECK_INT(getfields(), ENG_F_MODULE_IP);
+  resp_free(&r);
+  post_json("/api/config", "{\"module_ip\":\" \\n \"}", &r);
+  CHECK_INT(r.status, 200);
+  CHECK(strstr(r.body, "\"module_ip\":\"\",") != NULL);
   resp_free(&r);
   post_json("/api/config", "{\"interval_us\":2000,\"module_ip\":\" \\t10.0.0.5 \",\"port\":11001,\"http_port\":8080}", &r);
   CHECK_INT(r.status, 200);
+  CHECK_INT(getfields(), ENG_F_INTERVAL | ENG_F_MODULE_IP | ENG_F_PORT | ENG_F_HTTP_PORT);
   CHECK_STR(r.body, "{\"ok\":true,\"config\":{\"module_ip\":\"10.0.0.5\",\"port\":11001,\"http_port\":8080,\"interval_us\":2000,"
             "\"channels\":8},\"warning\":\"\"}");
   CHECK_STR(last().module_ip, "10.0.0.5");
@@ -1096,11 +1162,12 @@ static void test_log(void) {
   resp_free(&r);
   /* nothing new: lines [], seq = since */
   rq("GET", "/api/log?since=450", NULL, NULL, &r);
-  CHECK_STR(r.body, "{\"seq\":450,\"lines\":[]}");
+  snprintf(want, sizeof want, "{\"seq\":450,\"lines\":[],\"instance\":\"%s\"}", INST);
+  CHECK_STR(r.body, want);
   resp_free(&r);
   /* since beyond the newest (the program restarted): seq goes back, so the page starts over */
   rq("GET", "/api/log?since=4294967295", NULL, NULL, &r);
-  CHECK_STR(r.body, "{\"seq\":450,\"lines\":[]}");
+  CHECK_STR(r.body, want);
   resp_free(&r);
   /* hostile lines */
   log_raw("plain line");
@@ -1110,7 +1177,7 @@ static void test_log(void) {
   CHECK(json_valid(r.body, r.body_len));
   snprintf(want, sizeof want, "{\"seq\":452,\"lines\":[{\"seq\":451,\"time_ms\":1729590000450,\"text\":\"plain line\"},"
            "{\"seq\":452,\"time_ms\":1729590000451,\"text\":\"quote \\\" backslash \\\\ tab \\t \\u003cb\\u003ebold\\u003c/b\\u003e "
-           "\\u0026 \\ufffd \\u0001 \\u2028\"}]}");
+           "\\u0026 \\ufffd \\u0001 \\u2028\"}],\"instance\":\"%s\"}", INST);
   CHECK_STR(r.body, want);
   resp_free(&r);
   static const char *const BAD[] = {
@@ -1458,6 +1525,16 @@ int main(void) {
   PORT = (uint16_t)p;
   snprintf(HOSTHDR, sizeof HOSTHDR, "127.0.0.1:%u", p);
   printf("  serving on %s\n", url);
+  {
+    /* this run's instance: the same in every status and log answer */
+    resp_t r;
+    rq("GET", "/api/status", NULL, NULL, &r);
+    const char *q = strstr(r.body, "\"instance\":\"");
+    CHECK(q != NULL);
+    if (q) snprintf(INST, sizeof INST, "%.*s", (int)strcspn(q + 12, "\""), q + 12);
+    CHECK(strlen(INST) >= 3);
+    resp_free(&r);
+  }
   char small[8] = "x";
   web_url(w, small, sizeof small);               /* cut, NUL-terminated */
   CHECK_INT(strlen(small), 7);

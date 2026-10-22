@@ -83,8 +83,9 @@ typedef struct {
   int  (*activate)(void *ud, const wifi_act_t *a);                   /* WIFI_ACT_* */
 } wifi_hooks_t;
 
-typedef struct { uint32_t ip; int64_t t_us; } wifi_ipt_t;
+typedef struct { uint32_t ip; int64_t t_us; int interval_us, channels; } wifi_ipt_t;   /* + the request it carried */
 typedef struct { uint32_t ip; wifi_kind_t kind; char name[32]; int64_t t_us; } wifi_beacon_info_t;
+typedef struct { uint32_t ip; int interval_us, channels; int64_t t_us; } wifi_asked_t;
 
 typedef struct {
   wifi_hooks_t h;
@@ -93,9 +94,12 @@ typedef struct {
   uint32_t warned[WIFI_TABLE];  int nwarned;           /* 2nd sources already warned about */
   uint32_t nostick[WIFI_TABLE]; int nnostick;          /* sources warned for placeholder streams */
   uint32_t nostick_ip;                                 /* the last one (status text) */
-  wifi_ipt_t act[WIFI_TABLE];   int nact;              /* last activation per IP, LRU-evicted */
+  int64_t nostick_last_us;                             /* its last placeholder frame (the state goes back after 3 s) */
+  wifi_ipt_t act[WIFI_TABLE];   int nact;              /* last activation per IP (and its request), LRU-evicted */
   bool first_act_set; int64_t first_act_us; uint32_t first_act_ip; bool hint_shown;
-  wifi_beacon_info_t seen[WIFI_TABLE]; int nseen;      /* kind/name per IP from beacons (UI only) */
+  /* kind/name per IP from beacons, kept by reset (a module keeps its kind while it keeps its IP); the
+   * kind decides whether a joystick_end may be sent, so the locked module is never evicted */
+  wifi_beacon_info_t seen[WIFI_TABLE]; int nseen;
   /* stats window: online, same numbers as the C# list math */
   int frames, narr, ngaps; int64_t arr_first, arr_prev; double gap_mean, gap_m2; int64_t last_stats_us;
   double last_hz, last_jitter; int last_frames;        /* last emitted */
@@ -111,24 +115,37 @@ typedef struct {
   bool xf_noted;                                       /* "Crossfire ignores the request" logged */
   int64_t bound_since_us;                              /* when the lock was taken */
   bool restart_wait;                                   /* a request restart waiting to know it is no Crossfire */
+  uint32_t restart_wait_ip;                            /* the module it is for */
   uint32_t restarts;                                   /* restarts sent (lifetime counter) */
+  /* what a module streams as far as we know (kept by reset: it streams on after a stop): the request of
+   * a joystick_begin it surely took (a restart, or an activation after its ELRS beacon), else, from its
+   * lock on, that of the last activation sent to it this session, or the request when it locked */
+  wifi_asked_t asked[WIFI_TABLE]; int nasked;
 } wifi_proto_t;
 
 void wifi_proto_init(wifi_proto_t *p, const wifi_hooks_t *h);   /* request: WIFI_INTERVAL_DEFAULT, WIFI_CHANNELS_DEFAULT */
-void wifi_proto_reset(wifi_proto_t *p);                 /* ResetSessionState: keeps target, request, hooks, counters */
+/* ResetSessionState: keeps target, request, hooks, counters, and what is known about modules (their kind
+ * and name from beacons, what they were asked for): a module streams on after a stop */
+void wifi_proto_reset(wifi_proto_t *p);
 /* One datagram. now_us: poll time (lock logic). arrival_us: receive time (stats); pass now_us if unknown. */
 void wifi_proto_packet(wifi_proto_t *p, const uint8_t *d, size_t n, uint32_t src, int64_t now_us, int64_t arrival_us);
-/* Lock release, the "no data" hint, explicit-target re-POST. Call it on every poll. */
+/* Lock release, the "no data" hint, explicit-target re-POST; the "sending no stick data" state ends when
+ * no placeholder frame came for WIFI_SOURCE_TIMEOUT_US (the module went away). Call it on every poll. */
 void wifi_proto_tick(wifi_proto_t *p, int64_t now_us);
 /* SetTarget. Trims spaces/tabs. NULL/blank -> discovery (target 0, nothing else). Invalid text ->
- * logged, target unchanged, -1. Else: target = ip, its throttle entry removed, unlocked, logged,
- * state Searching "connecting to <ip>", and the activation POST goes out at once. Returns 0. */
+ * logged, target unchanged, -1. The module streaming to us now (locked, data within
+ * WIFI_SOURCE_TIMEOUT_US) -> target = ip, logged, the lock and a held restart for it stay, nothing is
+ * sent. Else: target = ip, its throttle entry removed, unlocked, logged, state Searching "connecting to
+ * <ip>", and the activation POST goes out at once. A restart pending or held for another module is
+ * dropped. Returns 0. */
 int  wifi_proto_set_target(wifi_proto_t *p, const char *text, int64_t now_us);
 /* EnsureStreaming: activation POST to ip unless one went out less than WIFI_THROTTLE_US ago */
 void wifi_proto_ensure(wifi_proto_t *p, uint32_t ip, int64_t now_us);
 /* Set what joystick_begin asks for; values are clamped. If they changed while locked to a module that is
  * not Crossfire, its stream is restarted so they apply (wifi_proto_restart); locked to Crossfire, that is
- * logged once per session. Returns true when the clamped values differ from the old ones. */
+ * logged once per session. Not locked: the next joystick_begin asks for them, and a module that streams
+ * an older request as far as is known (see "asked" below: e.g. one that streams on through a WiFi pause
+ * or a stop) is restarted when it locks. Returns true when the clamped values differ from the old ones. */
 bool wifi_proto_set_request(wifi_proto_t *p, int interval_us, int channels, int64_t now_us);
 /* Only store the request (clamped), restarting nothing: for a host that changes the target and the
  * request together. Call it, then wifi_proto_set_target: the new target's joystick_begin asks for it,
@@ -136,19 +153,29 @@ bool wifi_proto_set_request(wifi_proto_t *p, int interval_us, int channels, int6
 void wifi_proto_store_request(wifi_proto_t *p, int interval_us, int channels);
 /* Restart the stream of the locked module, else of the target, so it uses the request now
  * (joystick_end, then joystick_begin; no throttle). Crossfire: logged, nothing sent. Returns false when
- * there is no module or it is Crossfire. When the host is busy, it is retried on every tick. A locked
- * module that might be Crossfire (16 channels and no beacon yet this session) is restarted only once
- * WIFI_XF_BEACON_US of lock passed without a Crossfire beacon (decided on tick; dropped when its beacon
- * says Crossfire or the lock is lost).
- * Also sent by itself, once per module and session, when a module that is surely not Crossfire (ELRS by
- * its beacon, or a channel count other than 16) streams a channel count other than the request. */
+ * there is no module or it is Crossfire. When the host is busy, it is retried on every tick while that
+ * module is the locked one or the target (also after a lock loss, when it locks again). A locked module
+ * that might be Crossfire (16 channels and no beacon from it yet) is restarted only once
+ * WIFI_XF_BEACON_US of lock passed without a Crossfire beacon (decided on tick; held through a lock loss
+ * until it locks again; dropped when its beacon says Crossfire, another module locks or is set as the
+ * target, and on reset). Either is dropped when the module's ELRS beacon gets it activated: it is not
+ * streaming then, and the joystick_begin carries the request. The target, not locked and not identified
+ * by a beacon, gets only a joystick_begin past the throttle: it may be Crossfire, and a module that is
+ * not streaming takes the request from the joystick_begin alone.
+ * Also sent by itself when a module that is surely not Crossfire (ELRS by its beacon, or a channel count
+ * other than 16) streams a channel count other than the request (once per module and session), and when
+ * a module locks that streams an older request as far as is known ("asked": what a restart, or an
+ * activation after its ELRS beacon, asked it for; else, from its first lock on, the request of the last
+ * activation sent to it this session or, without one, the request when it locked: so a change made while
+ * it is not locked - during its activation, a WiFi pause, a stop - reaches a module that streams on).
+ * A module found streaming another app's request keeps its rate (only its channel count is checked). */
 bool wifi_proto_restart(wifi_proto_t *p, int64_t now_us);
 void wifi_proto_activation_done(wifi_proto_t *p, uint32_t ip, bool ok, int64_t now_us);
 void wifi_proto_set_state(wifi_proto_t *p, wifi_state_t s, const char *detail);  /* lifecycle (input_wifi.c) */
 void wifi_proto_poll_stats(wifi_proto_t *p, int64_t now_us);   /* emits when now - last >= 1 s */
 void wifi_proto_emit_stats(wifi_proto_t *p, int64_t now_us);
 void wifi_proto_add_arrival(wifi_proto_t *p, int64_t t_us);    /* AddArrivalForTest */
-wifi_kind_t wifi_proto_kind(const wifi_proto_t *p, uint32_t ip);   /* from beacons seen this session */
+wifi_kind_t wifi_proto_kind(const wifi_proto_t *p, uint32_t ip);   /* from its beacons (kept by reset) */
 const char *wifi_proto_module_name(const wifi_proto_t *p, uint32_t ip);  /* ELRS device name or "" */
 
 /* ---- pure helpers ---- */

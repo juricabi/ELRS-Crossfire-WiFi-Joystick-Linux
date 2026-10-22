@@ -27,11 +27,11 @@ elrs-wifi-joystick [options]
 | `-c`, `--channels` | N | 16 | Channels to ask for: 4..16. |
 | `-p`, `--port` | N | 11000 | UDP port to listen on (the modules always send to 11000). |
 | `--http-port` | N | 80 | The module's web server port (for the activation request). |
-| `-w`, `--web` | [ADDR:]PORT | 127.0.0.1:11000 | The web page's address. ADDR is an IPv4 literal or `localhost`; a PORT alone means 127.0.0.1:PORT. `0.0.0.0:11000` makes it reachable from the network (it has no password). |
+| `-w`, `--web` | [ADDR:]PORT | 127.0.0.1:11000 | The web page's address. ADDR is an IPv4 literal or `localhost`; a PORT alone means 127.0.0.1:PORT. `0.0.0.0:11000` makes it reachable from the network (it has no password); open it there by this machine's IP address (a host name such as `raspberrypi.local` gets a page that says so). |
 | `--no-web` | | | No web page. |
 | `--no-joystick` | | | Monitor only: no virtual joystick. |
 | `--no-buttons` | | | CH9..CH16 press no buttons (the device keeps its 8 buttons, never pressed). |
-| `--name` | NAME | ELRS Crossfire WiFi Joystick | The joystick's name: 1 to 63 characters, no control characters. |
+| `--name` | NAME | ELRS Crossfire WiFi Joystick | The joystick's name: 1 to 63 bytes (a letter outside ASCII takes 2 to 4), no control characters. |
 | `--config` | FILE | see [Settings file](#settings-file) | The settings file. |
 | `--no-config` | | | Read and write no settings file. |
 | `--daemon` | | | No keys and no status line: log lines with ISO timestamps (for systemd). |
@@ -79,7 +79,11 @@ bars for CH1..CH8 and marks for the 8 buttons. Keys (upper or lower case):
 | `q`, Ctrl+C | quit (the joystick is centered and removed) |
 
 In a prompt, Enter alone keeps the value (for `t` it means "find it by its broadcast"), and Esc then
-Enter cancels. The terminal is restored on exit, on every signal and around Ctrl+Z.
+Enter cancels; the rest of an answer longer than the prompt takes (a paste) is dropped, never run as keys.
+The terminal is restored on exit, on every signal (also `Ctrl+\`) and around Ctrl+Z. Ctrl+Z stops
+listening first (the joystick is centered: nothing stays held while the program is stopped) and listens
+again after `fg` or `bg`; in the background it neither reads the keys nor draws (the log lines wait for
+`fg`), and `kill %1` ends it.
 
 **Not interactive** (stdin or stdout is not a terminal, or it runs in the background): log lines with
 the time, and a plain status line every 2 s while streaming, for example
@@ -91,7 +95,10 @@ the time, and a plain status line every 2 s while streaming, for example
 Commands are then read from stdin, one per line (case does not matter, a UTF-8 byte order mark before
 the first one is ignored, an unknown command prints an error line). The end of stdin ends the commands,
 not the program, so `elrs-wifi-joystick < /dev/null` keeps running. A terminal stdin is not read while
-the program runs in the background (`elrs-wifi-joystick &`): that would stop it.
+the program runs in the background (`elrs-wifi-joystick &`): that would stop it; it is read after `fg`.
+Commands in a row see each other (`s` twice is a stop, then a start; `status` after `stop` says
+stopped). With stdout a pipe (`| grep ...`, `| head`) the program quits when the reader of the pipe is
+gone (not with `--daemon`).
 
 | command | |
 |---|---|
@@ -147,7 +154,7 @@ web = 127.0.0.1:11000
 | `web` | `[ADDR:]PORT`, or `off` | 127.0.0.1:11000 |
 | `joystick` | `on` or `off` (also yes/no, true/false, 1/0) | on |
 | `buttons` | `on` or `off` | on |
-| `name` | the joystick's name: 1 to 63 characters, no control characters; spaces at its ends are dropped | ELRS Crossfire WiFi Joystick |
+| `name` | the joystick's name: 1 to 63 bytes (a letter outside ASCII takes 2 to 4), no control characters; spaces at its ends are dropped | ELRS Crossfire WiFi Joystick |
 
 - One `key = value` per line; lines starting with `#` are comments; spaces around keys and values do
   not matter. An unknown key, a bad value or a line that is not `key = value` is a warning in the log,
@@ -182,17 +189,20 @@ is **250 Hz and 16 channels**, the same as the Windows app.
   channel count is fixed by itself: a module that is surely ELRS (by its beacon, or because it streams
   a channel count other than 16, which Crossfire never does) and streams a different channel count than
   the request - left over from another app or run - is restarted once per module and session.
-- **A module of unknown kind** that streams 16 channels and sent no beacon this session might be
-  Crossfire (ELRS beacons only while it is not streaming, so an ELRS module still streaming from before
-  has sent none). A restart of it (a change, or `a`) then waits until 20 s after the program locked on
+- **A change while the module is not locked** (during its activation, a WiFi pause of more than 3 s, a
+  stop, or before switching the module IP back to it) reaches it when it locks again: it streams on
+  through those with the old request, so it is restarted then (once per change).
+- **A module of unknown kind** that streams 16 channels and sent no beacon (ELRS beacons only while it
+  is not streaming, so an ELRS module still streaming from before has sent none) might be Crossfire. A restart of it (a change, or `a`) then waits until 20 s after the program locked on
   to it, unless a Crossfire beacon arrives first; the log says so ("... may be Crossfire (no beacon
   from it yet) ..."). Crossfire beacons about every 8 s also while streaming, so after 20 s without
   one it is taken as ELRS.
 - **Crossfire / Tracer** starts on the same request but ignores the rate and the channel count: it
   always sends 16 channels at about 90 Hz. A module known to be Crossfire (from its beacon) is never
   sent `joystick_end` (what Crossfire does with it is unknown). Before its first beacon the program
-  cannot tell: a restart of a module set with `--module` or `t` that does not stream yet is sent as
-  for ELRS.
+  cannot tell: a restart (`a`) of a module set with `--module` or `t` that does not stream to the
+  program yet is sent as a `joystick_begin` only (a module that is not streaming takes the request from
+  it); one known as ELRS by its beacon gets `joystick_end` first.
 
 The web page and the status line show the measured rate and jitter, so you can compare settings.
 
@@ -235,7 +245,7 @@ so bindings carry over, and CH9-CH16 as 8 buttons (like the ELRS Bluetooth joyst
 | variable | |
 |---|---|
 | `XDG_CONFIG_HOME`, `HOME` | where the settings file is (above) |
-| `XDG_RUNTIME_DIR` | where the single-instance lock is: `$XDG_RUNTIME_DIR/elrs-wifi-joystick.lock`, else `/tmp/elrs-wifi-joystick-<uid>.lock` |
+| `XDG_RUNTIME_DIR` | where the single-instance lock is: `$XDG_RUNTIME_DIR/elrs-wifi-joystick.lock`, else `/run/user/<uid>/elrs-wifi-joystick.lock` when that directory is yours (what it is in a login session: `su -`, `sudo -u` or cron find the same lock), else `/tmp/elrs-wifi-joystick-<uid>.lock` |
 | `NO_COLOR`, `TERM` | no colors when `NO_COLOR` is set to a non-empty value, or `TERM` is unset or `dumb` |
 | `LC_ALL`, `LC_CTYPE`, `LANG` | a UTF-8 locale gets block-character bars in the status line |
 
@@ -251,4 +261,5 @@ so bindings carry over, and CH9-CH16 as 8 buttons (like the ELRS Bluetooth joyst
 
 SIGINT, SIGTERM and SIGHUP end the program cleanly: the joystick is centered and removed, the socket
 closed. If it hangs while quitting, the third of these signals ends it at once, with exit code
-128 + the signal number. SIGPIPE is ignored.
+128 + the signal number. SIGHUP and SIGINT that were ignored when it started stay ignored (`nohup`, a
+script's `cmd &`). SIGPIPE is ignored.

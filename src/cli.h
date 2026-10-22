@@ -5,7 +5,10 @@
  * second. Single keys in raw mode (restored on exit and on every signal); prompts in cooked mode.
  * Otherwise: log lines with a time, a status line every 2 s while streaming, and line commands on
  * stdin (when stdin is not a terminal, or stdout is not one) like the Windows CLI's scripted stdin.
- * --daemon: ISO timestamps, a status line every 60 s while streaming, stdin ignored. */
+ * --daemon: ISO timestamps, a status line every 60 s while streaming, stdin ignored.
+ * A terminal on stdin is read (and, interactive, drawn on) only while the program is in the
+ * foreground: in the background (Ctrl+Z, then bg; or started with &) it runs on silently, the log
+ * lines wait for fg. Not --daemon, with stdout a pipe: the program quits when the pipe's reader is gone. */
 #ifndef CLI_H
 #define CLI_H
 
@@ -22,9 +25,11 @@ typedef struct {
   const char *version;
 } cli_opts_t;
 
-/* Signal handling for the whole program: SIGINT/SIGTERM/SIGHUP ask to quit (a second one while
- * quitting ends the program at once), SIGPIPE is ignored, Ctrl+Z / fg keep the terminal sane.
- * Call once, early (before any thread starts). 0 ok. */
+/* Signal handling for the whole program: SIGINT/SIGTERM/SIGHUP ask to quit (the third quit signal ends
+ * the program at once, exit code 128 + the signal); SIGINT and SIGHUP stay ignored when they were at
+ * the start (nohup, a background job of a script); SIGPIPE is ignored. cli_run adds Ctrl+Z (listening
+ * stops and the joystick centers while suspended, fg goes on) and, interactive, SIGQUIT (the terminal
+ * restored first). Call once, early (before any thread starts). 0 ok. */
 int  cli_signals_init(void);
 bool cli_quit_requested(void);
 /* Runs until quit (q, Ctrl+C, a signal, the quit command). Returns the exit code (0). */

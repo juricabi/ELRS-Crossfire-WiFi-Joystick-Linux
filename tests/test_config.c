@@ -68,6 +68,18 @@ static void values(void) {
   CHECK_INT(cfg_parse_int("99999999999999999999", 0, 100, &v), -2);   /* no overflow */
   CHECK_INT(cfg_parse_int(NULL, 0, 100, &v), -1);
   CHECK_INT(cfg_parse_int("00000000000000000000000000000000000000001", 0, 100, &v), -1);
+  /* 10 to 18 digits: with a 32-bit long (i686, armv7, armv6) these wrapped into range and were taken */
+  CHECK_INT(cfg_parse_int("4294971296", 1000, 100000, &v), -2);   /* 2^32 + 4000 */
+  CHECK_INT(cfg_parse_int("4294967304", 4, 16, &v), -2);          /* 2^32 + 8 */
+  CHECK_INT(cfg_parse_int("2147483648", 0, 2147483647L, &v), -2);
+  CHECK_INT(cfg_parse_int("-2147483649", -2147483647L - 1, 0, &v), -2);
+  CHECK_INT(cfg_parse_int("18446744073709555616", 1000, 100000, &v), -2);
+  CHECK_INT(cfg_parse_int("999999999999999999", 0, 100, &v), -2);
+  CHECK_INT(cfg_parse_int("0000004000", 1000, 100000, &v), 0);
+  CHECK_INT(v, 4000);
+  v = 77;
+  CHECK_INT(cfg_parse_int("4294967304", 4, 16, &v), -2);
+  CHECK_INT(v, 77);                                  /* out of range: *out untouched */
 
   char ip[64];
   CHECK_INT(cfg_value_module_ip(" 10.0.0.1\t", ip, err, sizeof err), 0);
@@ -111,12 +123,17 @@ static void values(void) {
   CHECK_INT(cfg_value_channels("17", &iv, err, sizeof err), -1);
   CHECK_INT(cfg_value_channels("4", &iv, err, sizeof err), 0);
   CHECK_INT(iv, 4);
+  CHECK_INT(cfg_value_channels("4294967304", &iv, err, sizeof err), -1);
+  CHECK_STR(err, "4294967304 is not supported - use 4 to 16");
+  CHECK_INT(cfg_value_interval("4294971296", &iv, err, sizeof err), -1);
+  CHECK_INT(cfg_value_rate("4294967546", &iv, err, sizeof err), -1);
   uint16_t port;
   CHECK_INT(cfg_value_port("0", &port, err, sizeof err), -1);
   CHECK_STR(err, "0 is not supported - use 1 to 65535");
   CHECK_INT(cfg_value_port("65536", &port, err, sizeof err), -1);
   CHECK_INT(cfg_value_port("65535", &port, err, sizeof err), 0);
   CHECK_INT(port, 65535);
+  CHECK_INT(cfg_value_port("4294978297", &port, err, sizeof err), -1);
 
   bool on;
   char addr[16];
@@ -137,6 +154,7 @@ static void values(void) {
   CHECK_INT(cfg_value_web(":80", &on, addr, &port, err, sizeof err), -1);
   CHECK_INT(cfg_value_web("1.2.3.4:0", &on, addr, &port, err, sizeof err), -1);
   CHECK_INT(cfg_value_web("", &on, addr, &port, err, sizeof err), -1);
+  CHECK_INT(cfg_value_web("4294978296", &on, addr, &port, err, sizeof err), -1);
 
   bool b;
   const char *t[] = { "on", "ON", "yes", "true", "1", " on " }, *f[] = { "off", "no", "False", "0" };
@@ -157,6 +175,11 @@ static void values(void) {
   CHECK_INT(cfg_value_name(longname, name, err, sizeof err), -1);
   longname[63] = 0;
   CHECK_INT(cfg_value_name(longname, name, err, sizeof err), 0);
+  /* the limit is in bytes, and the message says so: 36 Cyrillic letters are 64 bytes */
+  CHECK_INT(cfg_value_name("\xd0\x92\xd0\xb8\xd1\x80\xd1\x82\xd1\x83\xd0\xb0\xd0\xbb\xd1\x8c\xd0\xbd\xd1\x8b\xd0\xb9 "
+                           "\xd0\xb4\xd0\xb6\xd0\xbe\xd0\xb9\xd1\x81\xd1\x82\xd0\xb8\xd0\xba \xd0\xb4\xd0\xbb\xd1\x8f "
+                           "\xd0\xbf\xd0\xb8\xd0\xbb\xd0\xbe\xd1\x82\xd0\xb0 ELRS", name, err, sizeof err), -1);
+  CHECK_STR(err, "the name must be 1 to 63 bytes long (a letter outside ASCII takes 2 to 4), without control characters");
 }
 
 static void command_line(void) {
@@ -503,6 +526,13 @@ static void save_and_load(void) {
   cfg_defaults(&s);
   CHECK_INT(cfg_load(none, &s, on_warn, NULL), 0);
   CHECK_INT(s.eng.port, 11000);
+  /* a new file gets 0666 minus the umask (077 here: private), like any file the user makes */
+  char priv[600];
+  snprintf(priv, sizeof priv, "%s/private/config", dir);
+  mode_t um = umask(077);
+  CHECK_INT(cfg_save(priv, &c, CFG_K_PORT, err, sizeof err), 0);
+  umask(um);
+  CHECK(stat(priv, &st) == 0 && (st.st_mode & 0777) == 0600);
   /* a symlinked file is written where it points; the link stays */
   char real[600], link[600];
   snprintf(real, sizeof real, "%s/real.conf", dir);
@@ -515,6 +545,26 @@ static void save_and_load(void) {
   CHECK(lstat(link, &st) == 0 && S_ISLNK(st.st_mode));
   read_text(real, buf, sizeof buf);
   CHECK_STR(buf, "name = Linked\nport = 11000\n");
+  /* a link to a file that does not exist yet (dotfiles): the file is made there, the link stays; a relative
+   * link is relative to its directory; a link to a link, too */
+  char dots[600], dlink[600], dlink2[600], dfile[700];
+  snprintf(dots, sizeof dots, "%s/dots", dir);
+  mkdir(dots, 0700);
+  snprintf(dlink, sizeof dlink, "%s/dangling.conf", dir);
+  CHECK(symlink("dots/sub/elrs.conf", dlink) == 0);
+  CHECK_INT(cfg_save(dlink, &c, CFG_K_PORT, err, sizeof err), 0);
+  CHECK(lstat(dlink, &st) == 0 && S_ISLNK(st.st_mode));
+  snprintf(dfile, sizeof dfile, "%s/sub/elrs.conf", dots);
+  read_text(dfile, buf, sizeof buf);
+  CHECK(strstr(buf, "\nport = 11000\n") != NULL);
+  unlink(dfile);
+  snprintf(dlink2, sizeof dlink2, "%s/dangling2.conf", dir);
+  CHECK(symlink(dlink, dlink2) == 0);                 /* -> dangling.conf -> dots/sub/elrs.conf (gone again) */
+  CHECK_INT(cfg_save(dlink2, &c, CFG_K_CHANNELS, err, sizeof err), 0);
+  CHECK(lstat(dlink2, &st) == 0 && S_ISLNK(st.st_mode));
+  CHECK(lstat(dlink, &st) == 0 && S_ISLNK(st.st_mode));
+  read_text(dfile, buf, sizeof buf);
+  CHECK(strstr(buf, "\nchannels = 10\n") != NULL);
   /* errors: a file where a directory must be, a directory where the file must be, a binary file */
   char bad[700];
   snprintf(bad, sizeof bad, "%s/real.conf/sub/config", dir);
@@ -571,6 +621,35 @@ static void default_path(void) {
   CHECK_STR(out, "");
 }
 
+static void lock_path(void) {
+  char out[600], run[600];
+  CHECK_INT(cfg_lock_path("/run/user/1000", "/nonexistent", 1000, out, sizeof out), 0);
+  CHECK_STR(out, "/run/user/1000/elrs-wifi-joystick.lock");
+  /* no (or a relative) XDG_RUNTIME_DIR: the user's runtime directory when it is theirs, as in a session */
+  snprintf(run, sizeof run, "%s/runuser", dir);
+  mkdir(run, 0700);
+  unsigned me = (unsigned)getuid();
+  CHECK_INT(cfg_lock_path(NULL, run, me, out, sizeof out), 0);
+  char want[700];
+  snprintf(want, sizeof want, "%s/elrs-wifi-joystick.lock", run);
+  CHECK_STR(out, want);
+  CHECK_INT(cfg_lock_path("relative", run, me, out, sizeof out), 0);
+  CHECK_STR(out, want);
+  CHECK_INT(cfg_lock_path("", run, me, out, sizeof out), 0);
+  CHECK_STR(out, want);
+  /* the same file for an instance with XDG_RUNTIME_DIR = that directory */
+  CHECK_INT(cfg_lock_path(run, "/nonexistent", me, out, sizeof out), 0);
+  CHECK_STR(out, want);
+  /* not there, or someone else's: /tmp */
+  CHECK_INT(cfg_lock_path(NULL, "/nonexistent", me, out, sizeof out), 0);
+  snprintf(want, sizeof want, "/tmp/elrs-wifi-joystick-%u.lock", me);
+  CHECK_STR(out, want);
+  CHECK_INT(cfg_lock_path(NULL, run, me + 1, out, sizeof out), 0);
+  snprintf(want, sizeof want, "/tmp/elrs-wifi-joystick-%u.lock", me + 1);
+  CHECK_STR(out, want);
+  CHECK_INT(cfg_lock_path("/run/user/1000", NULL, 1000, out, 10), -1);
+}
+
 static void texts(void) {
   char buf[8192];
   FILE *f = fmemopen(buf, sizeof buf, "w");
@@ -603,8 +682,10 @@ int main(void) {
   settings_text();
   render();
   diff();
+  umask(022);                                        /* the modes checked below */
   save_and_load();
   default_path();
+  lock_path();
   texts();
   char cmd[600];
   snprintf(cmd, sizeof cmd, "rm -rf '%s'", dir);

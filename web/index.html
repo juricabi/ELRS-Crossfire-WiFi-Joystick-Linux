@@ -1,0 +1,744 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<title>ELRS / Crossfire WiFi Joystick</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect x='3' y='9' width='26' height='16' rx='8' fill='%232e7d32'/%3E%3Ccircle cx='11' cy='17' r='3.2' fill='%23fff'/%3E%3Ccircle cx='21' cy='17' r='3.2' fill='%23fff'/%3E%3Cpath d='M16 9V4' stroke='%232e7d32' stroke-width='2.4' stroke-linecap='round'/%3E%3C/svg%3E">
+<style>
+/* The page of elrs-wifi-joystick (docs/WEB_API.md). Self-contained: no fonts, scripts or images from
+   anywhere else, so it works offline. Colors only through these variables (light, then dark). */
+:root {
+  --bg: #eef0f3; --card: #ffffff; --fg: #15181d; --muted: #59626e; --line: #d6dbe1; --line-2: #b9c0c9;
+  --track: #e2e6eb; --fill: #1f9a4b; --tick: #8d96a2; --press: #1f9a4b; --press-off: #c9ced6;
+  --accent: #1c64d8; --accent-fg: #ffffff; --accent-hi: #1553b5;
+  --ok: #1a7a37; --warn-bg: #fff3dc; --warn-fg: #6e4300; --warn-line: #e7b45a;
+  --err-fg: #a8231a; --err-bg: #fdecea; --err-line: #e9a49d;
+  --log-bg: #f6f7f9; --focus: #1c64d8;
+  --b-stopped: #4b5563; --b-searching: #a85305; --b-streaming: #2e7d32; --b-error: #c0282b; --b-offline: #374151;
+  --mono: ui-monospace, "SFMono-Regular", "Cascadia Mono", "DejaVu Sans Mono", Menlo, Consolas, monospace;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #131417; --card: #1c1e22; --fg: #e8eaed; --muted: #a0a8b3; --line: #2e3238; --line-2: #4a515b;
+    --track: #2a2d33; --fill: #3fcf6c; --tick: #6c7581; --press: #3fcf6c; --press-off: #3b4048;
+    --accent: #4c8dff; --accent-fg: #0b1220; --accent-hi: #74a7ff;
+    --ok: #5ad27f; --warn-bg: #352a12; --warn-fg: #f3cf87; --warn-line: #7a5a1c;
+    --err-fg: #ff9c94; --err-bg: #3a1b1a; --err-line: #7b3430;
+    --log-bg: #16181b; --focus: #74a7ff;
+  }
+}
+* { box-sizing: border-box; }
+[hidden] { display: none !important; }
+html { background: var(--bg); -webkit-text-size-adjust: 100%; }
+body { margin: 0; color: var(--fg); background: var(--bg); font: 15px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif; }
+button, input, select { font: inherit; color: inherit; }
+:focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; }
+.num { font-variant-numeric: tabular-nums; }
+.wrap { max-width: 860px; margin: 0 auto; padding: 0 16px; }
+.sr { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }
+
+/* ---- the status banner (the Windows app's: gray stopped, orange searching, green streaming, red error) */
+.banner { color: #fff; background: var(--b-stopped); }
+.banner.st-searching { background: var(--b-searching); }
+.banner.st-streaming { background: var(--b-streaming); }
+.banner.st-error { background: var(--b-error); }
+.banner.st-offline { background: var(--b-offline); }
+.banner .wrap { padding-top: 12px; padding-bottom: 14px; }
+.banner h1 { margin: 0; font-size: 12.5px; font-weight: 600; letter-spacing: .04em; text-transform: uppercase; opacity: .85; }
+.banner .state { margin: 2px 0 0; font-size: 24px; font-weight: 700; line-height: 1.25; }
+.banner .detail { margin: 3px 0 0; font-size: 13.5px; color: #f1f3f5; min-height: 1.45em; overflow-wrap: anywhere; }
+
+main { padding-top: 14px; padding-bottom: 32px; }
+.card { background: var(--card); border: 1px solid var(--line); border-radius: 8px; padding: 14px 16px; margin: 0 0 14px; min-width: 0; }
+.card h2 { margin: 0 0 10px; font-size: 15px; }
+.card-head { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; flex-wrap: wrap; margin-bottom: 8px; }
+.card-head h2 { margin: 0; }
+.muted { color: var(--muted); }
+.small { font-size: 13px; }
+
+/* ---- rate line and the request */
+.stats { display: flex; flex-wrap: wrap; gap: 4px 18px; font-size: 14px; }
+.stats b { font-weight: 650; display: inline-block; text-align: right; }
+#rate { min-width: 3.6em; } #jit { min-width: 2.9em; } #pps { min-width: 2.2em; }
+.ask { margin: 4px 0 10px; font-size: 13.5px; color: var(--muted); }
+.ask .off { color: var(--warn-fg); background: var(--warn-bg); border-radius: 4px; padding: 0 4px; }
+
+/* ---- channel bars */
+.group-title { margin: 12px 0 2px; font-size: 12px; font-weight: 650; letter-spacing: .05em; text-transform: uppercase; color: var(--muted); }
+.row { display: grid; grid-template-columns: minmax(0, 9rem) minmax(0, 1fr) 3.3rem 1.2rem; align-items: center; gap: 0 10px; min-height: 36px; }
+.lab { min-width: 0; display: flex; flex-direction: column; white-space: nowrap; line-height: 1.25; }
+.lab .nm { font-size: 14px; overflow: hidden; text-overflow: ellipsis; }
+.lab .sub { font: 11px/1.3 var(--mono); color: var(--muted); overflow: hidden; text-overflow: ellipsis; }
+.track { position: relative; height: 18px; border-radius: 5px; background: var(--track); overflow: hidden; }
+.fill { position: absolute; inset: 0; background: var(--fill); transform-origin: left center; transform: scaleX(0); }
+.tick { position: absolute; top: 0; bottom: 0; width: 1px; background: var(--tick); opacity: .9; }
+.pct { text-align: right; font-size: 14px; }
+.mark { width: 12px; height: 12px; border-radius: 50%; background: var(--press-off); justify-self: center; }
+.mark.on { background: var(--press); box-shadow: 0 0 0 3px color-mix(in srgb, var(--press) 30%, transparent); }
+.row.nobtn .mark { visibility: hidden; }
+
+/* ---- controls and forms */
+.actions { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 10px; }
+.btn { min-height: 38px; padding: 0 16px; border-radius: 7px; border: 1px solid var(--line-2); background: var(--card); cursor: pointer; font-weight: 600; }
+.btn:hover:not(:disabled) { border-color: var(--muted); }
+.btn:disabled { opacity: .5; cursor: not-allowed; }
+.btn[aria-busy="true"] { cursor: progress; opacity: .8; }
+.btn.primary { background: var(--accent); border-color: var(--accent); color: var(--accent-fg); }
+.btn.primary:hover:not(:disabled) { background: var(--accent-hi); border-color: var(--accent-hi); }
+#startStop { min-width: 6.2em; }
+.hint { font-size: 13px; color: var(--muted); }
+.msg { margin: 0; font-size: 13.5px; overflow-wrap: anywhere; min-width: 0; }
+.msg.err { color: var(--err-fg); }
+.msg.ok { color: var(--ok); }
+.msg.warn { color: var(--warn-fg); }
+form .grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px 16px; }
+.field { display: flex; flex-direction: column; gap: 3px; min-width: 0; }
+.field label { font-size: 13px; font-weight: 600; color: var(--muted); }
+.field input, .field select {
+  width: 100%; min-height: 38px; padding: 6px 9px; border-radius: 7px; border: 1px solid var(--line-2);
+  background: var(--card); font-variant-numeric: tabular-nums;
+}
+.field input::placeholder { color: var(--muted); opacity: .8; }
+.field select:disabled { opacity: .6; }
+.field [aria-invalid="true"] { border-color: var(--err-fg); box-shadow: 0 0 0 1px var(--err-fg); }
+.xf-note { margin: 10px 0 0; padding: 7px 10px; border-radius: 6px; font-size: 13.5px; background: var(--warn-bg); color: var(--warn-fg); border: 1px solid var(--warn-line); }
+details.adv { margin-top: 12px; }
+details > summary { cursor: pointer; font-weight: 600; font-size: 14px; width: fit-content; }
+details.adv .grid { margin-top: 10px; }
+.form-actions { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-top: 14px; }
+
+/* ---- the joystick, counters, log */
+.box { padding: 9px 11px; border-radius: 6px; font-size: 14px; overflow-wrap: anywhere; }
+.box.bad { background: var(--err-bg); color: var(--err-fg); border: 1px solid var(--err-line); white-space: pre-wrap; }
+.box.info { background: var(--warn-bg); color: var(--warn-fg); border: 1px solid var(--warn-line); }
+.kv { display: grid; grid-template-columns: minmax(0, max-content) minmax(0, 1fr); gap: 3px 14px; margin: 0; font-size: 14px; }
+.kv dt { color: var(--muted); }
+.kv dd { margin: 0; overflow-wrap: anywhere; }
+details.card > summary { font-size: 15px; }
+details.card[open] > summary { margin-bottom: 10px; }
+.counters { display: grid; grid-template-columns: repeat(auto-fill, minmax(11.5rem, 1fr)); gap: 4px 18px; margin: 0; font-size: 13.5px; }
+.counters div { display: flex; justify-content: space-between; gap: 10px; border-bottom: 1px dashed var(--line); padding: 2px 0; }
+.counters dt { color: var(--muted); }
+.counters dd { margin: 0; }
+.log {
+  height: 16rem; min-height: 6rem; resize: vertical; overflow: auto; margin: 0; padding: 6px 9px; border-radius: 6px;
+  border: 1px solid var(--line); background: var(--log-bg); font: 12.5px/1.5 var(--mono); white-space: pre-wrap; overflow-wrap: anywhere;
+}
+.log .t { color: var(--muted); }
+.log .gap { color: var(--muted); font-style: italic; }
+footer { padding: 4px 0 24px; font-size: 12.5px; color: var(--muted); }
+
+@media (max-width: 560px) {
+  .wrap { padding: 0 10px; }
+  .banner .state { font-size: 21px; }
+  .card { padding: 12px 10px; }
+  form .grid { grid-template-columns: minmax(0, 1fr); }
+  .row { grid-template-columns: minmax(0, 7.2rem) minmax(0, 1fr) 2.9rem 1rem; gap: 0 6px; }
+  .lab .nm { font-size: 13.5px; }
+  .lab .sub { font-size: 10.5px; }
+}
+</style>
+</head>
+<body>
+<header class="banner st-stopped" id="banner">
+  <div class="wrap">
+    <h1>ELRS / Crossfire WiFi Joystick</h1>
+    <p class="state" id="bState" aria-live="polite">Connecting…</p>
+    <p class="detail" id="bDetail"></p>
+  </div>
+</header>
+
+<main class="wrap">
+  <section class="card" aria-labelledby="hSticks">
+    <div class="card-head">
+      <h2 id="hSticks">Sticks</h2>
+      <div class="stats num" aria-label="Stream statistics">
+        <span>Rate <b id="rate">--</b> Hz</span>
+        <span>Jitter <b id="jit">--</b> ms</span>
+        <span><b id="pps">--</b> pkt/s</span>
+      </div>
+    </div>
+    <p class="ask num" id="ask">asked -- Hz × -- ch</p>
+    <div role="group" aria-labelledby="gAxes"><p class="group-title" id="gAxes">Axes (CH1–CH8)</p><div id="axes"></div></div>
+    <div role="group" aria-labelledby="gBtns"><p class="group-title" id="gBtns">Buttons (CH9–CH16)</p><div id="btns"></div></div>
+  </section>
+
+  <section class="card" aria-labelledby="hCtl">
+    <h2 id="hCtl" class="sr">Receiver</h2>
+    <div class="actions">
+      <button type="button" class="btn" id="startStop" disabled>Start</button>
+      <button type="button" class="btn" id="restart" disabled aria-describedby="restartHint">Restart stream</button>
+      <span class="hint" id="restartHint">Ask the module again for the rate and channels below.</span>
+      <span class="msg" id="actMsg" role="status"></span>
+    </div>
+  </section>
+
+  <section class="card" aria-labelledby="hSet">
+    <h2 id="hSet">Settings</h2>
+    <form id="cfgForm" novalidate autocomplete="off">
+      <div class="grid">
+        <div class="field">
+          <label for="fIp">Module IP</label>
+          <input id="fIp" name="module_ip" inputmode="decimal" spellcheck="false" autocapitalize="off" maxlength="63" placeholder="found by its broadcast" aria-describedby="cfgMsg">
+        </div>
+        <div class="field">
+          <label for="fRate">Rate</label>
+          <select id="fRate" name="interval_us" aria-describedby="xfNote cfgMsg"></select>
+        </div>
+        <div class="field">
+          <label for="fCh">Channels</label>
+          <select id="fCh" name="channels" aria-describedby="xfNote cfgMsg"></select>
+        </div>
+        <div class="field">
+          <label for="fPort">UDP port</label>
+          <input id="fPort" name="port" inputmode="numeric" maxlength="5" spellcheck="false" aria-describedby="cfgMsg">
+        </div>
+      </div>
+      <p class="xf-note" id="xfNote" hidden>Crossfire always sends 16 channels at ~90 Hz</p>
+      <details class="adv" id="adv">
+        <summary>Advanced</summary>
+        <div class="grid">
+          <div class="field">
+            <label for="fHttp">Module web port</label>
+            <input id="fHttp" name="http_port" inputmode="numeric" maxlength="5" spellcheck="false" aria-describedby="cfgMsg">
+          </div>
+        </div>
+      </details>
+      <div class="form-actions">
+        <button type="submit" class="btn primary" id="apply">Apply</button>
+        <button type="button" class="btn" id="revert" hidden>Undo changes</button>
+        <span class="msg" id="cfgMsg" role="status"></span>
+      </div>
+    </form>
+  </section>
+
+  <section class="card" aria-labelledby="hJoy">
+    <h2 id="hJoy">Virtual joystick</h2>
+    <div id="joy" class="muted">--</div>
+  </section>
+
+  <details class="card" id="details">
+    <summary>Details</summary>
+    <dl class="counters num" id="counters"></dl>
+  </details>
+
+  <section class="card" aria-labelledby="hLog">
+    <div class="card-head"><h2 id="hLog">Log</h2><span class="hint" id="logHint"></span></div>
+    <div class="log" id="log" role="log" tabindex="0" aria-labelledby="hLog"></div>
+  </section>
+</main>
+<footer class="wrap" id="foot">elrs-wifi-joystick</footer>
+
+<script>
+'use strict';
+(function () {
+  const $ = (id) => document.getElementById(id);
+  /* CH1..CH8: the Windows app's vJoy order; on Linux the evdev axes of the virtual joystick */
+  const AXES = [['Roll', 'ABS_X'], ['Pitch', 'ABS_Y'], ['Throttle', 'ABS_RX'], ['Yaw', 'ABS_RY'],
+                ['Aux 1', 'ABS_RZ'], ['Aux 2', 'ABS_Z'], ['Aux 3', 'ABS_THROTTLE'], ['Aux 4', 'ABS_RUDDER']];
+  const BTNS = ['BTN_TRIGGER', 'BTN_THUMB', 'BTN_THUMB2', 'BTN_TOP', 'BTN_TOP2', 'BTN_PINKIE', 'BTN_BASE', 'BTN_BASE2'];
+  const RAW_MAX = 32767, PRESS = 24576, RELEASE = 20480;   /* the joystick's hysteresis: 75 % / 62.5 % */
+  const STATUS_MS = 100, LOG_MS = 1000, LOG_KEEP = 1000;
+  const TITLES = { streaming: 'Connected - streaming', searching: 'Searching for module…', error: 'Error', stopped: 'Stopped' };
+
+  let info = null;            /* GET /api/config: defaults, supported values, Crossfire */
+  let st = null;              /* the last status */
+  let fails = 0, offline = false, lastUptime = -1, reqNo = 0, shownNo = 0;
+  let logSince = 0, logBusy = false;
+  const touched = new Set();  /* fields the user changed and has not applied yet */
+
+  /* ---------------------------------------------------------------- the API */
+  async function api(path, body) {
+    const ctl = new AbortController();
+    const timer = setTimeout(() => ctl.abort(), 4000);
+    try {
+      const opt = { cache: 'no-store', signal: ctl.signal };
+      if (body !== undefined) {
+        opt.method = 'POST';
+        opt.headers = { 'Content-Type': 'application/json' };
+        opt.body = JSON.stringify(body);
+      }
+      const r = await fetch(path, opt);
+      let j = null;
+      try { j = await r.json(); } catch (e) { j = null; }
+      if (!r.ok || !j || j.ok === false) {
+        const err = new Error(j && typeof j.error === 'string' ? j.error : 'the program answered ' + r.status);
+        err.http = true;
+        throw err;
+      }
+      return j;
+    } catch (e) {
+      if (!e.http) e.message = e.name === 'AbortError' ? 'no answer from the program' : 'cannot reach the program';
+      throw e;
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+  const sleep = (ms) => new Promise((res) => setTimeout(res, ms));
+  const visible = () => document.visibilityState !== 'hidden';
+  function setText(el, t) { if (el.textContent !== t) el.textContent = t; }
+  function setMsg(el, text, kind) { setText(el, text); el.className = 'msg' + (kind ? ' ' + kind : ''); }
+
+  /* ---------------------------------------------------------------- the bars */
+  const rows = [];
+  function makeRow(parent, i) {
+    const row = document.createElement('div');
+    row.className = 'row';
+    const lab = document.createElement('div');
+    lab.className = 'lab';
+    const nm = document.createElement('span'); nm.className = 'nm';
+    const sub = document.createElement('span'); sub.className = 'sub';
+    lab.append(nm, sub);
+    const track = document.createElement('div');
+    track.className = 'track';
+    track.setAttribute('role', 'meter');
+    track.setAttribute('aria-valuemin', '0');
+    track.setAttribute('aria-valuemax', '100');
+    track.setAttribute('aria-valuenow', '0');
+    track.setAttribute('aria-valuetext', 'no data');
+    const fill = document.createElement('div'); fill.className = 'fill';
+    track.append(fill);
+    const ticks = i < 8 ? [50] : [62.5, 75];
+    for (const t of ticks) { const k = document.createElement('div'); k.className = 'tick'; k.style.left = t + '%'; track.append(k); }
+    const pct = document.createElement('span'); pct.className = 'pct num'; pct.textContent = '--';
+    const mark = document.createElement('span'); mark.className = 'mark'; mark.setAttribute('aria-hidden', 'true');
+    row.append(lab, track, pct, mark);
+    parent.append(row);
+    const r = { row, nm, sub, track, fill, pct, mark, v: undefined, on: false, btn: null };
+    if (i < 8) {
+      nm.textContent = AXES[i][0];
+      sub.textContent = 'CH' + (i + 1) + ' · ' + AXES[i][1];
+      track.setAttribute('aria-label', 'CH' + (i + 1) + ' ' + AXES[i][0]);
+      row.classList.add('nobtn');
+    }
+    rows.push(r);
+  }
+  for (let i = 0; i < 8; i++) makeRow($('axes'), i);
+  for (let i = 8; i < 16; i++) makeRow($('btns'), i);
+
+  /* CH9..CH16 are joystick buttons 1..8 unless the program runs with --no-buttons */
+  function setButtonMode(on) {
+    for (let i = 8; i < 16; i++) {
+      const r = rows[i];
+      if (r.btn === on) continue;
+      r.btn = on;
+      const n = i - 7;
+      r.nm.textContent = on ? 'Button ' + n : 'CH' + (i + 1);
+      r.sub.textContent = on ? 'CH' + (i + 1) + ' · ' + BTNS[i - 8] : 'not a button';
+      r.track.setAttribute('aria-label', on ? 'Button ' + n + ' (CH' + (i + 1) + ')' : 'CH' + (i + 1));
+      r.row.classList.toggle('nobtn', !on);
+      r.v = undefined;
+    }
+    setText($('gBtns'), on ? 'Buttons (CH9–CH16)' : 'Channels CH9–CH16');
+  }
+  setButtonMode(true);
+
+  function renderBars(s, live) {
+    const n = live ? Math.min(16, s.nch | 0) : 0;
+    for (let i = 0; i < 16; i++) {
+      const r = rows[i];
+      const v = i < n ? Math.max(0, Math.min(RAW_MAX, s.raw[i] | 0)) : null;
+      if (v === r.v) continue;
+      r.v = v;
+      if (v === null) {
+        r.fill.style.transform = 'scaleX(0)';
+        r.pct.textContent = '--';
+        r.track.setAttribute('aria-valuenow', '0');
+        r.track.setAttribute('aria-valuetext', 'no data');
+        r.on = false;
+        r.mark.classList.remove('on');
+        continue;
+      }
+      const p = Math.floor(v * 100 / RAW_MAX);
+      r.fill.style.transform = 'scaleX(' + (v / RAW_MAX).toFixed(4) + ')';
+      r.pct.textContent = p + '%';
+      r.track.setAttribute('aria-valuenow', String(p));
+      if (i >= 8 && r.btn) {
+        if (v >= PRESS) r.on = true;
+        else if (v < RELEASE) r.on = false;
+        r.mark.classList.toggle('on', r.on);
+        r.track.setAttribute('aria-valuetext', p + '%, ' + (r.on ? 'pressed' : 'released'));
+      } else {
+        r.track.setAttribute('aria-valuetext', p + '%');
+      }
+    }
+  }
+
+  /* ---------------------------------------------------------------- the settings form */
+  const F = { module_ip: $('fIp'), interval_us: $('fRate'), channels: $('fCh'), port: $('fPort'), http_port: $('fHttp') };
+  const LABEL = { module_ip: 'Module IP', interval_us: 'Rate', channels: 'Channels', port: 'UDP port', http_port: 'Module web port' };
+
+  function msText(us) { return String(+(us / 1000).toFixed(3)); }      /* 4000 -> "4", 6667 -> "6.667" */
+  function hzOf(us) { return Math.round(1e6 / us); }
+
+  /* the presets, plus the current value when it is not one (set with --interval or in the settings file) */
+  function fillRates(cur) {
+    if (!info) return;
+    const sel = F.interval_us, keep = sel.value;
+    const pre = info.supported.interval_us.presets, def = info.defaults.interval_us;
+    const list = pre.map((p) => ({ us: p.interval_us, hz: p.rate_hz, tag: p.interval_us === def ? ' – default' : '' }));
+    for (const c of [cur, +keep]) {
+      if (c && !list.some((x) => x.us === c)) list.push({ us: c, hz: hzOf(c), tag: ' – custom' });
+    }
+    list.sort((a, b) => a.us - b.us);
+    const sig = list.map((x) => x.us + x.tag).join();
+    if (sel.dataset.sig !== sig) {
+      sel.dataset.sig = sig;
+      sel.replaceChildren(...list.map((x) => new Option(x.hz + ' Hz (' + msText(x.us) + ' ms)' + x.tag, String(x.us))));
+      if (keep) sel.value = keep;
+    }
+  }
+
+  function fillChannels() {
+    const sel = F.channels, sup = info.supported.channels, def = info.defaults.channels;
+    const opts = [];
+    for (let n = sup.min; n <= sup.max; n++) opts.push(new Option(n + (n === def ? ' – default' : ''), String(n)));
+    sel.replaceChildren(...opts);
+  }
+
+  /* untouched fields follow the program's settings (the CLI or another page may change them) */
+  function syncForm(cfg, force) {
+    fillRates(cfg.interval_us);
+    for (const k of Object.keys(F)) {
+      const el = F[k];
+      if (!force && (touched.has(k) || document.activeElement === el)) continue;
+      const v = String(cfg[k]);
+      if (el.value !== v) el.value = v;
+    }
+    $('revert').hidden = touched.size === 0;
+  }
+
+  for (const k of Object.keys(F)) {
+    const ev = F[k].tagName === 'SELECT' ? 'change' : 'input';
+    F[k].addEventListener(ev, () => {
+      touched.add(k);
+      F[k].removeAttribute('aria-invalid');
+      $('revert').hidden = false;
+    });
+  }
+
+  function markInvalid(key) {
+    for (const k of Object.keys(F)) F[k].removeAttribute('aria-invalid');
+    if (!key) return;
+    if (key === 'http_port') $('adv').open = true;
+    F[key].setAttribute('aria-invalid', 'true');
+    F[key].focus();
+  }
+
+  $('revert').addEventListener('click', () => {
+    touched.clear();
+    markInvalid(null);
+    if (st) syncForm(st.config, true);
+    setMsg($('cfgMsg'), '', '');
+  });
+
+  let applying = false;
+  $('cfgForm').addEventListener('submit', async (e) => {
+    e.preventDefault();
+    if (!st || !info || applying) return;             /* (the selects are empty until the settings came) */
+    const cur = st.config, body = {};
+    markInvalid(null);
+    const ip = F.module_ip.value.trim();
+    if (ip !== cur.module_ip) body.module_ip = ip;
+    if (!F.interval_us.disabled && +F.interval_us.value !== cur.interval_us) body.interval_us = +F.interval_us.value;
+    if (!F.channels.disabled && +F.channels.value !== cur.channels) body.channels = +F.channels.value;
+    for (const k of ['port', 'http_port']) {
+      const t = F[k].value.trim();
+      if (!/^[0-9]{1,5}$/.test(t) || +t < 1 || +t > 65535) {
+        markInvalid(k);
+        setMsg($('cfgMsg'), LABEL[k] + ': "' + t + '" is not a port - use 1 to 65535', 'err');
+        return;
+      }
+      if (+t !== cur[k]) body[k] = +t;
+    }
+    if (!Object.keys(body).length) {
+      touched.clear();
+      syncForm(cur, true);
+      setMsg($('cfgMsg'), 'Nothing to change.', '');
+      return;
+    }
+    applying = true;
+    $('apply').setAttribute('aria-busy', 'true');
+    setMsg($('cfgMsg'), 'Applying…', '');
+    try {
+      const r = await api('/api/config', body);
+      touched.clear();
+      st.config = r.config;
+      syncForm(r.config, true);
+      if (r.warning) setMsg($('cfgMsg'), 'Applied, but: ' + r.warning, 'warn');
+      else setMsg($('cfgMsg'), 'Applied.', 'ok');
+      refresh().catch(() => {});
+    } catch (err) {
+      const m = /^([a-z_]+)(?::| must| is given)/.exec(err.message);
+      markInvalid(m && F[m[1]] ? m[1] : null);
+      setMsg($('cfgMsg'), err.message, 'err');
+    } finally {
+      applying = false;
+      $('apply').removeAttribute('aria-busy');
+    }
+  });
+
+  /* ---------------------------------------------------------------- actions */
+  /* A button stays enabled while its request runs (a disabled button loses the keyboard focus); a
+     second press meanwhile is ignored. */
+  let busy = false;
+  async function action(btn, path, doneText) {
+    if (busy) return;
+    busy = true;
+    btn.setAttribute('aria-busy', 'true');
+    try {
+      await api(path, {});
+      setMsg($('actMsg'), doneText, '');
+      await refresh();
+      pollLog();
+    } catch (err) {
+      setMsg($('actMsg'), err.message, 'err');
+    } finally {
+      busy = false;
+      btn.removeAttribute('aria-busy');
+      if (st) renderControls(st);
+    }
+  }
+  $('startStop').addEventListener('click', () => {
+    const run = st && st.running;
+    action($('startStop'), run ? '/api/stop' : '/api/start', run ? 'Stopped.' : 'Started.');
+  });
+  $('restart').addEventListener('click', () => action($('restart'), '/api/restart', 'Asked the module to restart its stream.'));
+
+  /* ---------------------------------------------------------------- rendering */
+  function isXf(s) { return !!(s.module && s.module.kind === 'Crossfire'); }
+
+  function renderControls(s) {
+    const ss = $('startStop');
+    setText(ss, s.running ? 'Stop' : 'Start');
+    ss.disabled = offline;
+    /* restart: a module to restart (the locked one, else the module IP), and it is not Crossfire */
+    const can = !offline && s.running && (s.module ? !isXf(s) : s.config.module_ip !== '');
+    $('restart').disabled = !can;
+    const xf = isXf(s);
+    F.interval_us.disabled = xf;
+    F.channels.disabled = xf;
+    $('xfNote').hidden = !xf;
+    if (xf && info) setText($('xfNote'), 'Crossfire always sends ' + info.crossfire.channels + ' channels at ~' + info.crossfire.rate_hz + ' Hz');
+  }
+
+  function renderJoystick(j) {
+    const el = $('joy');
+    let cls, text;
+    if (!j.enabled) {
+      cls = 'box info';
+      text = 'Monitor only: no virtual joystick (started with --no-joystick). The sticks still show here.';
+    } else if (j.ok) {
+      cls = '';
+      text = null;
+    } else {
+      cls = 'box bad';
+      text = 'No virtual joystick: ' + (j.error || 'unknown reason');
+    }
+    const sig = JSON.stringify(j);
+    if (el.dataset.sig === sig) return;
+    el.dataset.sig = sig;
+    el.className = cls;
+    if (text !== null) { el.textContent = text; return; }
+    const dl = document.createElement('dl');
+    dl.className = 'kv';
+    const add = (k, v) => { const dt = document.createElement('dt'); dt.textContent = k; const dd = document.createElement('dd'); dd.textContent = v; dl.append(dt, dd); };
+    add('Name', j.name);
+    add('Device', j.device || 'created (its /dev/input node is not known)');
+    add('CH9–CH16', j.buttons ? 'buttons 1–8 (pressed at 75 %, released below 62.5 %)' : 'not buttons (--no-buttons)');
+    el.replaceChildren(dl);
+  }
+
+  const COUNTERS = [
+    ['frames', 'Frames used'], ['rx', 'Datagrams received'], ['beacons', 'Beacons'], ['malformed', 'Malformed'],
+    ['dropped_filter', 'Ignored (other module)'], ['dropped_other', 'Ignored (no stick data)'], ['posts', 'Activations sent'],
+    ['posts_ok', 'Activations ok'], ['posts_failed', 'Activations failed'], ['restarts', 'Stream restarts'],
+    ['gaps', 'Gaps ≥ 250 ms'], ['gap_max_ms', 'Longest gap (ms)'],
+  ];
+  const cnt = {};
+  (function () {
+    const dl = $('counters');
+    const add = (key, label) => {
+      const d = document.createElement('div');
+      const dt = document.createElement('dt'); dt.textContent = label;
+      const dd = document.createElement('dd'); dd.textContent = '--';
+      d.append(dt, dd);
+      dl.append(d);
+      cnt[key] = dd;
+    };
+    for (const [k, l] of COUNTERS) add(k, l);
+    add('listening', 'UDP port');
+    add('uptime', 'Running for');
+  })();
+
+  function uptimeText(sec) {
+    sec = Math.floor(sec);
+    const h = Math.floor(sec / 3600), m = Math.floor(sec / 60) % 60, s = sec % 60;
+    return h ? h + ' h ' + String(m).padStart(2, '0') + ' min' : m ? m + ' min ' + String(s).padStart(2, '0') + ' s' : s + ' s';
+  }
+
+  function render(s) {
+    st = s;
+    offline = false;
+    const xf = isXf(s);
+    const streaming = s.state === 'streaming';
+    /* banner */
+    const ban = $('banner'), state = TITLES[s.state] ? s.state : 'stopped';
+    const cls = 'banner st-' + state;
+    if (ban.className !== cls) ban.className = cls;
+    setText($('bState'), TITLES[state]);
+    /* what is going on (unless the title says it), then the module: IP, kind, ELRS device name */
+    const m = s.module, parts = [];
+    if (s.status && s.status !== 'streaming') parts.push(s.status);
+    if (m) parts.push(...[m.ip, m.kind, m.name].filter(Boolean));
+    setText($('bDetail'), parts.join(' · '));
+    const docTitle = (streaming ? '● ' : '') + TITLES[state] + ' – ELRS WiFi Joystick';
+    if (document.title !== docTitle) document.title = docTitle;
+    /* rate line */
+    const live = streaming && s.nch > 0;
+    setText($('rate'), live ? s.rate_hz.toFixed(1) : '--');
+    setText($('jit'), live ? s.jitter_ms.toFixed(2) : '--');
+    setText($('pps'), live ? String(s.frames_last_s) : '--');
+    const ask = $('ask');
+    const askText = 'asked ' + s.request.rate_hz + ' Hz × ' + s.request.channels + ' ch';
+    let get = live ? 'getting ' + Math.round(s.rate_hz) + ' Hz × ' + s.nch + ' ch' : 'getting nothing yet';
+    const off = live && !xf && s.nch !== s.request.channels;
+    const sig = askText + get + off + xf;
+    if (ask.dataset.sig !== sig) {
+      ask.dataset.sig = sig;
+      const g = document.createElement('span');
+      g.textContent = get;
+      if (off) g.className = 'off';
+      ask.replaceChildren(askText + ' – ', g, xf ? ' (Crossfire ignores the request)' : '');
+    }
+    /* bars */
+    setButtonMode(!!s.joystick.buttons);
+    renderBars(s, live);
+    /* controls, form, joystick, counters */
+    renderControls(s);
+    if (info) syncForm(s.config, false);
+    renderJoystick(s.joystick);
+    for (const [k] of COUNTERS) setText(cnt[k], String(s.counters[k]));
+    setText(cnt.listening, s.config.port + (s.listening ? ' (listening)' : s.running ? ' (not bound yet)' : ' (stopped)'));
+    setText(cnt.uptime, uptimeText(s.uptime_s));
+    setText($('foot'), 'elrs-wifi-joystick ' + s.version + ' · ' + location.host);
+    /* the program was restarted: start the log over, read the settings again */
+    if (s.uptime_s < lastUptime) { loadInfo().catch(() => {}); resetLog(); }
+    lastUptime = s.uptime_s;
+  }
+
+  function renderOffline() {
+    if (offline) return;
+    offline = true;
+    $('banner').className = 'banner st-offline';
+    setText($('bState'), 'No connection');
+    setText($('bDetail'), 'elrs-wifi-joystick does not answer at ' + location.host + ' - is it still running? Retrying…');
+    document.title = 'No connection – ELRS WiFi Joystick';
+    $('startStop').disabled = true;
+    $('restart').disabled = true;
+    if (st) renderBars(st, false);
+    for (const k of ['rate', 'jit', 'pps']) setText($(k), '--');
+  }
+
+  /* ---------------------------------------------------------------- polling (only while visible) */
+  async function refresh() {
+    const no = ++reqNo;
+    const s = await api('/api/status');
+    if (no < shownNo) return;            /* an older answer that arrived late */
+    shownNo = no;
+    fails = 0;
+    render(s);
+  }
+
+  let statusLoop = false;
+  async function pollStatus() {
+    if (statusLoop) return;
+    statusLoop = true;
+    while (visible()) {
+      const t0 = performance.now();
+      try {
+        if (!info) await loadInfo();
+        await refresh();
+      } catch (e) {
+        if (++fails >= 2) renderOffline();
+      }
+      await sleep(fails ? 1000 : Math.max(10, STATUS_MS - (performance.now() - t0)));
+    }
+    statusLoop = false;
+  }
+
+  async function loadInfo() {
+    const c = await api('/api/config');
+    info = c;
+    fillChannels();
+    fillRates(c.config.interval_us);
+    syncForm(c.config, touched.size === 0);
+  }
+
+  /* ---------------------------------------------------------------- the log */
+  const logEl = $('log');
+  function two(n) { return String(n).padStart(2, '0'); }
+  function addLine(text, cls, time) {
+    const d = document.createElement('div');
+    if (cls) d.className = cls;
+    if (time) {
+      const t = document.createElement('span');
+      t.className = 't';
+      const dt = new Date(time);
+      t.textContent = two(dt.getHours()) + ':' + two(dt.getMinutes()) + ':' + two(dt.getSeconds()) + '  ';
+      d.append(t);
+    }
+    d.append(text);
+    logEl.append(d);
+  }
+  function resetLog() { logSince = 0; logEl.replaceChildren(); }
+
+  async function pollLog() {
+    if (logBusy) return;
+    logBusy = true;
+    try {
+      for (let again = 0; again < 3; again++) {
+        const r = await api('/api/log?since=' + logSince);
+        if (r.seq < logSince) { resetLog(); continue; }   /* the program restarted: its lines start at 1 again */
+        if (!r.lines.length) { logSince = r.seq; break; }
+        /* stay at the bottom unless the reader scrolled up */
+        const atEnd = logEl.scrollTop + logEl.clientHeight >= logEl.scrollHeight - 8;
+        const missed = r.lines[0].seq - logSince - 1;
+        if (missed > 0) addLine('… ' + missed + (logSince ? ' lines' : ' earlier lines') + ' not shown', 'gap');
+        for (const l of r.lines) addLine(l.text, '', l.time_ms);
+        while (logEl.childElementCount > LOG_KEEP) logEl.firstElementChild.remove();
+        logSince = r.seq;
+        if (atEnd) logEl.scrollTop = logEl.scrollHeight;
+        setText($('logHint'), atEnd ? '' : 'scrolled up: new lines are added below');
+        break;
+      }
+    } catch (e) {
+      /* the status poll shows the lost connection */
+    } finally {
+      logBusy = false;
+    }
+  }
+  logEl.addEventListener('scroll', () => {
+    if (logEl.scrollTop + logEl.clientHeight >= logEl.scrollHeight - 8) setText($('logHint'), '');
+  });
+
+  let logLoop = false;
+  async function pollLogLoop() {
+    if (logLoop) return;
+    logLoop = true;
+    while (visible()) {
+      await pollLog();
+      await sleep(LOG_MS);
+    }
+    logLoop = false;
+  }
+
+  function start() { pollStatus(); pollLogLoop(); }
+  document.addEventListener('visibilitychange', () => { if (visible()) start(); });
+  start();
+})();
+</script>
+</body>
+</html>

@@ -12,14 +12,19 @@ characters escaped.
 | `Host` is `localhost`, `127.0.0.1`, `[::1]` or an IPv4 literal, with an optional `:port` | 403 `{"ok":false,"error":"host not allowed"}` |
 | `Origin`, when present (and not `null`), is `http://<the same host:port as Host>` | 403 `{"ok":false,"error":"origin not allowed"}` |
 | POST has `Content-Type: application/json` (parameters like `; charset=utf-8` allowed) | 415 `{"ok":false,"error":"use Content-Type: application/json"}` |
-| request head ≤ 8 KiB, body ≤ 4 KiB, `Content-Length` given for a POST with a body | 413 / 411 / 400 |
+| request head ≤ 8 KiB, body ≤ 4 KiB | 413 |
+| `POST /api/config` has a `Content-Length`; no `Transfer-Encoding` anywhere (chunked bodies are refused) | 411 |
+| a well-formed HTTP/1.0 or 1.1 request (HTTP/1.1: exactly one `Host`; one `Content-Length` value) | 400 (505 for other versions) |
 | method allowed for the path | 405 with `Allow` |
 
-No `Access-Control-*` headers are ever sent. Chunked request bodies are refused (411).
+No `Access-Control-*` headers are ever sent. Every error is JSON `{"ok":false,"error":"..."}` except a 404
+outside `/api/`. Connections: one request each; a request must arrive within 5 s of connecting (else 408,
+or the connection just closes when nothing came); an answer that makes no progress for 5 s is dropped.
+With 32 connections open, further ones wait (they are not refused).
 
 ## `GET /`
 
-The page (`text/html; charset=utf-8`). `GET /index.html` is the same. `HEAD` is accepted for both.
+The page (`text/html; charset=utf-8`). `GET /index.html` is the same. `HEAD` is accepted wherever `GET` is.
 
 ## `GET /api/status`
 
@@ -84,8 +89,10 @@ the settings file.
 
 - 200 `{"ok":true,"config":{...},"warning":""}` (`warning`: e.g. the settings file could not be written).
 - 400 `{"ok":false,"error":"channels: 3 is not supported - use 4 to 16"}` for an unsupported value,
-  `{"ok":false,"error":"unknown key \"foo\""}`, `{"ok":false,"error":"channels must be a number"}`,
-  `{"ok":false,"error":"the body must be a JSON object"}`. Nothing changes on any error.
+  `{"ok":false,"error":"unknown key \"foo\""}`, `{"ok":false,"error":"channels must be a number"}`
+  (`... must be a whole number` for 16.0 or 1e3, `module_ip must be a string`, `channels is given twice`),
+  `{"ok":false,"error":"the body must be a JSON object"}`, `{"ok":false,"error":"the body is not valid JSON"}`.
+  Nothing changes on any error. `{}` changes nothing and answers the current config.
 
 ## `POST /api/start`, `POST /api/stop`, `POST /api/restart`
 
@@ -99,7 +106,9 @@ Body ignored (send `{}`). `start`/`stop` listen or not; `restart` re-sends our r
 ```
 
 Lines with `seq > since` (default 0), oldest first, at most 200 (the newest 200 when more). `seq` is the
-newest line's seq (pass it as `since` next time). `time_ms`: wall clock, ms since 1970.
+newest line's seq (pass it as `since` next time); with no new lines, the program's newest seq, which is
+below `since` after the program was restarted (start over from 0). `time_ms`: wall clock, ms since 1970.
+`since` that is not a number 0..4294967295: 400 `{"ok":false,"error":"since must be a number"}`.
 
 ## Errors
 

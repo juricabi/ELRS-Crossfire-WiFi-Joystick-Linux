@@ -4,7 +4,7 @@
 #   ./build.sh [target] [what] [test names...]
 #     target: native (default: this machine, cc), or a static Linux binary made with zig cc:
 #             x86_64, i686, aarch64, armv7, armv6, riscv64; "all" = every static target
-#     what:   all (default: the program + tests), prog, tests, test (build, then run the unit tests;
+#     what:   all (default: the program + tests), prog, tests, test (build both, then run the unit tests;
 #             names limit which), clean
 #
 # Environment:
@@ -111,7 +111,7 @@ for f in src/*.c; do
   [ "$n" = main ] || LIB_OBJ="$LIB_OBJ $o"
 done
 
-if [ "$WHAT" = all ] || [ "$WHAT" = prog ]; then
+if [ "$WHAT" = all ] || [ "$WHAT" = prog ] || [ "$WHAT" = test ]; then
   if [ -f src/main.c ]; then
     echo "  LD elrs-wifi-joystick"
     # shellcheck disable=SC2086,SC2090

@@ -29,7 +29,7 @@ src/                  the Linux program
 web/index.html        the page (self-contained: inline CSS/JS, no external requests), embedded at build
 tests/                unit tests (test_*.c), fake_elrs.py (fake module), e2e tests (*.py)
 packaging/            install.sh, udev rule, modules-load file, systemd user unit
-docs/                 DESIGN.md (this), WEB_API.md, USAGE.md
+docs/                 DESIGN.md (this), WEB_API.md, USAGE.md, INSTALL.md, TROUBLESHOOTING.md, DEVELOPMENT.md
 build.sh              native + static cross builds (zig cc, musl), tests
 ```
 
@@ -49,9 +49,11 @@ See the header comment of `core/wifi_proto.h`. In short:
 - **The request** (interval and channels) is a setting everywhere. Supported: interval 1000..100000 µs
   (presets 1000/500/333/250/200/150/100/50 Hz; default 4000 = 250 Hz), channels 4..16 (default 16).
   ELRS applies it only while not streaming, so changing it while an ELRS module streams restarts the
-  stream (`joystick_end`, then `joystick_begin`). Crossfire ignores it (16 channels, ~90 Hz) and is
-  never sent `joystick_end`. A module that is surely not Crossfire and streams a channel count other
-  than the request is restarted once per session (another app's leftover request).
+  stream (`joystick_end`, then `joystick_begin`). Crossfire ignores it (16 channels, ~90 Hz) and, once
+  its beacon says Crossfire, is never sent `joystick_end`; a locked 16-channel module with no beacon yet
+  is restarted only after 20 s of lock without a Crossfire beacon. A module that is surely not Crossfire
+  and streams a channel count other than the request is restarted once per session (another app's
+  leftover request); a leftover rate is not detected (startup values apply at the next joystick_begin).
 - Source lock: the first module with real channel data; others are ignored until it is silent for 3 s.
   With a module IP set, only that IP counts.
 - Crossfire placeholder frames (any channel = 0xF26A) and all-out-of-range frames are dropped.
@@ -136,8 +138,9 @@ elrs-wifi-joystick [options]
 
 - Precedence: defaults < settings file < command line. Invalid values: a one-line error naming the
   option and the supported values, exit code 2. `--rate` and `--interval` together: the later one wins.
-- Interactive (stdin and stdout are terminals, not `--daemon`): a header, then log lines as they come
-  (colored when the terminal supports it and `NO_COLOR` is unset), and one status line at the bottom
+- Interactive (stdin and stdout are terminals, in the foreground, not `--daemon`): a header, then log
+  lines as they come (colored when `TERM` is set and not `dumb` and `NO_COLOR` is empty or unset), and
+  one status line at the bottom
   redrawn ~10 times a second: state, module, rate/jitter, asked rate × channels, and 8 small bars
   (CH1-8) + CH9-16 button marks. Keys (raw mode, restored on exit and on every signal):
   `s` start/stop, `t` module IP (prompt; empty = discovery), `r` rate (prompt listing the presets),

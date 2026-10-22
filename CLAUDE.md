@@ -13,6 +13,10 @@ Open source (MIT): no secrets or personal paths in git. Your own notes go in `.l
 - `docs/DESIGN.md`: layout, threads, protocol summary, joystick mapping, CLI, settings, builds, tests.
 - `docs/WEB_API.md`: the web API contract. `src/engine.h`, `src/web.h`: the module contracts.
 - `core/wifi_proto.h`: the protocol and "the request" (interval/channels, restarts, Crossfire).
+- `docs/DEVELOPMENT.md`: build targets, every test suite, CI, releases, re-vendoring `core/` into sticktime-pi.
+- For users: `docs/USAGE.md` (CLI, keys, settings, the request, the joystick), `docs/INSTALL.md`
+  (install script, by hand, the service, updates), `docs/TROUBLESHOOTING.md`. `README.md` is a short
+  front page: keep it that way and put details in `docs/`.
 
 ## Rules
 

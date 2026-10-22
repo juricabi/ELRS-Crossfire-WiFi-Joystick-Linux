@@ -2,8 +2,8 @@
 # Tests packaging/install.sh without root and without network: every run happens in a temporary
 # directory (--root, or a temporary HOME), with fake system commands (id, uname, curl, wget, getent,
 # systemctl, runuser, sudo, modprobe, udevadm) and a fake GitHub (public download URLs and the API
-# that a private repository needs). PATH holds only the fakes and the basic tools the script may use,
-# so a test also fails when the script calls something unexpected.
+# that a token uses, as for a private fork). PATH holds only the fakes and the basic tools the script
+# may use, so a test also fails when the script calls something unexpected.
 #
 #   sh tests/test_install.sh [-v]
 # Every case runs under each shell found among: sh, dash, bash --posix, busybox sh (SHELLS to pick: one

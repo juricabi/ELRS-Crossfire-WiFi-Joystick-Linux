@@ -46,8 +46,6 @@ Both radios use the same "WiFi joystick" protocol (the one VelociDrone Mobile sp
 3. **Run** `elrs-wifi-joystick`. It finds the module by its broadcast, asks it to stream, and the virtual joystick follows your sticks.
 4. **Fly** - pick the joystick named **ELRS Crossfire WiFi Joystick** in the simulator and calibrate it.
 
-> **Note**: while the repository is private, the downloads need a `GITHUB_TOKEN`: see [docs/INSTALL.md](docs/INSTALL.md#while-the-repository-is-private).
-
 > ### 🛑 Crossfire / Tracer: check your firmware first
 >
 > | Component | Works | Broken |
@@ -85,8 +83,8 @@ The program asks the module for an update **rate** and a **channel count** - "th
 |------|---------|--------|--------|------------|--------|--------|--------|-------|
 | Interval (µs) | 1000 | 2000 | 3000 | **4000** | 5000 | 6667 | 10000 | 20000 |
 
-- **ExpressLRS** (3.4.0 and later) streams what it is asked for. A change with the keys `r` / `c` or the web page restarts its stream so that it takes effect (`joystick_end`, then `joystick_begin`): at once when it is surely ELRS, after up to 20 s while it might still be a Crossfire that has not sent its beacon. A restart that fails is sent again every 5 s while the module streams (3 tries in all). A change made while the module isn't streaming to the program goes into its next request, and a module that comes back with an older one is restarted.
-- `--rate` / `--channels` and the settings file only set the next request: if the module still streams from before, press `a` (or restart in the web page). Only a different channel count is fixed by itself (once per module and session).
+- **ExpressLRS** (3.4.0 and later) streams what it is asked for. A change with the keys `r` / `c` or the web page restarts its stream so that it takes effect ([details](docs/USAGE.md#the-request-rate-and-channels)).
+- `--rate` / `--channels` and the settings file only set the next request: if the module still streams from before, press `a` (or restart in the web page). Only a different channel count is fixed by itself.
 - **TBS Crossfire / Tracer** ignores both: it always sends 16 channels at about 90 Hz, and it is never sent `joystick_end`.
 
 ## 📋 Channel Mapping
@@ -130,9 +128,11 @@ If you like it, you can buy me a coffee:
 
 This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
 
+The release binaries are statically linked with [musl libc](https://musl.libc.org/) (MIT License, see its [COPYRIGHT](https://git.musl-libc.org/cgit/musl/tree/COPYRIGHT)). Parts of `src/engine.c` and `tests/fake_elrs.py` were first written by the same author for [sticktime-pi](https://github.com/juricabi/sticktime-pi) (GPL-2.0); the author licenses them here under the MIT License.
+
 ## 🤝 Contributing
 
-Contributions are welcome! Please feel free to submit a Pull Request. For major changes, please open an issue first to discuss what you would like to change.
+Contributions are welcome! Please read [CONTRIBUTING.md](CONTRIBUTING.md) (the tests to run, and the rules for the shared protocol core) and submit a Pull Request. For major changes, please open an issue first to discuss what you would like to change. Security problems: see [SECURITY.md](SECURITY.md), not a public issue.
 
 ### Reporting Issues
 

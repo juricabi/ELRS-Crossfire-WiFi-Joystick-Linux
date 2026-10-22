@@ -80,22 +80,26 @@ GitHub Actions (`.github/workflows/build.yml`) runs all of it on every push and 
 | static | the six static binaries, with every unit test under qemu-user on an old CPU of each target (riscv64: sifive-u54, plain RV64GC; and natively for x86_64 and i686); the checked binaries uploaded as artifacts |
 | web | the web page in Chromium, against the program and against the demo |
 | core | `core/` compiled for Windows and macOS |
+| scripts | shellcheck, the installer tests (sh, dash, bash --posix and busybox ash, each the full suite), actionlint, Python syntax |
 
 zig comes from its PyPI wheel, installed with `pip --require-hashes` against `ZIG_SHA256` in build.yml
 (update it together with `ZIG_VERSION`).
-| scripts | shellcheck, the installer tests (sh, dash, bash --posix and busybox ash, each the full suite), actionlint, Python syntax |
 
 ## Releases
 
 A tag `vX.Y.Z` that matches `VERSION` publishes a release with the six binaries, `install.sh` and
 `SHA256SUMS` (`.github/workflows/release.yml`). It runs all of build.yml first; a version with a `-`
-(`1.1.0-rc1`) is published as a pre-release, and running it again for the same tag replaces the assets
-and the notes. After publishing, release.yml installs the release with install.sh (through the API with
-the token, and from the public URLs when the repository is public) and checks that what it installed is
-the published binary, byte for byte.
+(`1.1.0-rc1`) is published as a pre-release. After publishing, release.yml installs the release with
+install.sh from the public URLs without a token (as users do) and through the API with a token (as for
+a private fork), and checks that what it installed is the published binary, byte for byte. The public
+check fails the release when the repository's visibility cannot be read; a private repository only
+gets a warning that it was skipped.
 
 1. Set the new version in `VERSION`, commit it and push.
 2. Tag that commit and push the tag: `git tag v1.1.0 && git push origin v1.1.0`.
+
+Do not run the release again for a published version: running it for the same tag replaces the assets
+in place, and an install during the swap can fail. Fix it with a new patch version instead (`1.1.1`).
 
 ## The shared core
 
@@ -106,7 +110,8 @@ the two copies the same). A change to `core/` must keep it free of Linux-app spe
 Linux, Windows and macOS (CI's `core` job), and its tests passing. Then vendor it again:
 
 1. Commit the change here, after `./build.sh native test` (also with `SAN=1 WERROR=1`).
-2. In sticktime-pi, checked out next to this repo: `tools/vendor_elrs_wifi.sh`, then
+2. In sticktime-pi, checked out next to this repo: `tools/vendor_elrs_wifi.sh` (with the path of this
+   checkout as its argument when it does not find it by itself), then
    `host/build.sh native test` and `python host/tests/wifi_live_test.py`, and commit
    `host/third_party/elrs-wifi/` and `host/tests/fake_elrs.py` (if it changed). sticktime-pi's CI fails
    when those files differ from what its `VENDOR` file recorded; its `host/third_party/elrs-wifi/README.md`

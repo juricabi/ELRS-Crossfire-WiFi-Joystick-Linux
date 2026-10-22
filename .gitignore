@@ -1,8 +1,32 @@
+# build output
 build/
-.local/
-__pycache__/
-*.pyc
-*.tmp
+build-*/
+dist/
 *.o
 *.obj
-build-*/
+*.tmp
+*.log
+# core dumps (never a bare "core": that is the core/ source directory)
+core.[0-9]*
+
+# your own notes
+.local/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Playwright (tests/test_ui.py)
+test-results/
+playwright-report/
+
+# OS and editor files
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
+.vscode/
+.idea/

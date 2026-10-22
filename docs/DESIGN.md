@@ -20,11 +20,11 @@ core/                 the shared protocol core (C, MIT): the source of truth for
 src/                  the Linux program
   main.c              options, settings file, single instance, signals, wiring, the run loop
   config.c/.h         command line + settings file parsing/validation/saving (pure where possible)
-  engine.c/.h         receive thread + worker thread + snapshot + commands + log ring (CONTRACT: engine.h)
+  engine.c/.h         receive thread + worker thread + snapshot + commands + log ring (interface: engine.h)
   joymap.c/.h         pure: channels -> axis/button values and the events to emit
   uinput.c/.h         the virtual joystick device
   cli.c/.h            terminal UI (interactive keys + status line, or line commands on stdin)
-  web.c/.h            HTTP server + JSON API (CONTRACT: web.h, docs/WEB_API.md)
+  web.c/.h            HTTP server + JSON API (interface: web.h; API: docs/WEB_API.md)
   hints.c/.h          Linux-specific advice (firewall, uinput access), pure + small file probes
 web/index.html        the page (self-contained: inline CSS/JS, no external requests), embedded at build
 tests/                unit tests (test_*.c), fake_elrs.py (fake module), e2e tests (*.py)
@@ -54,7 +54,7 @@ See the header comment of `core/wifi_proto.h`. In short:
   module only by a **restart**: `joystick_end`, then `joystick_begin` with the request. Crossfire ignores it
   (16 channels, ~90 Hz) and, as what it does with `joystick_end` is unknown, a module known as Crossfire
   by its beacon is never sent one. Only beacons tell the two apart: ELRS beacons only while idle, Crossfire
-  about every 8 s also while streaming. The rules (the same in the core, the Windows app and every doc):
+  about every 8 s also while streaming. The rules (the Windows app follows the same ones):
   1. Defaults 250 Hz (4000 µs) and 16 channels. Supported: interval 1000..100000 µs (presets
      1000/2000/3000/4000/5000/6667/10000/20000 µs = 1000/500/333/250/200/150/100/50 Hz), channels 4..16.
   2. A change while locked: Crossfire (known by its beacon): logged once per session, nothing sent.
@@ -229,7 +229,7 @@ also when that file does not exist yet.
 
 ## 7. Web page and API
 
-Default `http://127.0.0.1:11000/` (this machine only). The contract is `docs/WEB_API.md`; summary:
+Default `http://127.0.0.1:11000/` (this machine only). The full API is in `docs/WEB_API.md`; summary:
 
 - `GET /` the page; `GET /api/status`, `GET /api/config`, `POST /api/config`, `POST /api/start`,
   `POST /api/stop`, `POST /api/restart`, `GET /api/log?since=N`.
@@ -280,8 +280,8 @@ downloads the matching binary from the GitHub release (or uses `--file`), checks
 `SHA256SUMS`, installs it to `/usr/local/bin` (root) or `~/.local/bin`, installs the udev rule
 (`/dev/uinput` for the logged-in user and the `input` group) and `uinput` in
 `/etc/modules-load.d/`, loads the module, and optionally (`--service`) a systemd user unit. Running it
-again updates; `--uninstall` removes everything it installed. A private repository needs
-`GITHUB_TOKEN`.
+again updates; `--uninstall` removes everything it installed. `GITHUB_TOKEN` is only needed to install
+from a private fork (`ELRS_WIFI_JOYSTICK_REPO`).
 
 ## 11. Conventions
 

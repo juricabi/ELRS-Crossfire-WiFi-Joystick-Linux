@@ -4,7 +4,8 @@
 #   install.sh                                  packaging/install.sh
 #   SHA256SUMS                                  of all of them (install.sh checks downloads against it)
 # A version with a "-" (1.1.0-rc1) is published as a pre-release. Running it again for the same tag
-# replaces the assets and the notes.
+# replaces the assets and the notes: only for a release nobody installs yet. A public release is not
+# run again (an install during the swap could fail): tag a new patch version instead.
 name: release
 
 on:
@@ -104,10 +105,6 @@ jobs:
             echo "sudo sh install.sh --version $VER        # or: sh install.sh --version $VER (this user only)"
             echo '```'
             echo
-            echo "While the repository is private, the installer needs a token that can read it, e.g."
-            echo "\`gh release download v$VER -R $repo -p install.sh\` and then"
-            echo "\`GITHUB_TOKEN=\$(gh auth token) sudo --preserve-env=GITHUB_TOKEN sh install.sh --version $VER\`."
-            echo
             echo "### Files"
             echo
             echo "| file | for |"
@@ -144,8 +141,8 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          # the GitHub API path (a private repository: GITHUB_TOKEN), then the public URLs once it is public;
-          # what lands must be the published binary, byte for byte
+          # the public URLs without a token (what users do), then the GitHub API with GITHUB_TOKEN (what a
+          # private fork needs); what lands must be the published binary, byte for byte
           check() {  # label, then install.sh's environment
             root=$(mktemp -d)
             label=$1
@@ -154,9 +151,14 @@ jobs:
             cmp "$root/home/u/.local/bin/elrs-wifi-joystick" "dist/elrs-wifi-joystick-$VER-linux-x86_64"
             echo "$label: ok"
           }
+          vis=$(gh repo view "$GITHUB_REPOSITORY" --json visibility -q .visibility) || vis=""
+          case $vis in
+            PUBLIC)
+              check "public download" -u GITHUB_TOKEN ;;
+            PRIVATE|INTERNAL)
+              echo "::warning::the repository is ${vis}: the public download (what users run) was not tested" ;;
+            *)
+              echo "::error::cannot read the repository's visibility (got \"$vis\"), so the public download was not tested"
+              exit 1 ;;
+          esac
           check "with GITHUB_TOKEN" GITHUB_TOKEN="$GH_TOKEN"
-          if [ "$(gh repo view "$GITHUB_REPOSITORY" --json visibility -q .visibility)" = PUBLIC ]; then
-            check "public download" -u GITHUB_TOKEN
-          else
-            echo "(the repository is private: the public download is not tried)"
-          fi

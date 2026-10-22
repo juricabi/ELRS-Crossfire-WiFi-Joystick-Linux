@@ -73,7 +73,7 @@ bars for CH1..CH8 and marks for the 8 buttons. Keys (upper or lower case):
 | `r` | prompt for the rate (the presets, or 10..1000 Hz) |
 | `c` | prompt for the channels (4..16) |
 | `p` | prompt for the UDP port |
-| `a` | restart the stream: send our request again (`joystick_end`, then `joystick_begin`; after up to 20 s while a streaming module's kind is not known; Crossfire streaming to the program: nothing is sent; the module IP of a module that does not stream to the program and is not known as ELRS: only `joystick_begin`), see [the request](#the-request-rate-and-channels) |
+| `a` | restart the stream, so that a new rate or channel count takes effect (a Crossfire module is never sent `joystick_end`); see [the request](#the-request-rate-and-channels) |
 | `w` | print the web page's address |
 | `h`, `?` | help |
 | `q`, Ctrl+C | quit (the joystick is centered and removed) |

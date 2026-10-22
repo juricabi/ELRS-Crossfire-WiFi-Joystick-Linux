@@ -4,11 +4,11 @@
 #   systemctl --user stop|start|restart elrs-wifi-joystick
 #   journalctl --user -u elrs-wifi-joystick -f       the log
 # Settings: the web page (http://127.0.0.1:11000/) or ~/.config/elrs-wifi-joystick/config.
-# https://github.com/juricabi/elrs-crossfire-wifi-joystick-linux
+# https://github.com/juricabi/ELRS-Crossfire-WiFi-Joystick-Linux
 
 [Unit]
 Description=ELRS / Crossfire WiFi joystick
-Documentation=https://github.com/juricabi/elrs-crossfire-wifi-joystick-linux
+Documentation=https://github.com/juricabi/ELRS-Crossfire-WiFi-Joystick-Linux
 
 [Service]
 Type=simple

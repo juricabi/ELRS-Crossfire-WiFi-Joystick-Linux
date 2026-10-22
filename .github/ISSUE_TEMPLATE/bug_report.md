@@ -4,6 +4,8 @@ about: Something doesn't work with elrs-wifi-joystick on Linux
 labels: bug
 ---
 
+<!-- A security problem? Please don't report it here: see SECURITY.md (Security > Report a vulnerability). -->
+
 **What happened, and what did you expect?**
 
 
@@ -18,7 +20,7 @@ labels: bug
 
 **The module**
 - ExpressLRS: TX module and firmware version (e.g. RadioMaster Ranger, ELRS 3.5.3):
-- or TBS Crossfire / Tracer: TX firmware (e.g. 6.36) and WiFi module firmware (e.g. v2.25):
+- or TBS Crossfire / Tracer: TX firmware (e.g. 6.36) and WiFi module firmware (e.g. v2.25.49mb):
 - Rate and channels asked for (the web page, or `--rate` / `--channels`):
 
 **The joystick** (if the problem is with a game or simulator)

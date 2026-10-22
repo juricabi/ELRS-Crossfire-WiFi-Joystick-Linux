@@ -8,7 +8,7 @@ is the overview (and lists the [machines](../README.md#machines) there are binar
 ## With the install script
 
 ```sh
-curl -fsSLO https://github.com/juricabi/elrs-crossfire-wifi-joystick-linux/releases/latest/download/install.sh
+curl -fsSLO https://github.com/juricabi/ELRS-Crossfire-WiFi-Joystick-Linux/releases/latest/download/install.sh
 sudo sh install.sh
 ```
 
@@ -47,17 +47,19 @@ sh install.sh [options]
 
 | environment | |
 |---|---|
-| `GITHUB_TOKEN` | a token that can read the repository: needed while it is private (sent with curl; without curl, wget is used without it, with a warning). A token that cannot read the release (expired, or another account's) falls back to the public download, with a warning |
-| `ELRS_WIFI_JOYSTICK_REPO` | `owner/name` to install from (default `juricabi/elrs-crossfire-wifi-joystick-linux`) |
+| `GITHUB_TOKEN` | optional: a token that can read a private fork, only to install from one (`ELRS_WIFI_JOYSTICK_REPO`). The public download needs none and does not use the GitHub API, so no API rate limit applies to it. The token is sent with curl only (without curl, wget is used without it, with a warning). A token that cannot read the release (expired, or another account's) falls back to the public download, with a warning |
+| `ELRS_WIFI_JOYSTICK_REPO` | `owner/name` to install from (default `juricabi/ELRS-Crossfire-WiFi-Joystick-Linux`) |
 | `TMPDIR` | where the download is checked before it is installed; on a TMPDIR mounted noexec the check runs again next to the install folder |
 
-### While the repository is private
+### From a private fork
 
-The downloads need a token that can read it. With the GitHub CLI:
+The public repository needs no token. For a private fork, name it and give a token that can read it,
+e.g. with the GitHub CLI (`OWNER/FORK` is the fork):
 
 ```sh
-gh release download -R juricabi/elrs-crossfire-wifi-joystick-linux -p install.sh
-GITHUB_TOKEN=$(gh auth token) sudo --preserve-env=GITHUB_TOKEN sh install.sh
+gh release download -R OWNER/FORK -p install.sh
+GITHUB_TOKEN=$(gh auth token) ELRS_WIFI_JOYSTICK_REPO=OWNER/FORK \
+  sudo --preserve-env=GITHUB_TOKEN,ELRS_WIFI_JOYSTICK_REPO sh install.sh
 ```
 
 The script passes the token to curl on stdin (never on a command line) and only to api.github.com.
@@ -79,8 +81,8 @@ As root: `/usr/local/bin/elrs-wifi-joystick`, `/etc/udev/rules.d/60-elrs-wifi-jo
   the program must run here (`--version`) before it replaces anything (unless `--arch` or `--root` says
   it is for another machine). Files are installed atomically (a temporary file next to the target,
   then renamed) and flushed to disk; the list of installed files is written before them, so
-  `--uninstall` also removes what an interrupted install left. Downloads use curl, else wget (wget only
-  for a public repository).
+  `--uninstall` also removes what an interrupted install left. Downloads use curl, else wget (wget never
+  sends `GITHUB_TOKEN`).
 - With sudo, when the user who ran it also has a copy in `~/.local/bin` (installed without sudo), the
   script warns: that copy comes first on PATH; remove it with `sh install.sh --uninstall` as that user.
 - Exit codes: 0 done, 1 failed (nothing was installed when the download or its check failed),
@@ -89,7 +91,7 @@ As root: `/usr/local/bin/elrs-wifi-joystick`, `/etc/udev/rules.d/60-elrs-wifi-jo
 ## By hand
 
 1. Download `elrs-wifi-joystick-<version>-linux-<arch>` and `SHA256SUMS` from the
-   [releases](https://github.com/juricabi/elrs-crossfire-wifi-joystick-linux/releases), and check it:
+   [releases](https://github.com/juricabi/ELRS-Crossfire-WiFi-Joystick-Linux/releases), and check it:
    `sha256sum -c SHA256SUMS --ignore-missing`.
 2. Install it: `sudo install -m 0755 elrs-wifi-joystick-*-linux-<arch> /usr/local/bin/elrs-wifi-joystick`.
 3. Give access to `/dev/uinput`: `sudo sh install.sh --file elrs-wifi-joystick-*-linux-<arch>` does
@@ -142,8 +144,8 @@ Raspberry Pi OS: `sudo apt install build-essential`; Fedora: `sudo dnf install g
 Alpine: `apk add build-base linux-headers`).
 
 ```sh
-git clone https://github.com/juricabi/elrs-crossfire-wifi-joystick-linux
-cd elrs-crossfire-wifi-joystick-linux
+git clone https://github.com/juricabi/ELRS-Crossfire-WiFi-Joystick-Linux
+cd ELRS-Crossfire-WiFi-Joystick-Linux
 ./build.sh native prog                     # -> build/native/elrs-wifi-joystick
 sudo sh packaging/install.sh --file build/native/elrs-wifi-joystick
 ```

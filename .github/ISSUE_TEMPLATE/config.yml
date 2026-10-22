@@ -1,0 +1,11 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Security problem
+    url: https://github.com/juricabi/ELRS-Crossfire-WiFi-Joystick-Linux/security/advisories/new
+    about: Please report security problems privately, not in a public issue (see SECURITY.md).
+  - name: The Windows app
+    url: https://github.com/juricabi/ELRS-Crossfire-WiFi-Joystick-Windows/issues
+    about: Problems and ideas for ELRS-Crossfire-WiFi-Joystick-Windows belong to its own repository.
+  - name: StickTime Pi
+    url: https://github.com/juricabi/sticktime-pi/issues
+    about: The Raspberry Pi FPV simulator (it shares this program's protocol core) has its own issues.

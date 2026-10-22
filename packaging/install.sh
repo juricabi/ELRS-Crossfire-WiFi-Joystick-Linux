@@ -1,9 +1,9 @@
 #!/bin/sh
 # Install, update or remove elrs-wifi-joystick: the program, a udev rule that gives access to
 # /dev/uinput (the virtual joystick), the uinput module at boot, and optionally a systemd user service.
-# https://github.com/juricabi/elrs-crossfire-wifi-joystick-linux - MIT License.
+# https://github.com/juricabi/ELRS-Crossfire-WiFi-Joystick-Linux - MIT License.
 #
-#   curl -fsSLO https://github.com/juricabi/elrs-crossfire-wifi-joystick-linux/releases/latest/download/install.sh
+#   curl -fsSLO https://github.com/juricabi/ELRS-Crossfire-WiFi-Joystick-Linux/releases/latest/download/install.sh
 #   sudo sh install.sh            (or: sh install.sh --help)
 #
 # POSIX sh (dash, bash, busybox ash), standalone: it needs nothing next to it. Run it again to update.
@@ -12,7 +12,7 @@
 set -eu
 umask 022
 
-REPO=${ELRS_WIFI_JOYSTICK_REPO:-juricabi/elrs-crossfire-wifi-joystick-linux}
+REPO=${ELRS_WIFI_JOYSTICK_REPO:-juricabi/ELRS-Crossfire-WiFi-Joystick-Linux}
 APP=elrs-wifi-joystick
 RULE_NAME=60-elrs-wifi-joystick.rules
 MODLOAD_NAME=elrs-wifi-joystick-uinput.conf
@@ -27,11 +27,11 @@ RULE_TEXT='# elrs-wifi-joystick: write access to /dev/uinput, which it needs to 
 #   GROUP, MODE  members of the "input" group get it too (SSH logins, a service started at boot)
 #   static_node  the same permissions for /dev/uinput before the uinput module is loaded
 # Access to /dev/uinput lets that user'"'"'s programs create input devices (joysticks, also keyboards).
-# Installed by packaging/install.sh: https://github.com/juricabi/elrs-crossfire-wifi-joystick-linux
+# Installed by packaging/install.sh: https://github.com/juricabi/ELRS-Crossfire-WiFi-Joystick-Linux
 KERNEL=="uinput", SUBSYSTEM=="misc", TAG+="uaccess", GROUP="input", MODE="0660", OPTIONS+="static_node=uinput"'
 
 MODLOAD_TEXT='# Load the uinput kernel module at boot: elrs-wifi-joystick creates its virtual joystick with it.
-# Installed by packaging/install.sh: https://github.com/juricabi/elrs-crossfire-wifi-joystick-linux
+# Installed by packaging/install.sh: https://github.com/juricabi/ELRS-Crossfire-WiFi-Joystick-Linux
 uinput'
 
 # shellcheck disable=SC2016  # $USER is for the reader of the unit file
@@ -41,11 +41,11 @@ UNIT_TEXT='# elrs-wifi-joystick as a systemd user service: it runs while you are
 #   systemctl --user stop|start|restart elrs-wifi-joystick
 #   journalctl --user -u elrs-wifi-joystick -f       the log
 # Settings: the web page (http://127.0.0.1:11000/) or ~/.config/elrs-wifi-joystick/config.
-# https://github.com/juricabi/elrs-crossfire-wifi-joystick-linux
+# https://github.com/juricabi/ELRS-Crossfire-WiFi-Joystick-Linux
 
 [Unit]
 Description=ELRS / Crossfire WiFi joystick
-Documentation=https://github.com/juricabi/elrs-crossfire-wifi-joystick-linux
+Documentation=https://github.com/juricabi/ELRS-Crossfire-WiFi-Joystick-Linux
 
 [Service]
 Type=simple
@@ -81,8 +81,9 @@ root: the program in ~/.local/bin only; it prints the commands that need root. R
   -n, --dry-run    only print what would be done
   -h, --help       this help
 
-Environment: GITHUB_TOKEN (needed while the repository is private; needs curl; when it cannot read
-the release, the public download is tried), ELRS_WIFI_JOYSTICK_REPO (owner/name, default $REPO).
+Environment: GITHUB_TOKEN (optional, only for a private fork: a token that can read it; needs curl;
+when it cannot read the release, the public download is tried), ELRS_WIFI_JOYSTICK_REPO (owner/name,
+default $REPO).
 EOF
 }
 
@@ -548,7 +549,7 @@ ARCH=$ARCH_OPT
 if [ -z "$FILE" ]; then
   if [ -z "$ARCH" ]; then
     ARCH=$(uname_arch) || die "this machine ($(uname -m)) has no ready-made binary (there are: $ARCHES) - build it \
-from source: https://github.com/$REPO#building"
+from source: https://github.com/$REPO/blob/HEAD/docs/INSTALL.md#building-from-source"
   fi
 fi
 
@@ -608,13 +609,13 @@ else
   SUMS=$TMPD/SHA256SUMS
   VIA_API=0
   if [ -n "${GITHUB_TOKEN:-}" ] && [ "$DL" = curl ]; then
-    # private repository: the API names the assets; an asset is fetched by its id
+    # a token (a private fork): the API names the assets; an asset is fetched by its id
     if [ -n "$WANT" ]; then api=https://api.github.com/repos/$REPO/releases/tags/v$WANT
     else api=https://api.github.com/repos/$REPO/releases/latest; fi
     if fetch "$api" "$TMPD/release.json" api; then
       VIA_API=1
     else
-      # an expired token, or one exported for another account: a public repository needs none
+      # an expired token, or one exported for another account: the public download needs none
       warn "GITHUB_TOKEN cannot read release ${WANT:-latest} of $REPO (no such release, an expired token, or one \
 for another account): trying the public download"
     fi
@@ -639,15 +640,15 @@ for another account): trying the public download"
     fetch "https://api.github.com/repos/$REPO/releases/assets/$sums_id" "$SUMS" asset || die "cannot download SHA256SUMS of $tag"
     fetch "https://api.github.com/repos/$REPO/releases/assets/$bin_id" "$TMPD/$APP" asset || die "cannot download $NAME"
   else
-    tok="set GITHUB_TOKEN"
-    [ -z "${GITHUB_TOKEN:-}" ] || tok="GITHUB_TOKEN must be able to read it, and curl is needed"
+    tok="a private fork needs GITHUB_TOKEN"
+    [ -z "${GITHUB_TOKEN:-}" ] || tok="for a private fork, GITHUB_TOKEN must be able to read it, and curl is needed"
     if [ -n "$WANT" ]; then
       fetch "https://github.com/$REPO/releases/download/v$WANT/SHA256SUMS" "$SUMS" ||
-        die "cannot download release v$WANT of $REPO (no such release - or the repository is private: $tok)"
+        die "cannot download release v$WANT of $REPO (no such release, or no network; $tok)"
       VER=$WANT
     else
       fetch "https://github.com/$REPO/releases/latest/download/SHA256SUMS" "$SUMS" ||
-        die "cannot download the latest release of $REPO (none yet - or the repository is private: $tok)"
+        die "cannot download the latest release of $REPO (none yet, or no network; $tok)"
       # the asset names carry the version: the checksum list tells which one is the latest
       VER=$(awk '{ f = $2; sub(/^\*/, "", f); print f }' "$SUMS" |
             sed -n "s/^$APP-\\([0-9][0-9A-Za-z.+-]*\\)-linux-$ARCH\$/\\1/p" | head -n 1)

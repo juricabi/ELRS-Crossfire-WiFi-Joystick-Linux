@@ -3,8 +3,9 @@
  * getifaddrs). Everything else reaches them through the command queue (mu), the activation queue
  * (qmu) and the snapshot + log ring (smu).
  *
- * Ported from sticktime-pi host/src/input_wifi.c (socket, drain with kernel timestamps, worker,
- * activation logging, status text, gap log), which follows JoystickEngine.cs of the Windows app. */
+ * Ported from sticktime-pi host/src/input_wifi.c (the same author's, MIT here): the socket, the drain
+ * with kernel timestamps, the worker, activation logging, the status text and the gap log. That follows
+ * JoystickEngine.cs of the Windows app. */
 #include "engine.h"
 #include "hints.h"
 #include "joymap.h"

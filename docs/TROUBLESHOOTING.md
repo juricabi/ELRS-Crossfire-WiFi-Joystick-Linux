@@ -13,7 +13,7 @@ VelociDrone Mobile, so no software on the computer can work around it.
 | Component | Works | Broken |
 |-----------|-------|--------|
 | **Crossfire TX (XF)** | **6.31**, **6.36** | **6.42 public, 6.48 beta, 6.48 public** |
-| **WiFi module** | **v2.17** up to **v3.10** (v2.25 recommended) | **v3.20** |
+| **WiFi module** | **v2.17** up to **v3.10** (v2.25.49mb recommended) | **v3.20** |
 
 VelociDrone's developers confirmed the TX regression and reported it to TBS - see
 [TBS firmware breaks VelociDrone mobile wi-fi support](https://batcavegames.freshdesk.com/support/solutions/articles/16000225491).

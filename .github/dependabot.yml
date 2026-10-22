@@ -1,0 +1,7 @@
+# Keeps the GitHub Actions in .github/workflows up to date (a pull request a week at most).
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly

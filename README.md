@@ -153,7 +153,7 @@ When reporting issues, please include:
 
 <div align="center">
 
-**Made with ❤️ for the ExpressLRS community**
+**Made with ❤️ for the ExpressLRS community by [juricabi](https://github.com/juricabi)**
 
 [⭐ Star this repository](https://github.com/juricabi/ELRS-Crossfire-WiFi-Joystick-Linux/stargazers) if you find it helpful! · [☕ Buy me a coffee](https://ko-fi.com/juricabi)
 

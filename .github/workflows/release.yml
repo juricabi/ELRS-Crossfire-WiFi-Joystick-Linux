@@ -84,6 +84,7 @@ jobs:
               riscv64) run=qemu-riscv64-static ;;
             esac
             said=$($run "$dst" --version)
+            said=${said%%$'\n'*}        # its first line (then the project's links)
             echo "$a: $said"
             [ "$said" = "elrs-wifi-joystick $VER" ] || { echo "::error::$dst says \"$said\""; exit 1; }
           done

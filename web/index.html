@@ -128,7 +128,17 @@ details.card[open] > summary { margin-bottom: 10px; }
 }
 .log .t { color: var(--muted); }
 .log .gap { color: var(--muted); font-style: italic; }
-footer { padding: 4px 0 24px; font-size: 12.5px; color: var(--muted); }
+/* ---- the footer: the version, and links that open in a new tab (nothing is loaded from them) */
+footer.wrap {
+  display: flex; flex-wrap: wrap; align-items: baseline; justify-content: space-between; gap: 2px 18px;
+  padding-top: 0; padding-bottom: 20px; font-size: 12.5px; color: var(--muted);
+}
+.links { display: flex; flex-wrap: wrap; gap: 0 16px; }
+.links a {
+  display: inline-block; padding: 4px 0; border-radius: 3px; color: inherit;
+  text-decoration: underline; text-decoration-color: var(--line-2); text-underline-offset: 3px;
+}
+.links a:hover { color: var(--fg); text-decoration-color: currentColor; }
 
 @media (max-width: 560px) {
   .wrap { padding: 0 10px; }
@@ -229,7 +239,15 @@ footer { padding: 4px 0 24px; font-size: 12.5px; color: var(--muted); }
     <div class="log" id="log" role="log" tabindex="0" aria-labelledby="hLog"></div>
   </section>
 </main>
-<footer class="wrap" id="foot">elrs-wifi-joystick</footer>
+<footer class="wrap" id="foot">
+  <span id="ver">elrs-wifi-joystick</span>
+  <nav class="links" aria-label="About">
+    <a href="https://github.com/juricabi/ELRS-Crossfire-WiFi-Joystick-Linux" target="_blank" rel="noopener noreferrer" aria-describedby="newTab">Project on GitHub</a>
+    <span>Made by <a href="https://github.com/juricabi" target="_blank" rel="noopener noreferrer" aria-describedby="newTab">juricabi</a></span>
+    <a href="https://ko-fi.com/juricabi" target="_blank" rel="noopener noreferrer" aria-describedby="newTab">Support on Ko-fi</a>
+  </nav>
+  <span id="newTab" hidden>opens in a new tab</span>
+</footer>
 
 <script>
 'use strict';
@@ -640,7 +658,7 @@ footer { padding: 4px 0 24px; font-size: 12.5px; color: var(--muted); }
     for (const [k] of COUNTERS) setText(cnt[k], String(s.counters[k]));
     setText(cnt.listening, s.config.port + (s.listening ? ' (listening)' : s.running ? ' (not bound yet)' : ' (stopped)'));
     setText(cnt.uptime, uptimeText(s.uptime_s));
-    setText($('foot'), 'elrs-wifi-joystick ' + s.version + ' · ' + location.host);
+    setText($('ver'), 'elrs-wifi-joystick ' + s.version + ' · ' + location.host);
     /* the program was restarted (another instance, whatever its uptime): start the log over, read the
        settings again */
     if (lastInstance !== null && s.instance !== lastInstance) { loadInfo().catch(() => {}); resetLog(); }

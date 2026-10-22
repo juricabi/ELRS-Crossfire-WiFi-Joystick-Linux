@@ -122,7 +122,7 @@ int main(int argc, char **argv) {
   }
   switch (a.action) {
     case CFG_HELP: cfg_print_help(stdout); return 0;
-    case CFG_VERSION: printf("elrs-wifi-joystick %s\n", APP_VERSION); return 0;
+    case CFG_VERSION: cfg_print_version(stdout, APP_VERSION); return 0;
     case CFG_LIST_RATES: cfg_print_rates(stdout); return 0;
     case CFG_RUN: break;
   }

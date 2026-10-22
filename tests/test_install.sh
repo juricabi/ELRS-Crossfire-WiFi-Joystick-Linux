@@ -55,6 +55,7 @@ check() {  # description command...
   if "$@"; then pass "$ck_d"; else fail "$ck_d"; fi
 }
 has() { grep -qF -- "$1" "$OUT"; }
+has_line() { grep -qxF -- "$1" "$OUT"; }
 hasnt() { ! grep -qF -- "$1" "$OUT"; }
 logged() { grep -qF -- "$1" "$LOG"; }
 not_logged() { ! grep -qF -- "$1" "$LOG"; }
@@ -195,14 +196,16 @@ cp "$FAKE"/* "$W/nosystemctl/"
 rm "$W/nosystemctl/systemctl"
 
 # ------------------------------------------------------------------ the fake GitHub
+# what the program's --version says after its "elrs-wifi-joystick <version>" line (install.sh reads line 1)
+LINKS="https://github.com/juricabi/ELRS-Crossfire-WiFi-Joystick-Linux - Ko-fi: https://ko-fi.com/juricabi"
 fakebin() {  # out version arch [runs|norun|noexec-tmp|noexec]
   case ${4:-runs} in
     runs)
-      printf '#!/bin/sh\n# fake %s %s for %s\n[ "${1:-}" = --version ] && echo "%s %s"\nexit 0\n' "$APP" "$2" "$3" "$APP" "$2" > "$1" ;;
+      printf '#!/bin/sh\n# fake %s %s for %s\n[ "${1:-}" = --version ] && printf "%%s\\n" "%s %s" "%s"\nexit 0\n' "$APP" "$2" "$3" "$APP" "$2" "$LINKS" > "$1" ;;
     norun)
       printf '#!/bin/sh\n# fake %s that does not run here\necho "Illegal instruction" >&2\nexit 132\n' "$APP" > "$1" ;;
     noexec-tmp)   # what exec does from a TMPDIR mounted noexec: refused there (126), fine elsewhere
-      printf '#!/bin/sh\ncase $0 in "%s"/*) echo "$0: Permission denied" >&2; exit 126 ;; esac\n[ "${1:-}" = --version ] && echo "%s %s"\nexit 0\n' "$W/tmp" "$APP" "$2" > "$1" ;;
+      printf '#!/bin/sh\ncase $0 in "%s"/*) echo "$0: Permission denied" >&2; exit 126 ;; esac\n[ "${1:-}" = --version ] && printf "%%s\\n" "%s %s" "%s"\nexit 0\n' "$W/tmp" "$APP" "$2" "$LINKS" > "$1" ;;
     noexec)
       printf '#!/bin/sh\necho "$0: Permission denied" >&2\nexit 126\n' > "$1" ;;
   esac
@@ -387,7 +390,8 @@ case_system_latest() {
   check "record" record_is "$R/usr/local/share/$APP/installed" "file /usr/local/bin/$APP" \
     "file /etc/udev/rules.d/60-$APP.rules" "file /etc/modules-load.d/$APP-uinput.conf"
   check "checksum checked" has "Checksum OK"
-  check "version shown" has "Version: 1.2.3"
+  check "version shown" has_line "Version: 1.2.3"
+  check "version = the release's" hasnt "but the program says"
   check "--root: modprobe skipped" has "skipped (--root): modprobe uinput"
   check "--root: udevadm skipped" has "skipped (--root): udevadm control --reload"
   check "nothing loaded" not_logged modprobe
@@ -426,7 +430,7 @@ case_versions_and_update() {
   inst --root "$R" --version v1.2.3
   check "--version v1.2.3 (with v): exit 0" rc_is 0
   check "update: replaced" same "$R/usr/local/bin/$APP" "$BINREL/v1.2.3/$APP-1.2.3-linux-armv7"
-  check "update: says what it replaces" has "Replacing 1.1.0"
+  check "update: says what it replaces" has_line "Replacing 1.1.0 in $R/usr/local/bin/$APP"
   check "update: the record is the same" record_is "$R/usr/local/share/$APP/installed" "file /usr/local/bin/$APP" \
     "file /etc/udev/rules.d/60-$APP.rules" "file /etc/modules-load.d/$APP-uinput.conf"
   inst --root "$R" --version 9.9.9
@@ -506,7 +510,7 @@ case_bad_downloads() {
   inst --user --file "$W/nxtmp"
   check "TMPDIR noexec: exit 0" rc_is 0
   check "TMPDIR noexec: installed" same "$T_HOME/.local/bin/$APP" "$W/nxtmp"
-  check "TMPDIR noexec: version shown" has "Version: 1.2.3"
+  check "TMPDIR noexec: version shown" has_line "Version: 1.2.3"
   check "TMPDIR noexec: no check file left" files_are "$T_HOME" "./.local/bin/$APP" "./.local/share/$APP/installed"
   fakebin "$W/nx" 1.2.3 x86_64 noexec
   rm -rf "$T_HOME"
@@ -592,7 +596,7 @@ case_file() {
   check "--file: exit 0" rc_is 0
   check "--file: installed" same "$R/usr/local/bin/$APP" "$W/mybin"
   check "--file: executable" mode_is "$R/usr/local/bin/$APP" -rwxr-xr-x
-  check "--file: version shown" has "Version: 7.0.0"
+  check "--file: version shown" has_line "Version: 7.0.0"
   check "--file: no download" not_logged curl
   check "--file: the source is untouched" mode_is "$W/mybin" -rw-r--r--
 }

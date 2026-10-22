@@ -218,9 +218,11 @@ def case_version_help_rates():
     code, out, err = run_simple(["--version"])
     check(code == 0, "--version exit %d" % code)
     want = open(os.path.join(ROOT, "VERSION")).read().strip()
-    check(out.strip() == "elrs-wifi-joystick " + want, "--version printed %r" % out)
+    # line 1 is what install.sh and release.yml read; then the project and Ko-fi
+    links = "https://github.com/juricabi/ELRS-Crossfire-WiFi-Joystick-Linux - Ko-fi: https://ko-fi.com/juricabi"
+    check(out == "elrs-wifi-joystick %s\n%s\n" % (want, links), "--version printed %r" % out)
     code, out, _ = run_simple(["-V"])
-    check(code == 0 and want in out, "-V")
+    check(code == 0 and out.splitlines()[0] == "elrs-wifi-joystick " + want, "-V")
     code, out, _ = run_simple(["--list-rates"])
     check(code == 0, "--list-rates exit")
     for hz, us in ((1000, 1000), (500, 2000), (333, 3000), (250, 4000), (200, 5000), (150, 6667), (100, 10000),
@@ -232,6 +234,7 @@ def case_version_help_rates():
     for opt in ("--module", "--rate", "--interval", "--channels", "--port", "--http-port", "--web", "--no-web",
                 "--no-joystick", "--no-buttons", "--name", "--config", "--no-config", "--daemon", "--list-rates"):
         check(opt in out, "--help lacks " + opt)
+    check(out.endswith("\n" + links + "\n"), "--help does not end with the links: %r" % out[-200:])
 
 
 def case_bad_options():

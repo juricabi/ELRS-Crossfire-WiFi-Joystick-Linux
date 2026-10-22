@@ -8,7 +8,8 @@ follow the sticks (CH9-16 as buttons with the joystick's hysteresis), the rate a
 offer exactly the supported values, applying a change works and errors show inline, Crossfire
 disables rate/channels with its note, start/stop, restart, the log panel (autoscroll unless scrolled
 up), polling only while visible, phone width without sideways scrolling, light and dark, keyboard
-use, no layout shift while numbers change, and the lost-connection banner.
+use, no layout shift while numbers change, the footer's links (a new tab; nothing is loaded from them or
+from anywhere but the program), and the lost-connection banner.
 
     python3 tests/test_ui.py [--demo | --real] [-k name]
 Environment: BIN (the program), CC (for the demo), CHROMIUM (a Chromium binary, when Playwright's own
@@ -28,6 +29,7 @@ import threading
 import time
 import traceback
 import urllib.error
+import urllib.parse
 import urllib.request
 
 from playwright.sync_api import expect, sync_playwright
@@ -38,6 +40,9 @@ sys.path.insert(0, HERE)
 import fake_elrs  # noqa: E402
 
 PRESETS = [1000, 2000, 3000, 4000, 5000, 6667, 10000, 20000]
+# the footer's links: text, href
+FOOT_LINKS = [("Project on GitHub", "https://github.com/juricabi/ELRS-Crossfire-WiFi-Joystick-Linux"),
+              ("juricabi", "https://github.com/juricabi"), ("Support on Ko-fi", "https://ko-fi.com/juricabi")]
 RATE_TEXTS = ["1000 Hz (1 ms)", "500 Hz (2 ms)", "333 Hz (3 ms)", "250 Hz (4 ms) – default", "200 Hz (5 ms)",
               "150 Hz (6.667 ms)", "100 Hz (10 ms)", "50 Hz (20 ms)"]
 
@@ -304,7 +309,7 @@ def t_load(br, h):
     expect(p.locator("#pps")).to_have_text(re.compile(r"^\d+$"))
     expect(p.locator("#ask")).to_have_text(re.compile(r"^asked 250 Hz × 16 ch – getting 2[0-9]{2} Hz × 16 ch$"))
     assert "Connected - streaming" in p.title()
-    expect(p.locator("#foot")).to_contain_text("elrs-wifi-joystick ")
+    expect(p.locator("#ver")).to_have_text(re.compile(r"^elrs-wifi-joystick \S+ · 127\.0\.0\.1:\d+$"))
     expect(p.locator("#log")).to_contain_text("Listening for joystick data on UDP", timeout=3000)
     # accessible names of the controls
     for label in ("Module IP", "Rate", "Channels", "UDP port"):
@@ -874,6 +879,55 @@ def t_counters(br, h):
     pg.close()
 
 
+def t_footer(br, h):
+    """the footer: the version, the project, author and Ko-fi links (a new tab, no opener, no referrer, the
+    page's focus ring); the page loads nothing but from the program"""
+    pg = Page(br, h.url)
+    p = pg.page
+    # never the internet: a stub answers what is not the program (only a link that is followed may ask)
+    outside = []
+
+    def stub(route):
+        outside.append((route.request.url, route.request.headers.get("referer")))
+        route.fulfill(status=200, content_type="text/html", body="<!doctype html><title>stub</title>")
+    pg.ctx.route(re.compile(r"^(?!http://127\.0\.0\.1:)"), stub)
+    wait_streaming_page(pg, h)
+    version = http(h.url, "/api/status")[1]["version"]
+    expect(p.locator("#ver")).to_have_text(f"elrs-wifi-joystick {version} · {urllib.parse.urlsplit(h.url).netloc}")
+    links = p.locator("#foot a")
+    expect(links).to_have_count(len(FOOT_LINKS))
+    got = links.evaluate_all("as => as.map(a => [a.textContent, a.getAttribute('href'), a.target, a.rel])")
+    assert got == [[t, u, "_blank", "noopener noreferrer"] for t, u in FOOT_LINKS], got
+    for t, _ in FOOT_LINKS:
+        expect(p.get_by_role("link", name=t, exact=True)).to_have_accessible_description("opens in a new tab")
+    # the keyboard: after the log, Tab reaches each one, with the outline of the rest of the page
+    p.locator("#log").focus()
+    for t, u in FOOT_LINKS:
+        p.keyboard.press("Tab")
+        assert p.evaluate("document.activeElement.href") == u, (t, p.evaluate("document.activeElement.outerHTML"))
+        ring = p.evaluate("() => { const s = getComputedStyle(document.activeElement); return [s.outlineStyle, s.outlineWidth]; }")
+        assert ring == ["solid", "2px"], (t, ring)
+    # nothing came from anywhere else so far (no image, font or script of GitHub or Ko-fi)
+    p.wait_for_timeout(500)
+    assert not outside, outside
+    other = [u for _, _, u in pg.requests if not u.startswith(h.url)]
+    assert not other, other
+    # a click opens a new tab, without this page as its opener nor its address as the referrer; this page stays
+    with pg.ctx.expect_page() as new:
+        p.get_by_role("link", name="Support on Ko-fi").click()
+    tab = new.value
+    tab.wait_for_load_state()
+    assert tab.url == "https://ko-fi.com/juricabi", tab.url
+    assert tab.evaluate("window.opener") is None
+    assert outside == [("https://ko-fi.com/juricabi", None)], outside
+    tab.close()
+    assert p.url == h.url, p.url
+    wait_streaming_page(pg, h)
+    assert not [u for _, _, u in pg.requests if not u.startswith(h.url)]
+    assert not pg.problems(), pg.problems()
+    pg.close()
+
+
 def t_offline(br, h):
     """the program goes away: the banner says so (last: it ends the program)"""
     pg = Page(br, h.url)
@@ -891,7 +945,7 @@ def t_offline(br, h):
 
 TESTS = [t_load, t_bars, t_selects, t_apply, t_errors, t_crossfire, t_start_stop, t_restart, t_log, t_visibility,
          t_phone, t_keyboard, t_no_shift, t_joystick, t_states, t_restart_deferred, t_restart_keeps_unapplied,
-         t_log_restart, t_counters, t_offline]
+         t_log_restart, t_counters, t_footer, t_offline]
 
 
 def chromium(pw):

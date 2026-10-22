@@ -87,6 +87,8 @@ default $REPO).
 EOF
 }
 
+NL='
+'                           # a newline
 say() { printf '%s\n' "$*"; }
 warn() { printf 'WARNING: %s\n' "$*" >&2; }
 die() { printf 'install.sh: %s\n' "$*" >&2; exit 1; }
@@ -687,9 +689,10 @@ if [ -n "$NEWBIN" ]; then
     rm -f "$PENDING"
     PENDING=
   fi
-  if [ "$rv" = 0 ] && [ "${out%% *}" = "$APP" ]; then
-    say "Version: ${out#"$APP "}"
-    [ -z "$VER" ] || [ "${out#"$APP "}" = "$VER" ] || warn "the release is $VER but the program says ${out#"$APP "}"
+  ver=${out%%"$NL"*}           # its first line: "elrs-wifi-joystick <version>" (then the project's links)
+  if [ "$rv" = 0 ] && [ "${ver%% *}" = "$APP" ]; then
+    say "Version: ${ver#"$APP "}"
+    [ -z "$VER" ] || [ "${ver#"$APP "}" = "$VER" ] || warn "the release is $VER but the program says ${ver#"$APP "}"
   elif [ -z "$ROOT" ] && [ -z "$ARCH_OPT" ]; then
     why=${out:-no output}
     [ "$rv" != 126 ] || why="$why - it may not be executed there: is $ROOT$BIN_DIR on a file system mounted noexec?"
@@ -697,7 +700,7 @@ if [ -n "$NEWBIN" ]; then
   else
     say "(not run here: it may be for another machine)"
   fi
-  if [ -x "$ROOT$BIN" ] && old=$("$ROOT$BIN" --version 2>/dev/null) && [ "${old%% *}" = "$APP" ]; then
+  if [ -x "$ROOT$BIN" ] && old=$("$ROOT$BIN" --version 2>/dev/null) && old=${old%%"$NL"*} && [ "${old%% *}" = "$APP" ]; then
     say "Replacing ${old#"$APP "} in $ROOT$BIN"
   fi
 fi

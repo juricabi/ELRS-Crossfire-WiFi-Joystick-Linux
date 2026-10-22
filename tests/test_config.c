@@ -660,6 +660,17 @@ static void texts(void) {
                                       "--web", "--no-web", "--no-joystick", "--no-buttons", "--name", "--config",
                                       "--no-config", "--daemon", "--list-rates", "--version", "--help" };
   for (size_t i = 0; i < sizeof opts / sizeof opts[0]; i++) CHECK(strstr(buf, opts[i]) != NULL);
+  /* the last line: the project and Ko-fi */
+  static const char links[] = "https://github.com/juricabi/ELRS-Crossfire-WiFi-Joystick-Linux - Ko-fi: https://ko-fi.com/juricabi\n";
+  size_t n = strlen(buf);
+  CHECK(n > sizeof links && strcmp(buf + n - (sizeof links - 1), links) == 0 && buf[n - sizeof links] == '\n');
+  /* --version: the first line is what install.sh and release.yml read */
+  f = fmemopen(buf, sizeof buf, "w");
+  cfg_print_version(f, "1.2.3-rc1");
+  fclose(f);
+  char want[256];
+  snprintf(want, sizeof want, "elrs-wifi-joystick 1.2.3-rc1\n%s", links);
+  CHECK_STR(buf, want);
   f = fmemopen(buf, sizeof buf, "w");
   cfg_print_rates(f);
   fclose(f);

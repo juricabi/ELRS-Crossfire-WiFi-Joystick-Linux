@@ -17,6 +17,10 @@
 #include "engine.h"
 
 #define CFG_APP "elrs-wifi-joystick"
+#define CFG_PROJECT_URL "https://github.com/juricabi/ELRS-Crossfire-WiFi-Joystick-Linux"
+#define CFG_KOFI_URL "https://ko-fi.com/juricabi"
+/* the last line of --help and --version (web/index.html's footer has the same links) */
+#define CFG_LINKS CFG_PROJECT_URL " - Ko-fi: " CFG_KOFI_URL
 
 typedef struct {
   eng_config_t eng;         /* the live settings */
@@ -98,5 +102,7 @@ int  cfg_save(const char *path, const eng_config_t *c, unsigned keys, char *err,
 /* ---- text ---- */
 void cfg_print_help(FILE *f);
 void cfg_print_rates(FILE *f);
+/* "elrs-wifi-joystick <version>", then CFG_LINKS. install.sh and release.yml read the first line only. */
+void cfg_print_version(FILE *f, const char *version);
 
 #endif

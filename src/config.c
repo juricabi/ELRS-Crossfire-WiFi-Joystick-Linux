@@ -741,7 +741,12 @@ void cfg_print_help(FILE *f) {
         "Keys while running: s start/stop, t module IP, r rate, c channels, p UDP port, a restart the stream,\n"
         "w web address, h help, q quit. With stdin not a terminal, the same as lines: start, stop, t <ip>,\n"
         "rate <hz>, interval <us>, channels <n>, port <n>, restart, status, quit.\n"
-        "Exit codes: 0 ok, 1 error, 2 bad options, 3 already running.\n", f);
+        "Exit codes: 0 ok, 1 error, 2 bad options, 3 already running.\n"
+        CFG_LINKS "\n", f);
+}
+
+void cfg_print_version(FILE *f, const char *version) {
+  fprintf(f, CFG_APP " %s\n" CFG_LINKS "\n", version);
 }
 
 void cfg_print_rates(FILE *f) {

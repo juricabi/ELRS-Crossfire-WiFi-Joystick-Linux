@@ -4,12 +4,15 @@
 # apt-get update and install for the CI jobs. The downloads go through retry: a stalled mirror is cut off
 # and tried again (stalled connections also give up after 30 s inside apt). dpkg then installs from the
 # downloaded files, so a try is never cut off halfway through an install.
+# The package download is what stalls on some runners (qemu-user-static: a try stuck for 180 s, the next
+# one done in seconds; up to 2 stalled tries in a row seen), so it gets 5 tries, and -q (not -qq) logs
+# each file it fetches and from where.
 set -eu
 retry=$(dirname "$0")/retry
-opts="-o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 -qq"
+opts="-o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30"
 # shellcheck disable=SC2086  # $opts: options without spaces, one word each
-"$retry" 3 120 apt-get $opts update
+"$retry" 3 120 apt-get $opts -qq update
 # shellcheck disable=SC2086
-"$retry" 3 180 apt-get $opts -y --no-install-recommends install --download-only "$@"
+"$retry" 5 180 apt-get $opts -q -y --no-install-recommends install --download-only "$@"
 # shellcheck disable=SC2086
-apt-get $opts -y --no-install-recommends install "$@"
+apt-get $opts -qq -y --no-install-recommends install "$@"

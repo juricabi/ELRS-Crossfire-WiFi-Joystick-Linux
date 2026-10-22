@@ -45,7 +45,9 @@ RUN="qemu-aarch64-static" ./build.sh aarch64 test    # unit tests of another arc
 - **Unit tests**: `core/tests/test_*.c` and `tests/test_*.c`, e.g. `./build.sh native test test_joymap`
   for one.
 - **`tests/e2e.py [-v] [case ...]`**: the real binary (`--no-joystick`) against fake modules on
-  127.0.0.2 and 127.0.0.3; Python standard library only. `BIN` = the binary (default
+  127.0.0.2 and 127.0.0.3; Python standard library only. The cases include job control (the program
+  under a small job-control shell on a pseudo terminal), signals, closed std fds and a closed stdout
+  pipe. `BIN` = the binary (default
   `build/native/elrs-wifi-joystick`), `RUN` = a prefix like build.sh's
   (`RUN=qemu-aarch64-static BIN=build/aarch64/elrs-wifi-joystick`).
 - **`tests/uinput_e2e.py [--require] [-v]`**: needs write access to `/dev/uinput` and read access to
@@ -56,9 +58,12 @@ RUN="qemu-aarch64-static" ./build.sh aarch64 test    # unit tests of another arc
   `--demo` / `--real` force one. Environment: `BIN`, `CC` (for the demo), `CHROMIUM` (a Chromium
   binary, when Playwright's own download is missing), `HEADED=1` (watch it).
 - **`tests/test_install.sh [-v]`**: no root and no network (fake system commands, a fake GitHub). Every
-  case runs under each shell found among sh, dash, bash --posix and busybox sh (`SHELLS="dash"` picks;
-  a busybox sh with its own `id`/`uname` applets only gets a smoke test). A pass with busybox's tools
-  (sed, awk, grep, ...) runs when a busybox is installed; `BUSYBOX=/path/to/busybox` picks one.
+  case runs under each shell found among sh, dash, bash --posix and busybox sh (`SHELLS` picks, one per
+  line, a name on PATH or a path with its arguments: `SHELLS="dash"`, `SHELLS="/usr/bin/busybox sh"`; a
+  busybox built with standalone applets (busybox-static) runs its own `id`/`uname`, not the fakes, so it
+  only gets a smoke test; the dynamic `busybox` package gets the full suite, which CI runs). A pass with
+  busybox's tools (sed, awk, grep, ...) runs when a busybox is installed; `BUSYBOX=/path/to/busybox`
+  picks one.
 
 `tests/fake_elrs.py` is the fake module the tests use; it also runs as a program, as a fake module
 next to a real machine (its header comment has the options). `tests/web_demo.c` serves the real page
@@ -72,17 +77,22 @@ GitHub Actions (`.github/workflows/build.yml`) runs all of it on every push and 
 |---|---|
 | native | the unit tests with gcc and clang under ASan and UBSan (warnings are errors), then `tests/e2e.py` |
 | uinput | the virtual joystick through a real kernel, with the udev rule installed by `install.sh`, then the systemd user service and `--uninstall` |
-| static | the six static binaries, with every unit test under qemu-user on an old CPU of each target (and natively for x86_64 and i686); uploaded as artifacts |
+| static | the six static binaries, with every unit test under qemu-user on an old CPU of each target (riscv64: sifive-u54, plain RV64GC; and natively for x86_64 and i686); the checked binaries uploaded as artifacts |
 | web | the web page in Chromium, against the program and against the demo |
 | core | `core/` compiled for Windows and macOS |
-| scripts | shellcheck, the installer tests, actionlint, Python syntax |
+
+zig comes from its PyPI wheel, installed with `pip --require-hashes` against `ZIG_SHA256` in build.yml
+(update it together with `ZIG_VERSION`).
+| scripts | shellcheck, the installer tests (sh, dash, bash --posix and busybox ash, each the full suite), actionlint, Python syntax |
 
 ## Releases
 
 A tag `vX.Y.Z` that matches `VERSION` publishes a release with the six binaries, `install.sh` and
 `SHA256SUMS` (`.github/workflows/release.yml`). It runs all of build.yml first; a version with a `-`
 (`1.1.0-rc1`) is published as a pre-release, and running it again for the same tag replaces the assets
-and the notes.
+and the notes. After publishing, release.yml installs the release with install.sh (through the API with
+the token, and from the public URLs when the repository is public) and checks that what it installed is
+the published binary, byte for byte.
 
 1. Set the new version in `VERSION`, commit it and push.
 2. Tag that commit and push the tag: `git tag v1.1.0 && git push origin v1.1.0`.

@@ -73,17 +73,18 @@ bars for CH1..CH8 and marks for the 8 buttons. Keys (upper or lower case):
 | `r` | prompt for the rate (the presets, or 10..1000 Hz) |
 | `c` | prompt for the channels (4..16) |
 | `p` | prompt for the UDP port |
-| `a` | restart the stream: send our request again (ELRS: `joystick_end`, then `joystick_begin`, after up to 20 s while the module's kind is not known, see [the request](#the-request-rate-and-channels); Crossfire, known by its beacon: nothing is sent) |
+| `a` | restart the stream: send our request again (`joystick_end`, then `joystick_begin`; after up to 20 s while a streaming module's kind is not known; Crossfire streaming to the program: nothing is sent; the module IP of a module that does not stream to the program and is not known as ELRS: only `joystick_begin`), see [the request](#the-request-rate-and-channels) |
 | `w` | print the web page's address |
 | `h`, `?` | help |
 | `q`, Ctrl+C | quit (the joystick is centered and removed) |
 
 In a prompt, Enter alone keeps the value (for `t` it means "find it by its broadcast"), and Esc then
 Enter cancels; the rest of an answer longer than the prompt takes (a paste) is dropped, never run as keys.
-The terminal is restored on exit, on every signal (also `Ctrl+\`) and around Ctrl+Z. Ctrl+Z stops
-listening first (the joystick is centered: nothing stays held while the program is stopped) and listens
-again after `fg` or `bg`; in the background it neither reads the keys nor draws (the log lines wait for
-`fg`), and `kill %1` ends it.
+The terminal is restored on exit, on every signal (also `Ctrl+\`, SIGQUIT) and around Ctrl+Z. Ctrl+Z
+stops listening first, so the joystick is centered while the program is stopped ("Suspended: not
+listening (the joystick is centered) until the program goes on (fg)"); it listens again after `fg` or
+`bg`. In the background (after `bg`, or started with `&`) it neither reads the keys nor draws the status
+line: it runs on, its log lines show after `fg`, and `kill %1` ends it.
 
 **Not interactive** (stdin or stdout is not a terminal, or it runs in the background): log lines with
 the time, and a plain status line every 2 s while streaming, for example
@@ -94,11 +95,12 @@ the time, and a plain status line every 2 s while streaming, for example
 
 Commands are then read from stdin, one per line (case does not matter, a UTF-8 byte order mark before
 the first one is ignored, an unknown command prints an error line). The end of stdin ends the commands,
-not the program, so `elrs-wifi-joystick < /dev/null` keeps running. A terminal stdin is not read while
-the program runs in the background (`elrs-wifi-joystick &`): that would stop it; it is read after `fg`.
-Commands in a row see each other (`s` twice is a stop, then a start; `status` after `stop` says
-stopped). With stdout a pipe (`| grep ...`, `| head`) the program quits when the reader of the pipe is
-gone (not with `--daemon`).
+not the program, so `elrs-wifi-joystick < /dev/null` keeps running. A terminal stdin is read only while
+the program is in the foreground: started with `&`, it reads its commands after `fg`. Commands in a row
+see each other (`s` twice is a stop, then a start; `status` right after `stop` says stopped). A value
+already in effect is said so and changes nothing ("Asking for 8 channels already", "Listening on UDP port
+11000 already", or while stopped "The UDP port is 11000 already (used when listening starts)"). When
+stdout is a pipe whose reader goes away (`| head -5`), the program quits (not with `--daemon`).
 
 | command | |
 |---|---|
@@ -123,12 +125,16 @@ streaming, and stdin is not read. This is what the service runs ([INSTALL.md](IN
 `http://127.0.0.1:11000/` by default: the sticks and buttons live, the rate and jitter, the module, the
 request (rate and channels, with the supported values), the module IP and ports, start / stop /
 restart, and the log. It polls the program 10 times a second while it is visible and loads nothing
-from the internet. Changes apply at once and are saved like the keys' changes.
+from the internet. When the program restarts, the page starts its log over and reads the settings again.
+Changes apply at once and are saved like the keys' changes.
 
 It accepts requests only for `localhost`, `127.0.0.1`, `[::1]` or an IPv4 address in the `Host`
 header, refuses other sites' pages (`Origin`), and answers changes only to `application/json`
 requests, so other web pages in your browser cannot use it. With `--web 0.0.0.0:11000` anyone on your
-network can open it and change the settings: there is no password. The API is in [WEB_API.md](WEB_API.md).
+network can open it and change the settings: there is no password. Opened by a host name
+(`http://raspberrypi.local:11000/` with `--web 0.0.0.0:11000`), it shows a short page that says to open
+it by the IP address instead (e.g. `http://192.168.1.20:11000/`): host names are refused to keep other
+web sites out (DNS rebinding). The API is in [WEB_API.md](WEB_API.md).
 
 ## Settings file
 
@@ -163,7 +169,9 @@ web = 127.0.0.1:11000
   commands, web page): the first line of such a key gets the new value and its later lines are dropped.
   Every other line stays as it is. A new file starts with a short explanation.
 - Writes are atomic (a temporary file next to it, flushed to disk, then renamed); the folder is
-  created when needed, a symlinked file is written where the link points, and the file keeps its mode.
+  created when needed, a symlinked file is written where the link points (also when that file does not
+  exist yet); an existing file keeps its mode, a new one gets 0666 minus the umask (0644 with the usual
+  umask 022).
   If the file cannot be written, the change still applies and the log says why it was not saved.
 
 ## The request: rate and channels
@@ -181,28 +189,57 @@ is **250 Hz and 16 channels**, the same as the Windows app.
 
 - **ExpressLRS** (3.4.0 and later) streams what it is asked for, but takes a new request only while it
   is not streaming: a request to a streaming module just moves the stream. So when you change the rate
-  or the channels with the keys, the stdin commands or the web page while an ELRS module streams, the
-  program restarts its stream (`joystick_end`, then `joystick_begin`).
+  or the channels (keys, stdin commands, web page) while a module that is surely ELRS streams to the
+  program - known by its beacon, or streaming a channel count other than 16, which Crossfire never
+  sends - the program restarts its stream at once: `joystick_end`, then `joystick_begin` with the new
+  values ("Restarting the stream of <ip>: 500 Hz, 16 channels").
+- **Crossfire / Tracer** starts on the same request but ignores the rate and the channel count: it
+  always sends 16 channels at about 90 Hz. A module known as Crossfire by its beacon is never sent
+  `joystick_end` (what Crossfire does with it is unknown): a change while it streams is only logged, once
+  per session ("Crossfire module <ip> ignores the rate and channel count ...").
+- **A module of unknown kind** that streams 16 channels and sent no beacon (ELRS beacons only while it
+  is not streaming, so an ELRS module still streaming from before has sent none) might be Crossfire. Its
+  restart (a change, `a`, or one of the cases below) waits until 20 s after the program locked on to it,
+  and is dropped when a Crossfire beacon arrives first; the log says so ("<ip> may be Crossfire (no beacon
+  from it yet) ..."). Crossfire beacons about every 8 s also while streaming, so after 20 s without one
+  it is taken as ELRS. A restart waiting like this is kept when the module goes quiet and goes out when it
+  streams to the program again (after its 20 s); it is dropped when the module's ELRS beacon meanwhile
+  gets it a `joystick_begin` with the request, or when another module takes over.
+- **A change while the module does not stream to the program** (during its activation, a WiFi dropout
+  of more than 3 s, a stop, or before switching the module IP to it) goes into its next
+  `joystick_begin`. The program remembers what it last asked each module and what their beacons said
+  (up to 8 modules, never forgetting the kind of the one streaming now), and keeps both across a stop and
+  start or a port change (those clear the lock, the 5 s limits and waiting restarts): a module that
+  streams to the program again with an older request (it streams on through those) is restarted then, by
+  the rules above ("<ip> still streams 250 Hz, 16 channels from before the change - restarting its
+  stream with ...").
 - **At startup** the values from the command line and the settings file only set the next
   `joystick_begin`. A module still streaming from before (it keeps streaming after the program quits,
   below) keeps its old rate: press `a` (or restart in the web page) to apply them. Only a different
-  channel count is fixed by itself: a module that is surely ELRS (by its beacon, or because it streams
-  a channel count other than 16, which Crossfire never does) and streams a different channel count than
-  the request - left over from another app or run - is restarted once per module and session.
-- **A change while the module is not locked** (during its activation, a WiFi pause of more than 3 s, a
-  stop, or before switching the module IP back to it) reaches it when it locks again: it streams on
-  through those with the old request, so it is restarted then (once per change).
-- **A module of unknown kind** that streams 16 channels and sent no beacon (ELRS beacons only while it
-  is not streaming, so an ELRS module still streaming from before has sent none) might be Crossfire. A restart of it (a change, or `a`) then waits until 20 s after the program locked on
-  to it, unless a Crossfire beacon arrives first; the log says so ("... may be Crossfire (no beacon
-  from it yet) ..."). Crossfire beacons about every 8 s also while streaming, so after 20 s without
-  one it is taken as ELRS.
-- **Crossfire / Tracer** starts on the same request but ignores the rate and the channel count: it
-  always sends 16 channels at about 90 Hz. A module known to be Crossfire (from its beacon) is never
-  sent `joystick_end` (what Crossfire does with it is unknown). Before its first beacon the program
-  cannot tell: a restart (`a`) of a module set with `--module` or `t` that does not stream to the
-  program yet is sent as a `joystick_begin` only (a module that is not streaming takes the request from
-  it); one known as ELRS by its beacon gets `joystick_end` first.
+  channel count is fixed by itself, once per module and session: a module that is surely ELRS and
+  streams another channel count than the request (left over from another app or run) is restarted at
+  once ("<ip> streams 8 channels, 16 asked for ..."); one of unknown kind that streams 16 while fewer are
+  asked, once its 20 s passed without a Crossfire beacon.
+- **`a` (restart, also the web page's Restart and the `restart` command)** restarts the module streaming
+  to the program by the rules above (Crossfire: logged, nothing sent). When none streams, the module IP
+  (`--module`, `t`) is restarted if its beacon said ELRS; otherwise (no beacon yet, or Crossfire) it only
+  gets a `joystick_begin` at once, never `joystick_end` ("<ip> has sent no beacon yet (it may be
+  Crossfire, which is never sent joystick_end): activating it with ..."): a module that is not streaming
+  takes the request from that alone. Without a module IP nothing is sent ("No module to restart ...").
+- **A restart that fails** (its `joystick_end` or its `joystick_begin` gets no 2xx answer) changed
+  nothing. It is sent again every 5 s while the module still streams to the program and is not known as
+  Crossfire, 3 sends per change in all ("The restart of <ip> failed - sending it again in 5 s"), then the
+  program gives up and says so ("... failed 3 times - giving up ..."); press `a` to try again. A plain
+  `joystick_begin` that fails is never turned into a restart: the next beacon, or the module IP's next
+  try, sends it again after 5 s.
+- **Switching the module IP** to the module that streams now keeps it: nothing is sent, nothing
+  centered ("Target module set to <ip> - streaming from it already"). Another module IP lets go of the
+  module streaming now (the joystick centers), asks the new one at once ("connecting to <ip>") and sends
+  the module being left nothing: a restart waiting for it is dropped, also when the rate or the channels
+  change in the same go (the new module's `joystick_begin` carries them).
+- **Timing**: one `joystick_begin` per module per 5 s at most; a restart goes out at once and starts the
+  5 s over. Lock loss, sending again and waiting restarts are checked at least 10 times a second,
+  whatever arrives.
 
 The web page and the status line show the measured rate and jitter, so you can compare settings.
 
@@ -237,8 +274,9 @@ so bindings carry over, and CH9-CH16 as 8 buttons (like the ELRS Bluetooth joyst
 - Fewer channels: with fewer than 16 channels, the buttons of the missing channels stay released (and
   with fewer than 8, the missing axes stay centered).
 - The device: name "ELRS Crossfire WiFi Joystick" (`--name`), bus virtual, vendor and product 0.
-- When the module goes quiet for more than 3 s, on stop and at exit, every axis goes to the center and
-  every button is released; shorter gaps hold the last values.
+- When the module goes quiet for more than 3 s, on stop (also Ctrl+Z), at exit and on a switch to
+  another module IP, every axis goes to the center and every button is released; shorter gaps hold the
+  last values. Setting the module IP to the module that streams now keeps it (nothing is centered).
 
 ## Environment
 
@@ -262,4 +300,5 @@ so bindings carry over, and CH9-CH16 as 8 buttons (like the ELRS Bluetooth joyst
 SIGINT, SIGTERM and SIGHUP end the program cleanly: the joystick is centered and removed, the socket
 closed. If it hangs while quitting, the third of these signals ends it at once, with exit code
 128 + the signal number. SIGHUP and SIGINT that were ignored when it started stay ignored (`nohup`, a
-script's `cmd &`). SIGPIPE is ignored.
+script's `cmd &`). SIGPIPE is ignored. Ctrl+Z (SIGTSTP) centers the joystick and stops listening before
+the program stops. Without `--daemon`, a stdout pipe whose reader went away ends it (exit code 0).

@@ -71,6 +71,7 @@ typedef struct {
   int http_delay_ms;
   bool act_first;                 /* apply a POST, then wait http_delay_ms to answer (ELRS: it stops/starts, then answers) */
   int http_status;
+  int end_status;                 /* != 0: the answer to joystick_end (not 200: not applied either) */
   /* observations */
   char posts[MAXPOSTS][128];
   uint32_t post_from[MAXPOSTS];
@@ -157,6 +158,7 @@ static void *fk_http(void *arg) {
     body = body ? body + 4 : req + got;
     fk_lock(f);
     int delay = f->http_delay_ms, status = f->http_status;
+    if (f->end_status && strstr(body, "action=joystick_end")) status = f->end_status;
     bool first = f->act_first;
     if (f->nposts < MAXPOSTS) {
       snprintf(f->posts[f->nposts], sizeof f->posts[0], "%s", body);
@@ -1268,6 +1270,51 @@ static void t_wait_applied(void) {
   finish();
 }
 
+/* A restart whose joystick_end is refused: the joystick_begin got its 2xx, but a streaming module only moved
+ * its stream and kept its old request. The restart failed (logged so, counted as failed) and the core sends
+ * it again 5 s after the first send while the module streams to us (R6). */
+static void t_restart_end_refused(void) {
+  uint16_t U = free_udp(), H = free_tcp();
+  fake_t m;
+  fk_start(&m, "127.0.0.2", false, H, U);
+  start(U, H, "", false);
+  fk_beacon(&m);
+  CHECK(WAIT(5000, S.bound && S.nch == 16));
+  CHECK(WAIT(2000, S.posts_ok == 1));
+  CHECK_INT(fk_interval(&m), 4000);
+  fk_lock(&m);
+  m.end_status = 500;
+  fk_unlock(&m);
+  char err[256];
+  int64_t t0 = now_us();
+  CHECK_INT(set_cfg(inc_rate, err, sizeof err), 0);
+  CHECK(WAIT(3000, logged("Stream end POST failed for 127.0.0.2: HTTP 500") == 1));
+  CHECK(WAIT(2000, logged("The restart of 127.0.0.2 failed - sending it again in") == 1));
+  CHECK_INT(logged("Activation POST -> 127.0.0.2: 200 OK"), 2);
+  CHECK_INT(logged("Stream end POST -> 127.0.0.2"), 0);
+  CHECK(WAIT(2000, S.posts_failed == 1));
+  CHECK_INT(S.posts_ok, 1);
+  CHECK_INT(S.restarts, 1);
+  CHECK_INT(fk_interval(&m), 4000);                     /* the module kept its old request */
+  CHECK(S.bound);
+  /* the module takes joystick_end again: the second send (5 s after the first) does it */
+  fk_lock(&m);
+  m.end_status = 0;
+  fk_unlock(&m);
+  CHECK(WAIT(8000, fk_count(&m, "action=joystick_end") == 2 && S.posts_ok == 2));
+  CHECK(now_us() - t0 >= 4900000);
+  CHECK_INT(fk_interval(&m), 2000);
+  CHECK_INT(S.restarts, 2);
+  CHECK_INT(S.posts_failed, 1);
+  CHECK_INT(logged("Stream end POST -> 127.0.0.2: 200"), 1);
+  CHECK(WAIT(3000, S.bound && S.rate_hz > 350));
+  sleep_ms(300);
+  CHECK_INT(fk_count(&m, "action=joystick_end"), 2);
+  CHECK_INT(logged("The restart of"), 1);
+  finish();
+  fk_stop(&m);
+}
+
 /* Our own restart pauses the stream (joystick_end, then joystick_begin): not a gap, not logged as one */
 static void t_own_restart_no_gap(void) {
   uint16_t U = free_udp(), H = free_tcp();
@@ -1487,14 +1534,14 @@ int main(int argc, char **argv) {
   setvbuf(stderr, NULL, _IONBF, 0);
   int64_t t0 = now_us();
   /* one part: test_engine config|flow|xf|mismatch|status|bind|joyfail|log|shutdown|joywrite|concurrency|burst|
-   * update|applied|owngap|switch|sametarget|kind */
+   * update|applied|owngap|endrefused|switch|sametarget|kind */
   static const struct { const char *name; void (*fn)(void); } PARTS[] = {
     { "config", t_config_check }, { "flow", t_flow }, { "xf", t_crossfire_and_target }, { "mismatch", t_mismatch },
     { "status", t_status_texts }, { "bind", t_bind_error }, { "joyfail", t_joystick_fails }, { "log", t_log_ring },
     { "shutdown", t_shutdown_and_stale }, { "joywrite", t_joy_write_error }, { "concurrency", t_concurrency },
     { "burst", t_command_burst }, { "update", t_update_config }, { "applied", t_wait_applied },
-    { "owngap", t_own_restart_no_gap }, { "switch", t_switch_module_and_rate }, { "sametarget", t_same_target_no_center },
-    { "kind", t_kind_after_stop_start },
+    { "owngap", t_own_restart_no_gap }, { "endrefused", t_restart_end_refused }, { "switch", t_switch_module_and_rate },
+    { "sametarget", t_same_target_no_center }, { "kind", t_kind_after_stop_start },
   };
   if (argc > 1) {
     for (size_t i = 0; i < sizeof PARTS / sizeof PARTS[0]; i++)
@@ -1518,6 +1565,7 @@ int main(int argc, char **argv) {
   t_update_config();
   t_wait_applied();
   t_own_restart_no_gap();
+  t_restart_end_refused();
   t_switch_module_and_rate();
   t_same_target_no_center();
   t_kind_after_stop_start();

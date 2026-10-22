@@ -178,6 +178,10 @@ void wifi_proto_reset(wifi_proto_t *p) {
   p->nch = 0;
   p->last_src = 0;
   p->restart_ip = 0;
+  p->restart_retry = false;
+  p->restart_at_us = 0;
+  p->restart_res_ip = 0;
+  p->restart_tries = 0;
   p->nrestarted = 0;
   p->xf_noted = false;
   p->restart_wait = false;
@@ -212,15 +216,57 @@ static bool ensure(wifi_proto_t *p, uint32_t ip, int64_t now) {
 
 void wifi_proto_ensure(wifi_proto_t *p, uint32_t ip, int64_t now) { ensure(p, ip, now); }
 
+/* A restart still to send (the host was busy, or a failed one to send again) is not wanted any more. */
+static void restart_pending_drop(wifi_proto_t *p) {
+  p->restart_ip = 0;
+  p->restart_retry = false;
+}
+
+/* A restart that failed (its joystick_end or joystick_begin got no 2xx): a module still streaming to us kept
+ * its old request, so it is sent again WIFI_THROTTLE_US after the last send (tick), while that module stays
+ * locked and is not known as Crossfire, WIFI_RESTART_TRIES sends in all (R6). One that stopped streaming to
+ * us takes the request from its next joystick_begin (its ELRS beacon gets it one). */
+static void restart_failed(wifi_proto_t *p, uint32_t ip, int64_t now) {
+  if (!p->bound || p->bound_ip != ip || wifi_proto_kind(p, ip) == WIFI_KIND_XF) return;
+  if (p->restart_ip == ip && !p->restart_retry) return;      /* a newer restart of it waits to go out already */
+  char s[16];
+  wifi_ip_str(ip, s);
+  if (p->restart_tries >= WIFI_RESTART_TRIES) {
+    plog(p, "The restart of %s failed %d times - giving up: it may still stream its old rate and channel count",
+         s, p->restart_tries);
+    return;
+  }
+  p->restart_ip = ip;
+  p->restart_retry = true;
+  p->restart_at_us = p->restart_sent_us + WIFI_THROTTLE_US;
+  int64_t in = p->restart_at_us - now;
+  char when[24] = "now";
+  if (in > 0) snprintf(when, sizeof when, "in %d s", (int)((in + 999999) / 1000000));
+  plog(p, "The restart of %s failed - sending it again %s", s, when);
+}
+
 /* joystick_end + joystick_begin to ip, past the throttle (and it restarts the throttle). */
 static void send_restart(wifi_proto_t *p, uint32_t ip, int64_t now) {
   int r = send_act(p, ip, true);
-  if (r == WIFI_ACT_BUSY) { p->restart_ip = ip; return; }    /* retried on tick */
+  if (r == WIFI_ACT_BUSY) { p->restart_ip = ip; return; }    /* sent on tick (a retry stays one) */
   p->restart_ip = 0;
+  p->restart_retry = false;
+  p->restart_res_ip = 0;
   p->restarts++;
+  p->restart_tries++;
+  p->restart_sent_us = now;
   act_record(p, ip, now);
   asked_note(p, ip, now);
   if (r == WIFI_ACT_OK) mark_activated(p, ip, now);
+  else if (r == WIFI_ACT_QUEUED) p->restart_res_ip = ip;     /* its result: wifi_proto_activation_done */
+  else restart_failed(p, ip, now);
+}
+
+/* A new restart (a request change, an explicit one, a mismatch), not a retry: WIFI_RESTART_TRIES sends. */
+static void start_restart(wifi_proto_t *p, uint32_t ip, int64_t now) {
+  p->restart_tries = 0;
+  p->restart_retry = false;
+  send_restart(p, ip, now);
 }
 
 static void note_xf_ignores(wifi_proto_t *p, uint32_t ip) {
@@ -247,12 +293,12 @@ static bool restart_module(wifi_proto_t *p, uint32_t ip, int64_t now, const char
   char s[16];
   wifi_ip_str(ip, s);
   wifi_kind_t k = wifi_proto_kind(p, ip);
-  if (k == WIFI_KIND_XF) {
+  bool locked = p->bound && ip == p->bound_ip;
+  if (locked && k == WIFI_KIND_XF) {
     plog(p, "Crossfire module %s always sends %d channels at its own rate (about 90 Hz) - nothing to restart",
          s, WIFI_XF_CHANNELS);
     return false;
   }
-  bool locked = p->bound && ip == p->bound_ip;
   if (locked && kind_unsure(p, now)) {
     if (!p->restart_wait)
       plog(p, "%s may be Crossfire (no beacon from it yet), which is never sent joystick_end: restarting its stream "
@@ -262,11 +308,16 @@ static bool restart_module(wifi_proto_t *p, uint32_t ip, int64_t now, const char
     p->restart_wait_ip = ip;
     return true;
   }
-  if (!locked && k == WIFI_KIND_UNKNOWN) {
-    /* it may be a Crossfire that has not beaconed yet (or whose beacons do not get here); a module that is
-     * not streaming takes the request from the joystick_begin alone */
-    plog(p, "%s has sent no beacon yet (it may be Crossfire, which is never sent joystick_end): activating it with "
-            "%d Hz, %d channels", s, wifi_interval_hz(p->interval_us), p->channels);
+  if (!locked && k != WIFI_KIND_ELRS) {
+    /* the module IP, not streaming to us: a joystick_begin starts it, and a module that is not streaming takes
+     * the request from it alone. It may be (or is) Crossfire, which is never sent joystick_end: a Crossfire
+     * that has not beaconed yet, or whose beacons do not get here. */
+    if (k == WIFI_KIND_XF)
+      plog(p, "Crossfire module %s is not streaming to us: activating it (it always sends %d channels at about 90 Hz)",
+           s, WIFI_XF_CHANNELS);
+    else
+      plog(p, "%s has sent no beacon yet (it may be Crossfire, which is never sent joystick_end): activating it with "
+              "%d Hz, %d channels", s, wifi_interval_hz(p->interval_us), p->channels);
     act_remove(p, ip);
     ensure(p, ip, now);
     return true;
@@ -275,7 +326,7 @@ static bool restart_module(wifi_proto_t *p, uint32_t ip, int64_t now, const char
   else plog(p, "Restarting the stream of %s: %d Hz, %d channels", s, wifi_interval_hz(p->interval_us), p->channels);
   /* frames of the old request keep coming until the module has the restart: no mismatch restart then */
   set_add(p->restarted, &p->nrestarted, ip);
-  send_restart(p, ip, now);
+  start_restart(p, ip, now);
   return true;
 }
 
@@ -309,6 +360,11 @@ void wifi_proto_store_request(wifi_proto_t *p, int interval_us, int channels) {
 }
 
 void wifi_proto_activation_done(wifi_proto_t *p, uint32_t ip, bool ok, int64_t now) {
+  /* one activation per module is under way at a time (wifi_actq): this is the restart's result */
+  if (ip && ip == p->restart_res_ip) {
+    p->restart_res_ip = 0;
+    if (!ok) restart_failed(p, ip, now);
+  }
   if (ok) mark_activated(p, ip, now);
 }
 
@@ -354,11 +410,16 @@ void wifi_proto_tick(wifi_proto_t *p, int64_t now) {
     wifi_proto_set_state(p, WIFI_ST_SEARCHING, "activated, but no data (radio off? another client?)");
   }
   /* a restart the host was too busy for: retried while its module is the locked one or the target (after a
-   * lock loss it waits for the next lock: a module that streams on keeps the old request until restarted);
-   * never once a beacon said Crossfire */
+   * lock loss it waits for the next lock: a module that streams on keeps the old request until restarted).
+   * A failed one: sent again from restart_at_us while its module stays locked (R6). Never once a beacon
+   * said Crossfire. */
   if (p->restart_ip) {
-    if (wifi_proto_kind(p, p->restart_ip) == WIFI_KIND_XF) p->restart_ip = 0;
-    else if (p->bound ? p->bound_ip == p->restart_ip : p->target == p->restart_ip) send_restart(p, p->restart_ip, now);
+    uint32_t ip = p->restart_ip;
+    if (wifi_proto_kind(p, ip) == WIFI_KIND_XF) restart_pending_drop(p);
+    else if (p->restart_retry) {
+      if (!p->bound || p->bound_ip != ip) restart_pending_drop(p);
+      else if (now >= p->restart_at_us) send_restart(p, ip, now);
+    } else if (p->bound ? p->bound_ip == ip : p->target == ip) send_restart(p, ip, now);
   }
   /* a restart held to know the module is no Crossfire: decided while it is locked (through a lock loss it
    * waits for the next lock, for the same reason) */
@@ -433,7 +494,7 @@ void wifi_proto_packet(wifi_proto_t *p, const uint8_t *d, size_t n, uint32_t src
       if (!xf) {
         asked_note(p, src, now);
         if (p->restart_wait && p->restart_wait_ip == src) p->restart_wait = false;
-        if (p->restart_ip == src) p->restart_ip = 0;
+        if (p->restart_ip == src) restart_pending_drop(p);
       }
     }
     return;     /* never parsed as channels, whatever follows */
@@ -487,7 +548,7 @@ void wifi_proto_packet(wifi_proto_t *p, const uint8_t *d, size_t n, uint32_t src
     p->bound_since_us = now;
     /* a restart pending or held for another module is not wanted now; one for this module goes on */
     if (p->restart_wait && p->restart_wait_ip != src) p->restart_wait = false;
-    if (p->restart_ip != src) p->restart_ip = 0;
+    if (p->restart_ip != src) restart_pending_drop(p);
     /* Not known what it streams: what the last activation sent to it this session asked for (it was not
      * streaming then, or it streams what it streamed before, which nothing can tell), else the request now
      * (found streaming). Either way a change of the request made while it is not locked from here on - a
@@ -511,33 +572,35 @@ void wifi_proto_packet(wifi_proto_t *p, const uint8_t *d, size_t n, uint32_t src
   wifi_proto_add_arrival(p, arrival);
 
   /* A module still streaming another request (another app's, or ours from before a change) keeps it
-   * until it is restarted. Only where it surely is no Crossfire (that ignores the request): ELRS by its
-   * beacon, or a count Crossfire never sends. */
-  if (count != p->channels && p->restart_ip != src && ip_index(p->restarted, p->nrestarted, src) < 0) {
-    wifi_kind_t k = wifi_proto_kind(p, src);
-    /* once per module and session (and never when the table is full: no restart per frame) */
-    if ((k == WIFI_KIND_ELRS || (k == WIFI_KIND_UNKNOWN && count != WIFI_XF_CHANNELS)) &&
-        set_add(p->restarted, &p->nrestarted, src)) {
-      char ip[16];
-      wifi_ip_str(src, ip);
-      plog(p, "%s streams %d channels, %d asked for (another app's request?) - restarting its stream", ip, count,
-           p->channels);
-      send_restart(p, src, now);
-    }
+   * until it is restarted (R5). Crossfire ignores the request: restarted at once where it surely is none
+   * (ELRS by its beacon, or a count Crossfire never sends); an unknown one with 16 channels once
+   * WIFI_XF_BEACON_US of lock passed without a Crossfire beacon (held until then: restart_module). Once per
+   * module and session, and never when the table is full: no restart per frame. */
+  if (count != p->channels && p->restart_ip != src && !p->restart_wait &&
+      ip_index(p->restarted, p->nrestarted, src) < 0 && p->nrestarted < WIFI_TABLE &&
+      wifi_proto_kind(p, src) != WIFI_KIND_XF) {
+    char why[160], ip[16];
+    wifi_ip_str(src, ip);
+    snprintf(why, sizeof why, "%s streams %d channels, %d asked for (another app's request?) - restarting its stream",
+             ip, count, p->channels);
+    restart_module(p, src, now, why);
   }
-  /* A module that streams another request than the one now as far as we know (it changed while the module
-   * was not locked: during the activation, a WiFi pause, a stop, a switch to it from another module) streams
-   * that one until it is restarted. Once per change: the restart records the new request; may wait for the
-   * kind (kind_unsure). */
+  /* A module last asked for another request than the one now (it changed while the module was not locked:
+   * during the activation, a WiFi pause, a stop, a switch to it from another module) streams that one until
+   * it is restarted (R3), under R2's kind rules: Crossfire is only noted; may wait for the kind
+   * (kind_unsure). Once per change: the restart records the new request. */
   int a = asked_find(p, src);
   if (a >= 0 && (p->asked[a].interval_us != p->interval_us || p->asked[a].channels != p->channels) &&
-      p->restart_ip != src && !p->restart_wait && wifi_proto_kind(p, src) != WIFI_KIND_XF) {
-    char why[200], ip[16];
-    wifi_ip_str(src, ip);
-    snprintf(why, sizeof why, "%s still streams %d Hz, %d channels from before the change - restarting its "
-             "stream with %d Hz, %d channels", ip, wifi_interval_hz(p->asked[a].interval_us), p->asked[a].channels,
-             wifi_interval_hz(p->interval_us), p->channels);
-    restart_module(p, src, now, why);
+      p->restart_ip != src && !p->restart_wait) {
+    if (wifi_proto_kind(p, src) == WIFI_KIND_XF) note_xf_ignores(p, src);
+    else {
+      char why[200], ip[16];
+      wifi_ip_str(src, ip);
+      snprintf(why, sizeof why, "%s still streams %d Hz, %d channels from before the change - restarting its "
+               "stream with %d Hz, %d channels", ip, wifi_interval_hz(p->asked[a].interval_us), p->asked[a].channels,
+               wifi_interval_hz(p->interval_us), p->channels);
+      restart_module(p, src, now, why);
+    }
   }
 }
 
@@ -558,7 +621,7 @@ int wifi_proto_set_target(wifi_proto_t *p, const char *text, int64_t now) {
   wifi_ip_str(ip, s);
   p->target = ip;
   /* a restart pending or held for another module is not wanted any more (the module being left) */
-  if (p->restart_ip != ip) p->restart_ip = 0;
+  if (p->restart_ip != ip) restart_pending_drop(p);
   if (p->restart_wait && p->restart_wait_ip != ip) p->restart_wait = false;
   act_remove(p, ip);          /* allow an immediate POST */
   if (p->bound && p->bound_ip == ip && now - p->bound_last_us <= WIFI_SOURCE_TIMEOUT_US) {

@@ -36,7 +36,7 @@ sh install.sh [options]
 | `--version X` | install release X (`1.2.3` or `v1.2.3`; default: the latest) |
 | `--file PATH` | install this binary (one you already have) instead of downloading one |
 | `--user` | install for this user only, in `~/.local/bin` (the default without root; with sudo it is refused - run it as the user) |
-| `--service` | the systemd user service, for the user who ran sudo (or you, without sudo); enabled, and started when that user has a running systemd user session (else at the next login). Refused on a system without systemd (no `systemctl`): start `elrs-wifi-joystick --daemon` from its init system or the session's autostart instead |
+| `--service` | the systemd user service, for the user who ran sudo (or you, without sudo); enabled, and started when that user has a running systemd user session (else at the next login). It needs systemd: without `systemctl` it stops before installing anything (start `elrs-wifi-joystick --daemon` from the init system or the session's autostart instead); where systemd is not running it says the service starts at a login with systemd running |
 | `--no-udev` | leave `/dev/uinput` access and the uinput module alone; remembered, so an update (running the script again) leaves them alone too |
 | `--udev` | set them up again after an earlier `--no-udev` |
 | `--uninstall` | remove what this script installed |
@@ -47,9 +47,9 @@ sh install.sh [options]
 
 | environment | |
 |---|---|
-| `GITHUB_TOKEN` | a token that can read the repository: needed while it is private (with curl); when it cannot read the release (expired, another account's), the public download is tried |
+| `GITHUB_TOKEN` | a token that can read the repository: needed while it is private (sent with curl; without curl, wget is used without it, with a warning). A token that cannot read the release (expired, or another account's) falls back to the public download, with a warning |
 | `ELRS_WIFI_JOYSTICK_REPO` | `owner/name` to install from (default `juricabi/elrs-crossfire-wifi-joystick-linux`) |
-| `TMPDIR` | where the download is checked before it is installed |
+| `TMPDIR` | where the download is checked before it is installed; on a TMPDIR mounted noexec the check runs again next to the install folder |
 
 ### While the repository is private
 
@@ -77,9 +77,12 @@ As root: `/usr/local/bin/elrs-wifi-joystick`, `/etc/udev/rules.d/60-elrs-wifi-jo
   binary needs a Pentium Pro or later (CMOV).
 - A download is checked against the release's `SHA256SUMS` (with `sha256sum` or `shasum -a 256`), and
   the program must run here (`--version`) before it replaces anything (unless `--arch` or `--root` says
-  it is for another machine). Files are installed atomically
-  (a temporary file next to the target, then renamed). Downloads use curl, else wget (wget only for a
-  public repository).
+  it is for another machine). Files are installed atomically (a temporary file next to the target,
+  then renamed) and flushed to disk; the list of installed files is written before them, so
+  `--uninstall` also removes what an interrupted install left. Downloads use curl, else wget (wget only
+  for a public repository).
+- With sudo, when the user who ran it also has a copy in `~/.local/bin` (installed without sudo), the
+  script warns: that copy comes first on PATH; remove it with `sh install.sh --uninstall` as that user.
 - Exit codes: 0 done, 1 failed (nothing was installed when the download or its check failed),
   2 bad options.
 

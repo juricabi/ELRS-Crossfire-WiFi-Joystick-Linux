@@ -105,7 +105,8 @@ typedef struct {
   uint16_t raw[WIFI_MAX_CH];   /* the last applied frame, 0..32767, 0 beyond nch */
   uint32_t frames;          /* applied frames, lifetime */
   uint32_t rx, beacons, malformed, dropped_filter, dropped_other;
-  uint32_t posts, posts_ok, posts_failed, restarts;
+  uint32_t posts, posts_ok, posts_failed, restarts;   /* POSTs (a restart's joystick_end + joystick_begin is one: ok
+                                                     * when both got a 2xx), their results, restarts sent */
   uint32_t gaps;            /* pauses of 250 ms or more in the stream of the locked module */
   int64_t gap_max_us;
   /* the virtual joystick */

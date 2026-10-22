@@ -85,8 +85,9 @@ The program asks the module for an update **rate** and a **channel count** - "th
 |------|---------|--------|--------|------------|--------|--------|--------|-------|
 | Interval (µs) | 1000 | 2000 | 3000 | **4000** | 5000 | 6667 | 10000 | 20000 |
 
-- **ExpressLRS** (3.4.0 and later) streams what it is asked for. A change with the keys `r` / `c` or the web page restarts its stream so that it takes effect (after up to 20 s if the module's kind is not known yet). `--rate` / `--channels` and the settings file only set the next request: if the module still streams from before, press `a` (or restart in the web page). Only a different channel count on a module that is surely ELRS is fixed by itself.
-- **TBS Crossfire / Tracer** ignores both: it always sends 16 channels at about 90 Hz.
+- **ExpressLRS** (3.4.0 and later) streams what it is asked for. A change with the keys `r` / `c` or the web page restarts its stream so that it takes effect (`joystick_end`, then `joystick_begin`): at once when it is surely ELRS, after up to 20 s while it might still be a Crossfire that has not sent its beacon. A restart that fails is sent again every 5 s while the module streams (3 tries in all). A change made while the module isn't streaming to the program goes into its next request, and a module that comes back with an older one is restarted.
+- `--rate` / `--channels` and the settings file only set the next request: if the module still streams from before, press `a` (or restart in the web page). Only a different channel count is fixed by itself (once per module and session).
+- **TBS Crossfire / Tracer** ignores both: it always sends 16 channels at about 90 Hz, and it is never sent `joystick_end`.
 
 ## 📋 Channel Mapping
 

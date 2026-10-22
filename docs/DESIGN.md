@@ -46,28 +46,53 @@ See the header comment of `core/wifi_proto.h`. In short:
   u16le 0..32767`).
 - Activation: `POST /udpcontrol` with `action=joystick_begin&interval=<us>&channels=<n>`; the module
   streams to the IP that posted. One POST per module per 5 s, on a worker thread.
-- **The request** (interval and channels) is a setting everywhere. Supported: interval 1000..100000 µs
-  (presets 1000/500/333/250/200/150/100/50 Hz; default 4000 = 250 Hz), channels 4..16 (default 16).
-  ELRS applies it only while not streaming, so changing it while an ELRS module streams restarts the
-  stream (`joystick_end`, then `joystick_begin`). Crossfire ignores it (16 channels, ~90 Hz) and, once
-  its beacon says Crossfire, is never sent `joystick_end`; a locked 16-channel module with no beacon yet
-  is restarted only after 20 s of lock without a Crossfire beacon (the held restart survives a lock loss
-  of that module and goes out when it locks again, unless its ELRS beacon meanwhile got it a
-  `joystick_begin` with the request). The module IP, not locked and not identified by a
-  beacon, gets only a `joystick_begin` (it may be Crossfire; a module that is not streaming takes the
-  request from it). A module that is surely not Crossfire and streams a channel count other than the
-  request is restarted once per session (another app's leftover request). A module that streams an
-  older request of ours as far as is known is restarted when it locks: a change made while it was not
-  locked (during the activation, a WiFi dropout, a stop, before a switch to it) reaches it, as it streams
-  on with the old one. What it streams: what a restart or an activation after its ELRS beacon asked it
-  for; else, from its first lock on, what the last activation sent to it asked for, or the request when
-  it locked. A leftover rate of a module found streaming (another app's) is not detected.
-- What beacons said (kind, name) and what each module was asked for survive a stop and start or a port
-  change: an ELRS module streams on after a stop, and it never beacons while it streams.
 - Source lock: the first module with real channel data; others are ignored until it is silent for 3 s.
-  With a module IP set, only that IP counts. Setting the module IP to the module streaming now keeps the
-  lock (no centering of the joystick, nothing sent).
+  With a module IP set, only that IP counts.
 - Crossfire placeholder frames (any channel = 0xF26A) and all-out-of-range frames are dropped.
+- **The request** (interval and channels) is a setting everywhere. ELRS applies it only while it is not
+  streaming (a `joystick_begin` to a streaming module just moves the stream), so it reaches a streaming
+  module only by a **restart**: `joystick_end`, then `joystick_begin` with the request. Crossfire ignores it
+  (16 channels, ~90 Hz) and, as what it does with `joystick_end` is unknown, a module known as Crossfire
+  by its beacon is never sent one. Only beacons tell the two apart: ELRS beacons only while idle, Crossfire
+  about every 8 s also while streaming. The rules (the same in the core, the Windows app and every doc):
+  1. Defaults 250 Hz (4000 µs) and 16 channels. Supported: interval 1000..100000 µs (presets
+     1000/2000/3000/4000/5000/6667/10000/20000 µs = 1000/500/333/250/200/150/100/50 Hz), channels 4..16.
+  2. A change while locked: Crossfire (known by its beacon): logged once per session, nothing sent.
+     Surely not Crossfire (its ELRS beacon seen, or frames with a count other than 16): restarted at once.
+     Unknown kind with 16 channels: held until 20 s of the lock passed without a Crossfire beacon, then
+     restarted; dropped on a Crossfire beacon. A held restart survives a lock loss of its module and goes
+     out when that module locks again (after its 20 s); it is dropped when that module's ELRS beacon gets
+     it a `joystick_begin` carrying the request, or when another module takes the lock.
+  3. Not locked: the next `joystick_begin` carries the request. What each module was last asked is
+     remembered per module (a table of 8); a module that locks with another remembered request is restarted
+     under rule 2's kind rules (Crossfire: only logged). So a change made while it was not locked (during
+     its activation, a WiFi dropout, a stop, before a switch to it) reaches a module that streams on.
+  4. Explicit restart (key `a`, the web page's Restart, the `restart` command): locked: as rule 2
+     (Crossfire: logged, nothing sent). Not locked with a module IP set: a module known as ELRS is
+     restarted; unknown or Crossfire gets a plain `joystick_begin` past the throttle, never `joystick_end`.
+     Nothing locked and no module IP: logged, nothing sent.
+  5. A module that is surely not Crossfire streaming a channel count other than the request (another app's
+     leftover) is restarted once per module and session. An unknown-kind module streaming 16 while fewer
+     are asked: once its 20 s passed without a Crossfire beacon, restarted once. (A leftover rate is not
+     detected: the frames do not carry it.)
+  6. A restart counts as done only when both POSTs got a 2xx. A failed one is sent again every 5 s (the
+     throttle) while that module is still locked and not known as Crossfire, at most 3 sends per request
+     change; giving up is logged. A failed plain `joystick_begin` is never retried as a restart.
+  7. Setting the module IP to the module locked now keeps the lock, sends nothing and logs that it streams
+     already (no centering). Another module IP unlocks, reports "connecting to <ip>", POSTs
+     `joystick_begin` at once, and drops any pending or held restart for the module being left.
+  8. The module IP and the request changed together: the request is stored, the new module's
+     `joystick_begin` carries it, the module being left gets nothing.
+  9. Stop/start and a port change start a new session: lock, throttles and restart state are cleared; the
+     kinds learnt from beacons and the remembered requests are kept (an ELRS module streams on after a
+     stop, and it never beacons while it streams).
+  10. Tables are bounded (8 modules); the locked module's kind is never evicted.
+  11. Lock loss (3 s without data), stop, exit and switching to another module IP center the 8 axes
+      (16384) and release the buttons; channels a frame does not carry are neutral (centered / released);
+      short gaps hold the last values ([§4](#4-the-virtual-joystick-uinput)).
+  12. The tick (lock release, retries, held restarts, the module IP's re-POST) runs at least every 100 ms
+      whatever traffic arrives.
+  13. One POST per module per 5 s for plain activations (the throttle); restarts bypass it and restart it.
 
 ## 3. Threads and data flow
 
@@ -126,8 +151,9 @@ module ───────────────▶ receive thread ───
   its axis goes to the center and its button is released, so nothing stays held from a longer frame.
 - Each applied frame = one `write()` of the changed axes/buttons + `SYN_REPORT` (nothing when nothing
   changed). The kernel timestamps events at that write.
-- When the lock is released (3 s of silence), on stop (also Ctrl+Z), and at exit: every axis to 16384,
-  every button released. The Windows app centers its vJoy device on lock loss, stop and exit the same way.
+- When the lock is released (3 s of silence, or a switch to another module IP), on stop (also Ctrl+Z),
+  and at exit: every axis to 16384, every button released. The Windows app centers its vJoy device on
+  lock loss, stop and exit the same way.
   Short gaps hold the last values; setting the module IP to the module streaming now is no lock loss.
 - `/dev/uinput` missing or not writable: not fatal. The program runs as a monitor (CLI + web still
   show the sticks) and says exactly why and what to run (`sudo modprobe uinput`, the udev rule from

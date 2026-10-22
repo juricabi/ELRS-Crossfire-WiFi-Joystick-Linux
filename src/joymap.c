@@ -29,17 +29,22 @@ static int ev(joy_event_t *out, int k, uint16_t type, uint16_t code, int32_t val
 int joymap_frame(joymap_t *m, const uint16_t *raw, int n, joy_event_t *out) {
   int k = 0;
   if (!raw || n <= 0) return 0;
-  int na = n < JOY_AXES ? n : JOY_AXES;
-  for (int i = 0; i < na; i++) {
-    int32_t v = raw[i] > JOY_AXIS_MAX ? JOY_AXIS_MAX : raw[i];
+  /* A channel the frame does not carry (fewer asked for, or a module that sends fewer) is no longer
+   * driven: its axis goes to the center and its button is released, so nothing stays held from an
+   * earlier, longer frame (a switch on CH9 would otherwise keep its button pressed). */
+  for (int i = 0; i < JOY_AXES; i++) {
+    int32_t v = i >= n ? JOY_CENTER : raw[i] > JOY_AXIS_MAX ? JOY_AXIS_MAX : raw[i];
     if (v == m->axis[i]) continue;
     m->axis[i] = v;
     k = ev(out, k, JOY_EV_ABS, JOY_AXIS_CODES[i], v);
   }
   if (!m->buttons) return k;
-  for (int i = 0; i < JOY_BUTTONS && JOY_AXES + i < n; i++) {
-    int r = raw[JOY_AXES + i] > JOY_AXIS_MAX ? JOY_AXIS_MAX : raw[JOY_AXES + i];
-    bool p = joymap_button_next(m->btn[i], r);
+  for (int i = 0; i < JOY_BUTTONS; i++) {
+    bool p = false;
+    if (JOY_AXES + i < n) {
+      int r = raw[JOY_AXES + i] > JOY_AXIS_MAX ? JOY_AXIS_MAX : raw[JOY_AXES + i];
+      p = joymap_button_next(m->btn[i], r);
+    }
     if (p == m->btn[i]) continue;
     m->btn[i] = p;
     k = ev(out, k, JOY_EV_KEY, JOY_BUTTON_CODES[i], p);

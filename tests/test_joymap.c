@@ -77,20 +77,38 @@ static void axes_pass_raw_through(void) {
   CHECK_INT(n, 1);
   CHECK(has(n, EV_ABS, ABS_X, 1));
   /* above 32767 counts as 32767 (the core already clamps; joymap never trusts it) */
-  n = FRAME(65535);
+  n = FRAME(65535, 32767, 100, 16384, 20000, 1, 32766, 12345);
   CHECK_INT(n, 1);
   CHECK(has(n, EV_ABS, ABS_X, 32767));
 }
 
-static void short_frames_keep_the_rest(void) {
+static void short_frames_release_the_rest(void) {
   joymap_init(&M, true);
   FRAME(100, 200, 300, 400, 500, 600, 700, 800, 32767, 32767);
   CHECK(M.btn[0] && M.btn[1]);
-  int n = FRAME(1, 2, 3, 4);                          /* 4 channels: CH5.. stay */
-  CHECK_INT(n, 4);
-  CHECK_INT(M.axis[4], 500);
-  CHECK_INT(M.axis[7], 800);
-  CHECK(M.btn[0] && M.btn[1]);
+  int n = FRAME(1, 2, 3, 4);                          /* 4 channels: CH5.. are no longer driven */
+  CHECK_INT(n, 4 + 4 + 2);
+  CHECK(has(n, EV_ABS, ABS_X, 1));
+  CHECK(has(n, EV_ABS, ABS_RZ, 16384));               /* CH5 */
+  CHECK(has(n, EV_ABS, ABS_RUDDER, 16384));           /* CH8 */
+  CHECK(has(n, EV_KEY, BTN_TRIGGER, 0));              /* CH9 */
+  CHECK(has(n, EV_KEY, BTN_THUMB, 0));                /* CH10 */
+  CHECK_INT(M.axis[4], 16384);
+  CHECK_INT(M.axis[7], 16384);
+  CHECK(!M.btn[0] && !M.btn[1]);
+  CHECK_INT(FRAME(1, 2, 3, 4), 0);                    /* and then nothing more to write */
+  /* 8 channels after 16: the buttons are released, the axes follow */
+  FRAME(1, 2, 3, 4, 5, 6, 7, 8, 32767, 0, 0, 0, 0, 0, 0, 32767);
+  CHECK(M.btn[0] && M.btn[7]);
+  n = FRAME(1, 2, 3, 4, 5, 6, 7, 8);
+  CHECK_INT(n, 2);
+  CHECK(has(n, EV_KEY, BTN_TRIGGER, 0) && has(n, EV_KEY, BTN_BASE2, 0));
+  /* without buttons: only the axes */
+  joymap_init(&M, false);
+  FRAME(100, 200, 300, 400, 500, 600, 700, 800, 32767);
+  CHECK(!M.btn[0]);
+  n = FRAME(1, 2, 3, 4);
+  CHECK_INT(n, 8);
   /* n <= 0 or no data: nothing */
   CHECK_INT(joymap_frame(&M, NULL, 4, ev), 0);
   uint16_t r[1] = { 5 };
@@ -138,13 +156,18 @@ static void buttons_with_hysteresis(void) {
   CHECK_INT(n, 1 + 7);
   CHECK_INT(ev[0].type, EV_ABS);
   for (int i = 1; i < n; i++) CHECK_INT(ev[i].type, EV_KEY);
-  /* a 12-channel frame: buttons 1-4 follow, 5-8 keep their state */
+  /* a 12-channel frame: buttons 1-4 follow (CH9-12 = 0), 5-8 are no longer driven: released */
   int w[12];
   for (int i = 0; i < 12; i++) w[i] = i < 8 ? v[i] : 0;
   n = frame(12, w);
+  CHECK_INT(n, 8);
+  for (int i = 0; i < 8; i++) CHECK(!M.btn[i]);
+  /* CH9-12 pressed again in a 12-channel frame: only those */
+  for (int i = 8; i < 12; i++) w[i] = 32767;
+  n = frame(12, w);
   CHECK_INT(n, 4);
-  for (int i = 0; i < 4; i++) CHECK(!M.btn[i]);
-  for (int i = 4; i < 8; i++) CHECK(M.btn[i]);
+  for (int i = 0; i < 4; i++) CHECK(M.btn[i]);
+  for (int i = 4; i < 8; i++) CHECK(!M.btn[i]);
 }
 
 static void no_buttons_mode(void) {
@@ -222,7 +245,7 @@ int main(void) {
   codes_are_the_kernels();
   init_centers();
   axes_pass_raw_through();
-  short_frames_keep_the_rest();
+  short_frames_release_the_rest();
   buttons_with_hysteresis();
   no_buttons_mode();
   reset_centers_and_releases();

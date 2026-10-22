@@ -94,10 +94,12 @@ module ───────────────▶ receive thread ───
   CH1 `ABS_X`, CH2 `ABS_Y`, CH3 `ABS_RX`, CH4 `ABS_RY`, CH5 `ABS_RZ`, CH6 `ABS_Z`, CH7 `ABS_THROTTLE`,
   CH8 `ABS_RUDDER`. Range 0..32767, **fuzz 0, flat 0** (the kernel must not drop small moves or add a
   dead zone), resolution 0, initial value 16384 (center).
-- Buttons (unless `--no-buttons`): CH9..CH16 = `BTN_TRIGGER`..`BTN_BASE2` (0x120..0x127, "joystick
-  buttons 1-8", like the ELRS BLE joystick). Pressed at raw ≥ 24576 (75 %), released at raw < 20480
-  (62.5 %): hysteresis, so a switch sitting near a threshold never chatters. A channel the frame does not
-  carry leaves its axis/button as it is.
+- Buttons: CH9..CH16 = `BTN_TRIGGER`..`BTN_BASE2` (0x120..0x127, "joystick buttons 1-8", like the
+  ELRS BLE joystick). Pressed at raw ≥ 24576 (75 %), released at raw < 20480 (62.5 %): hysteresis, so
+  a switch sitting near a threshold never chatters. With `--no-buttons` the buttons are still declared
+  but never pressed: udev and SDL take a device with X/Y/Z axes and no `EV_KEY` for an accelerometer,
+  not a joystick. A channel the frame does not carry (fewer channels asked for, or sent) is not driven:
+  its axis goes to the center and its button is released, so nothing stays held from a longer frame.
 - Each applied frame = one `write()` of the changed axes/buttons + `SYN_REPORT` (nothing when nothing
   changed). The kernel timestamps events at that write.
 - When the lock is released (3 s of silence), on stop, and at exit: every axis to 16384, every button

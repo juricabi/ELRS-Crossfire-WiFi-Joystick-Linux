@@ -50,7 +50,7 @@ void joymap_init(joymap_t *m, bool buttons);
 /* The next state of a button: hysteresis between JOY_BTN_RELEASE and JOY_BTN_PRESS. */
 bool joymap_button_next(bool pressed, int raw);
 /* One applied frame (raw 0..32767, n channels; values above 32767 count as 32767). A channel the frame
- * does not carry keeps its axis/button. Writes the events that change the device to out (room for
+ * does not carry is not driven: its axis goes to the center, its button is released. Writes the events that change the device to out (room for
  * JOY_MAX_EVENTS) and returns how many: axes first (CH order), then buttons. 0 = nothing to write. */
 int  joymap_frame(joymap_t *m, const uint16_t *raw, int n, joy_event_t *out);
 /* Center every axis and release every button (lock lost, stop, exit). Returns the events for what

@@ -94,11 +94,11 @@ int ujoy_open(ujoy_t *j, const char *path, const char *name, bool buttons, const
   if (s_ioctl(j->fd, UI_SET_EVBIT, IARG(EV_ABS)) < 0) return fail(j, err, cap, "UI_SET_EVBIT", errno);
   for (int i = 0; i < JOY_AXES; i++)
     if (s_ioctl(j->fd, UI_SET_ABSBIT, IARG(JOY_AXIS_CODES[i])) < 0) return fail(j, err, cap, "UI_SET_ABSBIT", errno);
-  if (buttons) {
-    if (s_ioctl(j->fd, UI_SET_EVBIT, IARG(EV_KEY)) < 0) return fail(j, err, cap, "UI_SET_EVBIT", errno);
-    for (int i = 0; i < JOY_BUTTONS; i++)
-      if (s_ioctl(j->fd, UI_SET_KEYBIT, IARG(JOY_BUTTON_CODES[i])) < 0) return fail(j, err, cap, "UI_SET_KEYBIT", errno);
-  }
+  /* the buttons exist even when CH9-CH16 are not buttons (they are never pressed then): udev and SDL take
+   * a device with X, Y and Z axes and no EV_KEY for an accelerometer, not a joystick */
+  if (s_ioctl(j->fd, UI_SET_EVBIT, IARG(EV_KEY)) < 0) return fail(j, err, cap, "UI_SET_EVBIT", errno);
+  for (int i = 0; i < JOY_BUTTONS; i++)
+    if (s_ioctl(j->fd, UI_SET_KEYBIT, IARG(JOY_BUTTON_CODES[i])) < 0) return fail(j, err, cap, "UI_SET_KEYBIT", errno);
 
   /* kernel 4.5+: UI_ABS_SETUP (it also sets the initial value) and UI_DEV_SETUP; older kernels answer
    * EINVAL (unknown uinput ioctl) or ENOTTY, and take a struct uinput_user_dev written to the fd */
@@ -144,7 +144,8 @@ int ujoy_open(ujoy_t *j, const char *path, const char *name, bool buttons, const
   if (s_ioctl(j->fd, UI_DEV_CREATE, NULL) < 0) return fail(j, err, cap, "UI_DEV_CREATE", errno);
 
   char sys[64] = "";
-  if (s_ioctl(j->fd, UI_GET_SYSNAME(sizeof sys), sys) == 0) {
+  /* the kernel answers the length of the name it copied (> 0), not 0 */
+  if (s_ioctl(j->fd, UI_GET_SYSNAME(sizeof sys), sys) >= 0) {
     sys[sizeof sys - 1] = 0;
     snprintf(j->sysname, sizeof j->sysname, "%s", sys);
     /* evdev attaches while the device registers, so the node is normally there at once; a moment's

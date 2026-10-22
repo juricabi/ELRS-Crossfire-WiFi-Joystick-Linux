@@ -59,7 +59,7 @@ static int f_ioctl(int fd, unsigned long req, void *arg) {
   if (req == UI_GET_SYSNAME(64)) {
     if (no_sysname) { errno = EINVAL; return -1; }
     snprintf(arg, 64, "%s", sysname);
-    return 0;
+    return (int)strlen(sysname) + 1;                    /* the kernel answers the length it copied */
   }
   return 0;
 }
@@ -268,8 +268,9 @@ static void create_without_buttons_and_node(void) {
   char err[300];
   CHECK_INT(ujoy_open(&j, NULL, "", false, NULL, err, sizeof err), 0);
   CHECK_STR(j.name, "ELRS Crossfire WiFi Joystick");    /* "" = the default name */
-  CHECK_INT(count_req(UI_SET_EVBIT, EV_KEY), 0);
-  CHECK_INT(count_any(UI_SET_KEYBIT), 0);
+  /* the buttons exist anyway (never pressed): without EV_KEY, udev and SDL see an accelerometer */
+  CHECK_INT(count_req(UI_SET_EVBIT, EV_KEY), 1);
+  CHECK_INT(count_any(UI_SET_KEYBIT), 8);
   CHECK_STR(j.sysname, "");
   CHECK_STR(j.device, "");                              /* best effort: unknown */
   ujoy_close(&j);

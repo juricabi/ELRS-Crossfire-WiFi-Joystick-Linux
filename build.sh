@@ -20,6 +20,7 @@ HERE=$(cd "$(dirname "$0")" && pwd)
 cd "$HERE"
 TARGET=${1:-native}
 WHAT=${2:-all}
+# shellcheck disable=SC2015  # shift 2 cannot fail with 2 arguments
 [ $# -ge 2 ] && shift 2 || shift $#
 ONLY="$*"
 OPT=${OPT:--O2}
@@ -28,6 +29,7 @@ if [ -z "$VERSION" ]; then
 fi
 
 if [ "$TARGET" = all ]; then
+  # shellcheck disable=SC2086  # ONLY: test names, one word each
   for t in x86_64 i686 aarch64 armv7 armv6 riscv64; do "$0" "$t" "$WHAT" $ONLY; done
   exit 0
 fi
@@ -38,7 +40,9 @@ case "$TARGET" in
   x86_64)  CC="zig cc"; TFLAGS="-target x86_64-linux-musl" ;;
   i686)    CC="zig cc"; TFLAGS="-target x86-linux-musl -mcpu=i686" ;;
   aarch64) CC="zig cc"; TFLAGS="-target aarch64-linux-musl" ;;
-  armv7)   CC="zig cc"; TFLAGS="-target arm-linux-musleabihf -mcpu=cortex_a7" ;;    # Pi 2/3/4 32-bit OS, most ARM boards
+  # ARMv7-A with VFPv3-D16 and no NEON (the armhf baseline): Pi 2/3/4 with a 32-bit OS and every 32-bit
+  # ARMv7 board (cortex_a7 would emit NEON/VFPv4 and die with SIGILL on Cortex-A8/A9 boards)
+  armv7)   CC="zig cc"; TFLAGS="-target arm-linux-musleabihf -mcpu=generic+v7a+vfp3d16-neon-d32" ;;
   armv6)   CC="zig cc"; TFLAGS="-target arm-linux-musleabihf -mcpu=arm1176jzf_s" ;;  # Pi 1 / Zero (W)
   riscv64) CC="zig cc"; TFLAGS="-target riscv64-linux-musl" ;;
   *) echo "unknown target $TARGET (native x86_64 i686 aarch64 armv7 armv6 riscv64 all)" >&2; exit 2 ;;
@@ -58,6 +62,7 @@ if [ "$WHAT" = clean ]; then rm -rf "$OUT"; echo "removed $OUT"; exit 0; fi
 
 WARN="-Wall -Wextra -Wno-unused-parameter"
 [ "$WERROR" = 1 ] && WARN="$WARN -Werror"
+# shellcheck disable=SC2089  # the quotes are for the compiler: APP_VERSION is a C string
 CFLAGS="$TFLAGS $OPT $DBG -std=gnu99 -D_GNU_SOURCE -Icore -Isrc -I$OUT/gen -DAPP_VERSION=\"$VERSION\""
 LIBS="-lpthread -lm"
 
@@ -78,11 +83,18 @@ if [ ! -f "$GEN" ] || { [ -f web/index.html ] && [ web/index.html -nt "$GEN" ]; 
   mv "$GEN.tmp" "$GEN"
 fi
 
+# objects of other flags (SAN, OPT, WERROR, VERSION) must not be reused: start over when they change
+STAMP="$OUT/obj/flags"
+if [ "$(cat "$STAMP" 2>/dev/null)" != "$CC $CFLAGS $WARN" ]; then
+  rm -f "$OUT"/obj/core/*.o "$OUT"/obj/src/*.o "$OUT"/obj/tests/*.o
+  printf '%s\n' "$CC $CFLAGS $WARN" > "$STAMP"
+fi
+# shellcheck disable=SC2012  # plain file names
 NEWEST_H=$(ls -t core/*.h src/*.h "$GEN" 2>/dev/null | head -1)
 compile() {  # src obj
   if [ ! -f "$2" ] || [ "$1" -nt "$2" ] || [ "$NEWEST_H" -nt "$2" ]; then
     echo "  CC $1"
-    # shellcheck disable=SC2086
+    # shellcheck disable=SC2086,SC2090
     $CC $CFLAGS $WARN -c "$1" -o "$2"
   fi
 }
@@ -102,7 +114,7 @@ done
 if [ "$WHAT" = all ] || [ "$WHAT" = prog ]; then
   if [ -f src/main.c ]; then
     echo "  LD elrs-wifi-joystick"
-    # shellcheck disable=SC2086
+    # shellcheck disable=SC2086,SC2090
     $CC $CFLAGS $LDSTATIC -o "$OUT/elrs-wifi-joystick" "$OUT/obj/src/main.o" $LIB_OBJ $LIBS
   fi
 fi
@@ -128,7 +140,7 @@ if [ "$WHAT" = all ] || [ "$WHAT" = tests ] || [ "$WHAT" = test ]; then
       for s in $STUBBED; do [ "$(basename "$o" .o)" = "$s" ] && skip=1; done
       [ $skip = 1 ] || OBJS="$OBJS $o"
     done
-    # shellcheck disable=SC2086
+    # shellcheck disable=SC2086,SC2090
     $CC $CFLAGS $LDSTATIC -o "$OUT/$n" "$OUT/obj/tests/$n.o" $OBJS $LIBS
   done
 fi

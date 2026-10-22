@@ -643,13 +643,13 @@ static void t_flow(void) {
   CHECK(S.bound);                                       /* the lock held through it */
   CHECK(WAIT(4000, S.rate_hz > 350));
   fprintf(stderr, "  500 Hz asked: %.1f Hz measured\n", S.rate_hz);
-  /* channels: 8 -> the stream carries 8, CH9..16 keep their state */
+  /* channels: 8 -> the stream carries 8; CH9..16 are no longer driven: their buttons are released */
   CHECK_INT(set_cfg(set_8ch, err, sizeof err), 0);
   CHECK(WAIT(3000, S.nch == 8));
   CHECK_INT(fk_count(&m, "action=joystick_end"), 2);
   CHECK_INT(fk_count(&m, "action=joystick_begin&interval=2000&channels=8"), 1);
   for (int i = 8; i < 16; i++) CHECK_INT(S.raw[i], 0);
-  CHECK(WAIT(1000, K.btn[7]));                          /* button 8 was pressed: still is */
+  CHECK(WAIT(1000, !K.btn[7]));                         /* button 8 was pressed: released now */
   CHECK_INT(S.restarts, 2);
   /* an explicit restart re-sends the request */
   eng_restart_stream(E);

@@ -13,6 +13,8 @@
  *   joy ok|off|err <text>    the virtual joystick (\n in text: a new line)   buttons on|off  CH9-16 as buttons
  *   raw <ch 1-16> <0..32767|auto>   pin a channel       nch <n|auto>      channels per frame
  *   log <text>               a log line                 warn <text>       the next saves "fail" with this
+ *   release ok|wait|fail <why>   how the next stops' release (joystick_end) ends: answered (the default), no
+ *                            answer logged yet (a "log" line gives one), or "Releasing <ip> failed: <why> - ..."
  *   restart                  as if the program restarted: a new web server (a new instance), the log and
  *                            the uptime from 0
  *   quit
@@ -45,6 +47,7 @@ struct engine {
   int pin[WIFI_MAX_CH];          /* -1 = animated */
   int nch_override;              /* 0 = from the request (ELRS) or 16 (Crossfire) */
   char warn[160];
+  char rel[64];                  /* a stop's release: "" answered, "wait" no answer yet, else why it failed */
   uint32_t seq, restarts, posts, frames_base;
   int64_t t0_us, stream_t0_us;
   eng_logline_t log[ENG_LOG_LINES];
@@ -146,7 +149,17 @@ void eng_stop(engine_t *e) {
   if (e->running) {
     e->running = false;
     e->forced = false;
-    dlog(e, "Stopped");
+    /* R14, the lines the program logs: the module streaming to us is released (joystick_end), not Crossfire */
+    if (e->present && e->kind == WIFI_KIND_XF)
+      dlog(e, "Not releasing %s: Crossfire broadcasts while streaming, other apps find it as it is", e->ip);
+    else if (e->present)
+      dlog(e, "Releasing %s: joystick_end, so it stops streaming and broadcasts again", e->ip);
+    dlog(e, "Stopped.");
+    if (e->present && e->kind != WIFI_KIND_XF) {
+      if (!e->rel[0]) dlog(e, "Released %s: it broadcasts again, any app can connect to it", e->ip);
+      else if (strcmp(e->rel, "wait"))
+        dlog(e, "Releasing %s failed: %s - it may stream on until its WiFi or power is cycled", e->ip, e->rel);
+    }
     settle(e);
   }
   pthread_mutex_unlock(&e->mu);
@@ -362,6 +375,11 @@ static int command(engine_t *e, char *line) {
     dlog(e, "%s", arg);
   } else if (!strcmp(line, "warn")) {
     snprintf(e->warn, sizeof e->warn, "%s", arg);
+  } else if (!strcmp(line, "release")) {
+    if (!strcmp(arg, "ok")) e->rel[0] = 0;
+    else if (!strcmp(arg, "wait")) snprintf(e->rel, sizeof e->rel, "wait");
+    else if (!strncmp(arg, "fail ", 5) && arg[5]) snprintf(e->rel, sizeof e->rel, "%s", arg + 5);
+    else rc = -1;
   } else if (!strcmp(line, "quit")) {
     rc = 1;
   } else if (line[0]) {

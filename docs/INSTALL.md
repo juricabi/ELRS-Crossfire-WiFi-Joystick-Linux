@@ -121,14 +121,17 @@ sudo loginctl enable-linger $USER                # run it from boot, without log
 ```
 
 Change its settings on the web page. Only one copy may run: stop the service before running the
-program in a terminal (`systemctl --user stop elrs-wifi-joystick`). Started from boot there is no
-desktop session, so `/dev/uinput` access comes from the `input` group (`sudo usermod -aG input $USER`),
-not from the udev rule's `uaccess`.
+program in a terminal (`systemctl --user stop elrs-wifi-joystick`). Stopping the service (also at
+logout) releases the module, so another app can find it
+([USAGE.md](USAGE.md#using-the-module-from-another-app)). Started from boot there is no desktop
+session, so `/dev/uinput` access comes from the `input` group (`sudo usermod -aG input $USER`), not from
+the udev rule's `uaccess`.
 
 ## Updating
 
 Run the install script again: it updates the program (and the service's unit), and restarts a running
-service. `--version X` installs a given release instead of the latest.
+service (the module is released, and found again by its next broadcast). `--version X` installs a given
+release instead of the latest.
 
 ## Uninstalling
 

@@ -3,7 +3,9 @@
  * be separate IPs) and the virtual joystick replaced by a sink (ujoy_sys: the writes the device would
  * get, checked and decoded). Covers discovery, the lock, frames to the joystick, the request and its
  * restarts, Crossfire, the module IP, stop/start, port changes, bind errors, every status text,
- * hints, gaps, the log ring, eng_wait and shutdown with a POST in flight. */
+ * hints, gaps, the log ring, eng_wait, shutdown with a POST in flight, and the release (R14: joystick_end
+ * on stop, port change and exit, also to a module left by a switch; the exit's wait for it, also line by line; a
+ * release nobody answers holds the next start 2 s at most). */
 #include "tests/t.h"
 #include "engine.h"
 #include "uinput.h"
@@ -733,8 +735,10 @@ static void t_flow(void) {
   /* the "lock lost" gap is no gap */
   CHECK_INT(S.gaps, g0);
 
-  /* ---- stop: closed, centered, the port free; start: back without a POST ---- */
+  /* ---- stop: closed, centered, the port free, the module released (R14); start: found by its beacon ---- */
   posts0 = fk_nposts(&m);
+  snap();
+  uint32_t ap0 = S.posts;
   eng_stop(E);
   CHECK(WAIT(1000, !S.running));
   CHECK(!S.listening);
@@ -742,25 +746,44 @@ static void t_flow(void) {
   CHECK_INT(S.state, WIFI_ST_STOPPED);
   CHECK(sink_centered());
   CHECK(udp_port_free(U));
-  CHECK_INT(logged("Stopped. (The module keeps broadcasting until powered off.)"), 1);
+  CHECK_INT(logged("Stopped."), 1);
+  CHECK_INT(logged("keeps broadcasting"), 0);
+  CHECK(WAIT(2000, logged("Released 127.0.0.2: it broadcasts again, any app can connect to it") == 1));
+  CHECK_INT(fk_nposts(&m), posts0 + 1);
+  fk_post(&m, posts0, body, sizeof body);
+  CHECK_STR(body, "action=joystick_end");               /* alone */
+  fk_lock(&m);
+  CHECK(!m.active);                                     /* it streams no more */
+  fk_unlock(&m);
+  CHECK(WAIT(1000, S.releasing == 0));
+  CHECK_INT(S.posts, ap0);                              /* not an activation */
   eng_stop(E);                                          /* twice: nothing */
   sleep_ms(100);
   CHECK_INT(logged("Stopped."), 1);
+  CHECK_INT(logged("Releasing 127.0.0.2"), 1);
   eng_restart_stream(E);                                /* stopped: nothing to restart (the Windows app's line) */
   CHECK(WAIT(1000, logged("Not running - nothing to restart") == 1));
   CHECK_INT(logged("Not listening"), 0);
+  fk_beacon(&m);                                        /* stopped: nobody listens, nothing sent */
+  sleep_ms(200);
+  CHECK_INT(fk_nposts(&m), posts0 + 1);
   eng_start(E);
   eng_start(E);
+  CHECK(WAIT(1000, logged(want) == 2));
+  fk_beacon(&m);                                        /* released, it beacons: activated again */
   CHECK(WAIT(2000, S.bound));
-  CHECK_INT(logged(want), 2);
-  CHECK_INT(fk_nposts(&m), posts0);
-  /* stop + start at once: a new session */
+  CHECK_INT(fk_nposts(&m), posts0 + 2);
+  /* stop + start at once: a new session. The frames that come before the joystick_end lands may lock it again
+   * for the 3 s of the timeout (its beacon is not taken then); after that its beacon activates it */
   eng_stop(E);
   eng_start(E);
   CHECK(WAIT(2000, logged("Stopped.") == 2 && logged(want) == 3));
+  CHECK(WAIT(2000, logged("Released 127.0.0.2") == 2));
+  CHECK(WAIT(4000, !S.bound));
+  fk_beacon(&m);
   CHECK(WAIT(2000, S.bound));
 
-  /* ---- the port changes: rebind, the old one free ---- */
+  /* ---- the port changes: rebind, the old one free; a stop and a start, so the module is released (R14) ---- */
   uint16_t U2 = free_udp();
   g_port = U2;
   CHECK_INT(set_cfg(set_port, err, sizeof err), 0);
@@ -771,6 +794,8 @@ static void t_flow(void) {
   CHECK(udp_port_free(U));
   CHECK(!udp_port_free(U2));
   CHECK_INT(S.cfg.port, U2);
+  CHECK(WAIT(2000, logged("Released 127.0.0.2") == 3));
+  CHECK_INT(logged("Stopped."), 2);                     /* (quiet: a port change is no Stop for the user) */
 
   finish();
   CHECK(K.destroyed);
@@ -834,9 +859,17 @@ static void t_crossfire_and_target(void) {
   g_ip[0] = 0;
   CHECK_INT(set_cfg(set_ip, err, sizeof err), 0);
   CHECK(WAIT(1000, logged("Module IP cleared - finding the module by its broadcast") == 1));
-  /* while stopped a module IP waits for the start */
+  /* the stop releases (R14) the ELRS module locked now; the Crossfire one still streaming to us (its frames
+   * dropped) is left as it is: it broadcasts while streaming, and what joystick_end does to it is unknown */
   eng_stop(E);
   CHECK(WAIT(1000, !S.running));
+  CHECK(WAIT(2000, logged("Released 127.0.0.2: it broadcasts again, any app can connect to it") == 1));
+  CHECK_INT(logged("Releasing 127.0.0.2: joystick_end, so it stops streaming and broadcasts again"), 1);
+  CHECK_INT(logged("Not releasing 127.0.0.3: Crossfire broadcasts while streaming, other apps find it as it is"), 1);
+  CHECK_INT(logged("Releasing 127.0.0.3"), 0);
+  CHECK_INT(fk_count(&e, "action=joystick_end"), 1);
+  CHECK_INT(fk_count(&x, "joystick_end"), 0);
+  /* while stopped a module IP waits for the start */
   snprintf(g_ip, sizeof g_ip, "127.0.0.3");
   CHECK_INT(set_cfg(set_ip, err, sizeof err), 0);
   CHECK(WAIT(1000, logged("Module IP set to 127.0.0.3 (used when listening starts)") == 1));
@@ -850,6 +883,9 @@ static void t_crossfire_and_target(void) {
   CHECK(WAIT(3000, S.bound && !strcmp(S.source, "127.0.0.3")));
   g_ip[0] = 0;
   eng_stop(E);
+  CHECK(WAIT(1000, logged("Not releasing 127.0.0.3") == 2));      /* locked Crossfire: not released either */
+  CHECK_INT(fk_count(&x, "joystick_end"), 0);
+  CHECK_INT(logged("Releasing 127.0.0.2"), 1);                    /* (released before: it streams no more) */
   CHECK_INT(set_cfg(set_ip, err, sizeof err), 0);
   CHECK(WAIT(1000, logged("Module IP cleared - the module will be found by its broadcast") == 1));
   /* the module's web port */
@@ -1118,7 +1154,9 @@ static void t_log_ring(void) {
   finish();
 }
 
-/* destroy while a POST hangs: prompt; the result of an old session never shows */
+/* stop + start while a POST hangs: it is aborted and its result never shows; the stop releases the module IP it
+ * went to (R14: activated less than 3 s ago and not locked since, it may be about to stream to us), then the new
+ * session POSTs again. Destroy while a restart hangs: aborted at once, but the exit's release gets 1.5 s. */
 static void t_shutdown_and_stale(void) {
   uint16_t U = free_udp(), H = free_tcp();
   fake_t m;
@@ -1129,16 +1167,402 @@ static void t_shutdown_and_stale(void) {
   /* stop + start: the POST in flight is aborted, its result dropped */
   eng_stop(E);
   eng_start(E);
-  CHECK(WAIT(2000, fk_nposts(&m) == 2));               /* the new session POSTs again */
-  sleep_ms(200);
-  CHECK_INT(logged("Activation"), 0);
+  fk_lock(&m);
+  m.http_delay_ms = 0;                                  /* (the next ones are answered at once) */
+  fk_unlock(&m);
+  CHECK(WAIT(3000, fk_nposts(&m) == 3));
+  char body[128];
+  fk_post(&m, 1, body, sizeof body);
+  CHECK_STR(body, "action=joystick_end");
+  fk_post(&m, 2, body, sizeof body);
+  CHECK_STR(body, "action=joystick_begin&interval=4000&channels=16");   /* the new session's */
+  CHECK(WAIT(2000, S.bound));
+  CHECK(WAIT(1000, logged("Released 127.0.0.2: it broadcasts again, any app can connect to it") == 1));
+  CHECK_INT(logged("Activation POST -> 127.0.0.2: 200 OK"), 1);        /* the new session's only */
+  CHECK_INT(logged("aborted"), 0);
+  /* destroy while a restart hangs: the restart is aborted at once; the release after it gets no answer either,
+   * and the exit waits for it 1.5 s (WIFI_RELEASE_WAIT_US), not the 5 s of a POST */
+  fk_beacon(&m);                                        /* known as ELRS: restarted at once */
+  sleep_ms(100);
+  fk_lock(&m);
+  m.http_delay_ms = 4000;
+  fk_unlock(&m);
+  int n0 = fk_nposts(&m);
+  eng_restart_stream(E);
+  CHECK(WAIT(1000, fk_nposts(&m) == n0 + 1));
   int64_t t0 = now_us();
   finish();
   int64_t took = now_us() - t0;
-  fprintf(stderr, "  destroy with a POST in flight: %.0f ms\n", (double)took / 1000);
-  CHECK(took < 1000000);
+  fprintf(stderr, "  destroy with a POST in flight, its release unanswered: %.0f ms\n", (double)took / 1000);
+  CHECK(took >= WIFI_RELEASE_WAIT_US - 100000 && took < WIFI_RELEASE_WAIT_US + 800000);
+  CHECK_INT(fk_nposts(&m), n0 + 2);                     /* the restart's joystick_end, then the release's */
+  fk_post(&m, n0 + 1, body, sizeof body);
+  CHECK_STR(body, "action=joystick_end");
   CHECK(udp_port_free(U));
   fk_stop(&m);
+}
+
+/* R14: a stop releases the module (joystick_end alone, on the worker), logged as it goes; eng_wait_released
+ * waits for the answers, and cuts short what is left after its timeout (logged); a refused release says so (the
+ * module streams on); a port change releases too; a release nobody answers (refused) says why */
+static void t_release(void) {
+  uint16_t U = free_udp(), H = free_tcp();
+  fake_t m;
+  fk_start(&m, "127.0.0.2", false, H, U);
+  start(U, H, "", false);
+  fk_beacon(&m);
+  CHECK(WAIT(5000, S.bound && S.nch == 16));
+  CHECK(WAIT(2000, S.posts_ok == 1));
+  /* no answer within eng_wait_released's timeout: cut short, logged, the module streams on */
+  fk_lock(&m);
+  m.http_delay_ms = 1000;
+  fk_unlock(&m);
+  int64_t t0 = now_us();
+  eng_stop(E);
+  CHECK(eng_wait_applied(E, 1000));
+  snap();
+  CHECK_INT(S.releasing, 1);
+  CHECK_INT(logged("Releasing 127.0.0.2: joystick_end, so it stops streaming and broadcasts again"), 1);
+  CHECK(!eng_wait_released(E, 200));
+  int64_t took = now_us() - t0;
+  CHECK(took >= 190000 && took < 700000);
+  CHECK_INT(logged("Releasing 127.0.0.2 failed: no answer in time - it may stream on until its WiFi or power is cycled"), 1);
+  CHECK_INT(logged("Released"), 0);
+  snap();
+  CHECK_INT(S.releasing, 0);
+  fk_lock(&m);
+  CHECK(m.active);
+  m.http_delay_ms = 300;
+  fk_unlock(&m);
+  /* an answer in 300 ms: waited for (the cut is over: this one is not cut) */
+  eng_start(E);
+  CHECK(WAIT(3000, S.bound));                           /* (it streamed on: locked at once) */
+  t0 = now_us();
+  eng_stop(E);
+  CHECK(eng_wait_released(E, 3000));
+  CHECK(now_us() - t0 >= 250000);
+  snap();
+  CHECK_INT(S.releasing, 0);
+  CHECK_INT(logged("Released 127.0.0.2: it broadcasts again, any app can connect to it"), 1);
+  CHECK_INT(logged("failed"), 1);
+  CHECK_INT(S.posts, 1);                                /* a release is no activation: not counted */
+  CHECK_INT(S.posts_ok, 1);
+  CHECK_INT(S.posts_failed, 0);
+  CHECK_INT(fk_count(&m, "action=joystick_end"), 2);
+  fk_lock(&m);
+  CHECK(!m.active);
+  fk_unlock(&m);
+  t0 = now_us();
+  CHECK(eng_wait_released(E, 1000));                    /* none left: at once */
+  CHECK(now_us() - t0 < 100000);
+  /* refused: said so, and the module streams on (a start locks it again at once) */
+  fk_lock(&m);
+  m.http_delay_ms = 0;
+  m.end_status = 500;
+  fk_unlock(&m);
+  eng_start(E);
+  CHECK(eng_wait_applied(E, 1000));                     /* (listening before the beacon) */
+  fk_beacon(&m);
+  CHECK(WAIT(3000, S.bound));
+  eng_stop(E);
+  CHECK(eng_wait_applied(E, 1000));
+  CHECK(eng_wait_released(E, 3000));
+  CHECK_INT(logged("Releasing 127.0.0.2 failed: HTTP 500 - it may stream on until its WiFi or power is cycled"), 1);
+  fk_lock(&m);
+  CHECK(m.active);
+  m.end_status = 0;
+  fk_unlock(&m);
+  eng_start(E);
+  CHECK(WAIT(3000, S.bound));
+  /* a port change: a stop and a start, with its release (the modules send to 11000 only: on another port no
+   * frame of theirs comes, and a later stop could not release them) */
+  int ends = fk_count(&m, "action=joystick_end");
+  g_port = free_udp();
+  char err[256];
+  CHECK_INT(set_cfg(set_port, err, sizeof err), 0);
+  CHECK(eng_wait_applied(E, 2000));
+  CHECK(eng_wait_released(E, 3000));
+  CHECK_INT(fk_count(&m, "action=joystick_end"), ends + 1);
+  CHECK_INT(logged("Released 127.0.0.2"), 2);
+  CHECK_INT(logged("Stopped."), 3);                     /* (the port change's stop is quiet) */
+  fk_lock(&m);
+  CHECK(!m.active);
+  fk_unlock(&m);
+  /* a module IP that refuses the connection: its activation failed, its release too (sent anyway: an activation
+   * that timed out may have reached it) */
+  snprintf(g_ip, sizeof g_ip, "127.0.0.3");
+  CHECK_INT(set_cfg(set_ip, err, sizeof err), 0);
+  CHECK(WAIT(3000, logged("Activation failed for 127.0.0.3: connection refused") == 1));
+  eng_stop(E);
+  CHECK(eng_wait_applied(E, 1000));
+  CHECK(eng_wait_released(E, 3000));
+  CHECK_INT(logged("Releasing 127.0.0.3 failed: connection refused - it may stream on until its WiFi or power is cycled"), 1);
+  CHECK_INT(logged("Releasing 127.0.0.2: joystick_end"), 4);   /* (it streamed no more: not released again) */
+  snap();
+  CHECK_INT(S.posts_failed, 1);                         /* the activation's; the releases count nowhere */
+  finish();
+  fk_stop(&m);
+}
+
+/* R14 at exit: eng_destroy releases and waits for the answers, at most WIFI_RELEASE_WAIT_US after the stop:
+ * an answer in time is waited for (the module took it); none in time is cut short; a stop's release still under
+ * way when the exit comes gets the rest of its 1.5 s, not 1.5 s more; Crossfire is not released */
+static void t_release_exit(void) {
+  uint16_t U = free_udp(), H = free_tcp();
+  fake_t m, x;
+  fk_start(&m, "127.0.0.2", false, H, U);
+  fk_start(&x, "127.0.0.3", true, H, U);
+  /* answered in 400 ms */
+  start(U, H, "", false);
+  fk_beacon(&m);
+  CHECK(WAIT(5000, S.bound));
+  fk_lock(&m);
+  m.http_delay_ms = 400;
+  fk_unlock(&m);
+  int64_t t0 = now_us();
+  finish();
+  int64_t took = now_us() - t0;
+  fprintf(stderr, "  exit, its release answered in 400 ms: %.0f ms\n", (double)took / 1000);
+  CHECK(took >= 350000 && took < 1300000);
+  CHECK_INT(fk_count(&m, "action=joystick_end"), 1);
+  fk_lock(&m);
+  CHECK(!m.active);                                     /* the exit did not cut it short */
+  m.http_delay_ms = 0;
+  fk_unlock(&m);
+  /* no answer in time: 1.5 s, then aborted (the module streams on) */
+  start(U, H, "", false);
+  fk_beacon(&m);
+  CHECK(WAIT(5000, S.bound));
+  fk_lock(&m);
+  m.http_delay_ms = 5000;
+  fk_unlock(&m);
+  t0 = now_us();
+  finish();
+  took = now_us() - t0;
+  fprintf(stderr, "  exit, its release unanswered: %.0f ms\n", (double)took / 1000);
+  CHECK(took >= WIFI_RELEASE_WAIT_US - 100000 && took < WIFI_RELEASE_WAIT_US + 800000);
+  CHECK_INT(fk_count(&m, "action=joystick_end"), 2);
+  fk_lock(&m);
+  CHECK(m.active);
+  m.http_delay_ms = 0;
+  fk_unlock(&m);
+  sleep_ms(100);                                        /* (the fake notices the abort) */
+  /* a stop 1 s before the exit, its release unanswered: the exit waits the 0.5 s left */
+  start(U, H, "", false);
+  CHECK(WAIT(3000, S.bound));                           /* (it streamed on) */
+  fk_lock(&m);
+  m.http_delay_ms = 5000;
+  fk_unlock(&m);
+  eng_stop(E);
+  CHECK(eng_wait_applied(E, 1000));
+  sleep_ms(1000);
+  t0 = now_us();
+  finish();
+  took = now_us() - t0;
+  fprintf(stderr, "  exit 1 s after a stop whose release is unanswered: %.0f ms\n", (double)took / 1000);
+  CHECK(took >= 250000 && took < 1000000);
+  CHECK_INT(fk_count(&m, "action=joystick_end"), 3);
+  fk_lock(&m);
+  m.http_delay_ms = 0;
+  m.active = false;                                     /* (powered off and on: out of the way) */
+  fk_unlock(&m);
+  sleep_ms(100);
+  /* Crossfire, known by its beacon: never sent joystick_end, nothing to wait for */
+  start(U, H, "", false);
+  fk_beacon(&x);
+  CHECK(WAIT(5000, S.bound && S.kind == WIFI_KIND_XF));
+  eng_stop(E);
+  CHECK(eng_wait_applied(E, 1000));
+  CHECK_INT(logged("Not releasing 127.0.0.3: Crossfire broadcasts while streaming, other apps find it as it is"), 1);
+  snap();
+  CHECK_INT(S.releasing, 0);
+  eng_start(E);
+  CHECK(WAIT(3000, S.bound));
+  t0 = now_us();
+  finish();
+  took = now_us() - t0;
+  CHECK(took < 500000);
+  CHECK_INT(fk_count(&x, "joystick_end"), 0);
+  CHECK_INT(fk_nposts(&x), 1);
+  fk_stop(&m);
+  fk_stop(&x);
+}
+
+/* R14: eng_wait_released counts from the stop, not from its call: a wait that starts 1 s after a stop whose
+ * release is unanswered has 0.5 s left, one that starts later none (the CLI's quit after a stop, Ctrl+Z after a
+ * stop). What it cuts short says how: the one in flight "no answer in time", one queued behind it (a 2nd source
+ * here) "not sent, ..." and it is never sent, not even after the cut */
+static void t_release_wait_from_stop(void) {
+  uint16_t U = free_udp(), H = free_tcp();
+  fake_t m, b;
+  fk_start(&m, "127.0.0.2", false, H, U);
+  fk_start(&b, "127.0.0.4", false, H, U);
+  start(U, H, "", false);
+  fk_beacon(&m);
+  CHECK(WAIT(5000, S.bound && !strcmp(S.source, "127.0.0.2")));
+  fk_lock(&m);
+  m.http_delay_ms = 5000;
+  fk_unlock(&m);
+  eng_stop(E);
+  CHECK(eng_wait_applied(E, 1000));
+  sleep_ms(1000);
+  int64_t t0 = now_us();
+  CHECK(!eng_wait_released(E, 3000));
+  int64_t took = now_us() - t0;
+  fprintf(stderr, "  wait for a release 1 s after its stop: %.0f ms\n", (double)took / 1000);
+  CHECK(took >= 350000 && took < 900000);
+  CHECK_INT(logged("Releasing 127.0.0.2 failed: no answer in time - it may stream on until its WiFi or power is cycled"), 1);
+  t0 = now_us();
+  CHECK(eng_wait_released(E, 3000));                    /* none left: at once */
+  CHECK(now_us() - t0 < 100000);
+  fk_lock(&m);
+  m.http_delay_ms = 0;
+  m.active = false;                                     /* (powered off and on) */
+  fk_unlock(&m);
+  sleep_ms(100);                                        /* (the fake notices the abort) */
+  /* a 2nd source behind a locked module that does not answer: cut before its turn, never sent */
+  eng_start(E);
+  CHECK(eng_wait_applied(E, 1000));
+  fk_beacon(&m);
+  CHECK(WAIT(5000, S.bound && !strcmp(S.source, "127.0.0.2")));
+  fk_lock(&b);
+  b.active = true;
+  b.remote = IP("127.0.0.1");
+  b.channels = 16;
+  fk_unlock(&b);
+  CHECK(WAIT(2000, logged("Ignoring 2nd source 127.0.0.4") >= 1));
+  fk_lock(&m);
+  m.http_delay_ms = 5000;
+  fk_unlock(&m);
+  eng_stop(E);
+  CHECK(eng_wait_applied(E, 1000));
+  CHECK_INT(logged("Releasing 127.0.0.4: joystick_end, so it stops streaming and broadcasts again"), 1);
+  t0 = now_us();
+  CHECK(!eng_wait_released(E, 200));
+  took = now_us() - t0;
+  CHECK(took >= 190000 && took < 700000);
+  CHECK_INT(logged("Releasing 127.0.0.2 failed: no answer in time - it may stream on until its WiFi or power is cycled"), 2);
+  CHECK_INT(logged("Releasing 127.0.0.4 failed: not sent, the wait ran out before its turn - it may stream on until its "
+                   "WiFi or power is cycled"), 1);
+  snap();
+  CHECK_INT(S.releasing, 0);
+  sleep_ms(300);
+  CHECK_INT(fk_count(&b, "joystick_end"), 0);
+  fk_lock(&b);
+  CHECK(b.active);
+  b.active = false;
+  fk_unlock(&b);
+  fk_lock(&m);
+  m.http_delay_ms = 0;
+  fk_unlock(&m);
+  t0 = now_us();
+  finish();                                             /* (nothing left: the exit waits for nothing) */
+  CHECK(now_us() - t0 < 500000);
+  CHECK_INT(fk_count(&b, "joystick_end"), 0);
+  fk_stop(&m);
+  fk_stop(&b);
+}
+
+/* R14: eng_wait_releasing, the CLI's wait that shows the release's lines as they come: 0 at a new log line, 1 once
+ * no release is under way, -1 when the 1.5 s after the stop ran out, and it cuts nothing short (eng_wait_released
+ * does, after it) */
+static void t_wait_releasing(void) {
+  uint16_t U = free_udp(), H = free_tcp();
+  fake_t m;
+  fk_start(&m, "127.0.0.2", false, H, U);
+  start(U, H, "", false);
+  fk_beacon(&m);
+  CHECK(WAIT(5000, S.bound));
+  /* answered in 300 ms: the "Released" line, then 1 */
+  fk_lock(&m);
+  m.http_delay_ms = 300;
+  fk_unlock(&m);
+  snap();
+  uint32_t since = S.log_seq;
+  eng_stop(E);
+  int r, lines = 0;
+  int64_t t0 = now_us();
+  while ((r = eng_wait_releasing(E, since, 3000)) == 0) {
+    snap();
+    since = S.log_seq;
+    lines++;
+  }
+  CHECK_INT(r, 1);
+  CHECK(lines >= 1);                                    /* ("Releasing ...", "Stopped.": one call or two) */
+  CHECK(now_us() - t0 >= 250000 && now_us() - t0 < 1000000);
+  CHECK_INT(logged("Released 127.0.0.2: it broadcasts again, any app can connect to it"), 1);
+  CHECK_INT(eng_wait_releasing(E, since, 1000), 1);     /* none left: at once */
+  CHECK_INT(eng_wait_releasing(E, 0, 1000), 1);
+  /* unanswered: -1 when the 1.5 s after the stop ran out, nothing cut short; a line not read yet: 0 at once */
+  eng_start(E);
+  CHECK(eng_wait_applied(E, 1000));
+  fk_beacon(&m);
+  CHECK(WAIT(5000, S.bound));
+  fk_lock(&m);
+  m.http_delay_ms = 5000;
+  fk_unlock(&m);
+  t0 = now_us();
+  eng_stop(E);
+  CHECK(eng_wait_applied(E, 1000));
+  snap();
+  CHECK_INT(eng_wait_releasing(E, S.log_seq - 1, 3000), 0);
+  CHECK(now_us() - t0 < 1000000);
+  snap();
+  CHECK_INT(eng_wait_releasing(E, S.log_seq, 200), -1);         /* (its own timeout) */
+  snap();
+  CHECK_INT(eng_wait_releasing(E, S.log_seq, 3000), -1);        /* (the stop's 1.5 s) */
+  int64_t took = now_us() - t0;
+  CHECK(took >= WIFI_RELEASE_WAIT_US - 50000 && took < WIFI_RELEASE_WAIT_US + 300000);
+  snap();
+  CHECK_INT(S.releasing, 1);
+  CHECK_INT(logged("failed"), 0);
+  CHECK(!eng_wait_released(E, 3000));                   /* the cut */
+  CHECK(now_us() - t0 < WIFI_RELEASE_WAIT_US + 400000);
+  CHECK_INT(logged("Releasing 127.0.0.2 failed: no answer in time - it may stream on until its WiFi or power is cycled"), 1);
+  CHECK_INT(eng_wait_releasing(E, UINT32_MAX, 1000), 1);
+  fk_lock(&m);
+  m.http_delay_ms = 0;
+  fk_unlock(&m);
+  finish();
+  fk_stop(&m);
+}
+
+/* R14: a release nobody answers (a mistyped module IP, a module that just lost power) gets 2 s, not the 5 s of an
+ * activation: the one worker sends what queues behind it, a start's joystick_begin to the right module IP, that
+ * much later at most */
+static void t_release_unanswered(void) {
+  uint16_t U = free_udp(), H = free_tcp();
+  fake_t a, b;
+  fk_start(&a, "127.0.0.2", false, H, U);
+  fk_start(&b, "127.0.0.3", false, H, U);
+  fk_lock(&b);
+  b.http_delay_ms = 7000;                               /* takes the connection, never answers in time */
+  fk_unlock(&b);
+  start(U, H, "127.0.0.3", false);
+  CHECK(WAIT(2000, fk_nposts(&b) == 1));
+  sleep_ms(500);
+  int64_t t0 = now_us();
+  eng_stop(E);
+  CHECK(eng_wait_applied(E, 1000));
+  CHECK_INT(logged("Releasing 127.0.0.3: joystick_end, so it stops streaming and broadcasts again"), 1);
+  snprintf(g_ip, sizeof g_ip, "127.0.0.2");
+  char err[256];
+  CHECK_INT(set_cfg(set_ip, err, sizeof err), 0);
+  eng_start(E);
+  CHECK(WAIT(3000, fk_nposts(&a) >= 1));
+  int64_t took = now_us() - t0;
+  fprintf(stderr, "  a start right after a stop whose release is unanswered: joystick_begin %.0f ms after the stop\n",
+          (double)took / 1000);
+  CHECK(took >= 1900000 && took < 2500000);
+  CHECK(WAIT(1000, S.bound && !strcmp(S.source, "127.0.0.2")));
+  CHECK_INT(logged("Releasing 127.0.0.3 failed: timed out after 2 s - it may stream on until its WiFi or power is cycled"), 1);
+  sleep_ms(300);
+  CHECK_INT(logged("Activation POST -> 127.0.0.2: 200 OK"), 1);   /* (its throttle did not run out while it waited) */
+  CHECK_INT(fk_count(&b, "action=joystick_end"), 1);
+  CHECK_INT(fk_count(&a, "joystick_begin"), 1);
+  finish();
+  fk_stop(&a);
+  fk_stop(&b);
 }
 
 /* the device refuses writes for a while: said once (log + joy_error), then recovered */
@@ -1201,7 +1625,16 @@ static void t_command_burst(void) {
   CHECK(eng_wait_applied(E, 3000));
   CHECK(WAIT(3000, logged("Asking for 250 Hz (4000 us) and 8 channels") == 1));
   CHECK_INT(logged("Too many commands"), 0);
-  CHECK(WAIT(8000, S.running && S.bound && S.nch == 8));          /* applied: the module streams 8 now */
+  /* the stops released the module (R14): its beacon gets it a joystick_begin with the request (one taken while
+   * frames that came before its joystick_end hold the lock is ignored: beacons until it is in) */
+  int64_t end = now_us() + 8000000;
+  while (now_us() < end) {
+    snap();
+    if (S.running && S.bound && S.nch == 8) break;
+    fk_beacon(&m);
+    sleep_ms(250);
+  }
+  CHECK(S.running && S.bound && S.nch == 8);           /* applied: the module streams 8 now */
   CHECK_INT(S.cfg.channels, 8);
   /* the last one wins: a stop at the end of a burst stops */
   for (int i = 0; i < 100; i++) { eng_start(E); eng_stop(E); }
@@ -1405,7 +1838,7 @@ static void t_own_restart_no_gap(void) {
 
 /* The module IP and the rate in one change: the module being left gets no joystick_end; the new one gets
  * a joystick_begin with the new request, and when it already streams what it was asked for before, a
- * restart at its lock */
+ * restart at its lock. A stop then releases both (R14): the locked one, and the one left, which streams on */
 static void t_switch_module_and_rate(void) {
   uint16_t U = free_udp(), H = free_tcp();
   fake_t a, b;
@@ -1438,6 +1871,26 @@ static void t_switch_module_and_rate(void) {
   CHECK(WAIT(4000, S.rate_hz > 150 && S.rate_hz < 250));
   CHECK_INT(fk_count(&b, "joystick_end"), 0);           /* the one left now: nothing */
   CHECK(WAIT(1000, logged("127.0.0.2 still streams 250 Hz, 16 channels from before the change") == 1));
+  /* R14: a stop releases the locked module, then the one left by the switch, which streams to us still (its
+   * frames dropped) */
+  uint32_t d0 = S.dropped_other;
+  CHECK(WAIT(2000, S.dropped_other > d0 + 10));
+  int ends_a = fk_count(&a, "action=joystick_end");
+  eng_stop(E);
+  CHECK(eng_wait_applied(E, 1000));
+  CHECK_INT(logged("Releasing 127.0.0.2: joystick_end, so it stops streaming and broadcasts again"), 1);
+  CHECK_INT(logged("Releasing 127.0.0.3: joystick_end, so it stops streaming and broadcasts again"), 1);
+  CHECK(eng_wait_released(E, 3000));
+  CHECK_INT(logged("Released 127.0.0.2: it broadcasts again, any app can connect to it"), 1);
+  CHECK_INT(logged("Released 127.0.0.3: it broadcasts again, any app can connect to it"), 1);
+  CHECK_INT(fk_count(&a, "action=joystick_end"), ends_a + 1);
+  CHECK_INT(fk_count(&b, "action=joystick_end"), 1);
+  fk_lock(&a);
+  CHECK(!a.active);
+  fk_unlock(&a);
+  fk_lock(&b);
+  CHECK(!b.active);
+  fk_unlock(&b);
   finish();
   fk_stop(&a);
   fk_stop(&b);
@@ -1480,10 +1933,18 @@ static void t_kind_after_stop_start(void) {
   start(U, H, "", false);
   fk_beacon(&m);
   CHECK(WAIT(5000, S.bound && S.kind == WIFI_KIND_ELRS));
+  /* it streams on when its release is refused (R14; or when the program was killed) */
+  fk_lock(&m);
+  m.end_status = 500;
+  fk_unlock(&m);
   eng_stop(E);
   eng_start(E);
   CHECK(eng_wait_applied(E, 3000));                     /* (the snapshot is of the new session from here) */
   CHECK_INT(logged("Stopped."), 1);
+  CHECK(WAIT(2000, logged("Releasing 127.0.0.2 failed: HTTP 500") == 1));
+  fk_lock(&m);
+  m.end_status = 0;
+  fk_unlock(&m);
   CHECK(WAIT(3000, S.bound));
   CHECK_INT(S.kind, WIFI_KIND_ELRS);
   CHECK_STR(S.module_name, "Unified TX");
@@ -1491,19 +1952,25 @@ static void t_kind_after_stop_start(void) {
   CHECK_INT(set_cfg(inc_rate, err, sizeof err), 0);
   CHECK(WAIT(2000, S.restarts == 1));
   CHECK_INT(logged("may be Crossfire"), 0);
-  /* a port change too (a new session on the new port) */
+  /* a port change too (a new session on the new port; its release refused again) */
   uint16_t U2 = free_udp();
   fk_lock(&m);
   m.dest_port = U2;
+  m.end_status = 500;
   fk_unlock(&m);
   g_port = U2;
   CHECK_INT(set_cfg(set_port, err, sizeof err), 0);
+  CHECK(WAIT(2000, logged("Releasing 127.0.0.2 failed: HTTP 500") == 2));
+  fk_lock(&m);
+  m.end_status = 0;
+  fk_unlock(&m);
   CHECK(WAIT(3000, S.bound && S.cfg.port == U2));
   CHECK_INT(S.kind, WIFI_KIND_ELRS);
   CHECK_INT(set_cfg(set_8ch, err, sizeof err), 0);
   CHECK(WAIT(2000, S.restarts == 2));
   CHECK_INT(logged("may be Crossfire"), 0);
-  /* the port and the module IP in one change while listening: used at once, said so */
+  /* the port and the module IP in one change while listening: used at once, said so (released, then asked
+   * again at once: the module IP gets its joystick_begin when listening starts) */
   uint16_t U3 = free_udp();
   fk_lock(&m);
   m.dest_port = U3;
@@ -1569,7 +2036,8 @@ int main(int argc, char **argv) {
   setvbuf(stderr, NULL, _IONBF, 0);
   int64_t t0 = now_us();
   /* one part: test_engine config|flow|xf|mismatch|status|bind|joyfail|log|shutdown|joywrite|concurrency|burst|
-   * update|applied|owngap|endrefused|switch|sametarget|kind|statusswitch */
+   * update|applied|owngap|endrefused|switch|sametarget|kind|statusswitch|release|releaseexit|releasewait|
+   * releaseslow|releasing */
   static const struct { const char *name; void (*fn)(void); } PARTS[] = {
     { "config", t_config_check }, { "flow", t_flow }, { "xf", t_crossfire_and_target }, { "mismatch", t_mismatch },
     { "status", t_status_texts }, { "bind", t_bind_error }, { "joyfail", t_joystick_fails }, { "log", t_log_ring },
@@ -1577,7 +2045,9 @@ int main(int argc, char **argv) {
     { "burst", t_command_burst }, { "update", t_update_config }, { "applied", t_wait_applied },
     { "owngap", t_own_restart_no_gap }, { "endrefused", t_restart_end_refused }, { "switch", t_switch_module_and_rate },
     { "sametarget", t_same_target_no_center }, { "kind", t_kind_after_stop_start },
-    { "statusswitch", t_status_switch_in_flight },
+    { "statusswitch", t_status_switch_in_flight }, { "release", t_release }, { "releaseexit", t_release_exit },
+    { "releasewait", t_release_wait_from_stop }, { "releaseslow", t_release_unanswered },
+    { "releasing", t_wait_releasing },
   };
   if (argc > 1) {
     for (size_t i = 0; i < sizeof PARTS / sizeof PARTS[0]; i++)
@@ -1606,6 +2076,11 @@ int main(int argc, char **argv) {
   t_switch_module_and_rate();
   t_same_target_no_center();
   t_kind_after_stop_start();
+  t_release();
+  t_release_exit();
+  t_release_wait_from_stop();
+  t_release_unanswered();
+  t_wait_releasing();
   fprintf(stderr, "  test_engine took %.1f s\n", (double)(now_us() - t0) / 1e6);
   T_DONE();
 }

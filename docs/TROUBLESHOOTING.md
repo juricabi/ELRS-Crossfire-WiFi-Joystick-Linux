@@ -31,7 +31,30 @@ would show every axis at full deflection and give your simulator full throttle.
 
 Is the module on the same network (check its IP in your router, ping it)? Guest WiFi networks often
 isolate clients: use your main network. VPNs and virtual network adapters can get in the way; the
-program prints this machine's addresses at start. Or give the IP: `--module 192.168.1.50`.
+program prints this machine's addresses at start. Or give the IP: `--module 192.168.1.50`. An ELRS module
+that streams to another app does not broadcast: see the next section.
+
+### Another app can't find the module
+
+An ELRS module streams to the app that asked until it gets `joystick_end`, loses power or loses its WiFi,
+and broadcasts only while it does not stream: while it streams to one app (this program, the Windows
+app, a phone), the others can't find it by its broadcast. Stop or quit the app it streams to. This
+program releases the module on stop and quit (`s`, `q`, Ctrl+C, the web page's Stop, `systemctl --user
+stop elrs-wifi-joystick`) and says so: "Released <ip>: it broadcasts again, any app can connect to it".
+
+- **"Releasing <ip> failed: ..."**, or the program was killed (a crash, `kill -9`, a power cut) or ended
+  by Ctrl+\ or a third Ctrl+C while it waited for the module: the module streams on, to a machine that no
+  longer listens. Power it off and on, or turn its WiFi off and on. Or give the other app the module's IP:
+  asked by IP, a module moves its stream to whoever asks.
+- **"no answer in time"**, **"timed out after 2 s"**: the module did not answer. Quitting (or Ctrl+Z) waits
+  for it until 1.5 s after the stop, a stop 2 s. Check that it is still on the network.
+- **"not sent, the wait ran out before its turn"**: that module was never asked. Its release waited behind
+  one to another module that did not answer (the line before it), and the 1.5 s ran out first. The
+  module streams on: cycle its WiFi or power, then check the one that did not answer.
+- **Crossfire** broadcasts while it streams, so other apps find it anyway; it is never sent `joystick_end`
+  ("Not releasing <ip>: Crossfire broadcasts while streaming, ...").
+
+More in [USAGE.md](USAGE.md#using-the-module-from-another-app).
 
 ### The module is found and activated, but no data arrives
 

@@ -80,7 +80,10 @@ main { padding-top: 14px; padding-bottom: 32px; }
 .row.nobtn .mark { visibility: hidden; }
 
 /* ---- controls and forms */
-.actions { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 10px; }
+/* each button with what it does next to it; the answer below them */
+.actions { display: grid; grid-template-columns: max-content minmax(0, 1fr); align-items: center; gap: 8px 12px; }
+.actions .btn { width: 100%; }
+.actions .msg { grid-column: 1 / -1; }   /* (never display: none: a live region must be there to be announced) */
 .btn { min-height: 38px; padding: 0 16px; border-radius: 7px; border: 1px solid var(--line-2); background: var(--card); cursor: pointer; font-weight: 600; }
 .btn:hover:not(:disabled) { border-color: var(--muted); }
 .btn:disabled { opacity: .5; cursor: not-allowed; }
@@ -181,7 +184,8 @@ footer.wrap {
   <section class="card" aria-labelledby="hCtl">
     <h2 id="hCtl" class="sr">Receiver</h2>
     <div class="actions">
-      <button type="button" class="btn" id="startStop" disabled>Start</button>
+      <button type="button" class="btn" id="startStop" disabled aria-describedby="stopHint">Start</button>
+      <span class="hint" id="stopHint">Stop releases the module, so another app can connect to it.</span>
       <button type="button" class="btn" id="restart" disabled aria-describedby="restartHint">Restart stream</button>
       <span class="hint" id="restartHint">Ask the module again for the rate and channels below.</span>
       <span class="msg" id="actMsg" role="status"></span>
@@ -262,12 +266,14 @@ footer.wrap {
   const BTNS = ['BTN_TRIGGER', 'BTN_THUMB', 'BTN_THUMB2', 'BTN_TOP', 'BTN_TOP2', 'BTN_PINKIE', 'BTN_BASE', 'BTN_BASE2'];
   const RAW_MAX = 32767, PRESS = 24576, RELEASE = 20480;   /* the joystick's hysteresis: 75 % / 62.5 % */
   const STATUS_MS = 100, LOG_MS = 1000, LOG_KEEP = 1000;
+  const REL_LOG_MS = 200;     /* the log this often while a stop's release waits for its answer */
   const TITLES = { streaming: 'Connected - streaming', searching: 'Searching for module…', error: 'Error', stopped: 'Stopped' };
 
   let info = null;            /* GET /api/config: defaults, supported values, Crossfire */
   let st = null;              /* the last status */
   let fails = 0, offline = false, lastInstance = null, reqNo = 0, shownNo = 0;
-  let logSince = 0, logBusy = false, logGen = 0, logInstance = null;
+  let logSince = 0, logRun = null, logGen = 0, logInstance = null;   /* logRun: the log read in flight */
+  let rel = null;             /* the Stop being followed in the log (relLine) */
   const touched = new Set();  /* fields the user changed and has not applied yet */
 
   /* ---------------------------------------------------------------- the API */
@@ -511,16 +517,25 @@ footer.wrap {
   /* A button stays enabled while its request runs (a disabled button loses the keyboard focus); a
      second press meanwhile is ignored. */
   let busy = false;
-  async function action(btn, path, doneText) {
+  async function action(btn, path, doneText, release) {
     if (busy) return;
     busy = true;
+    rel = null;
     btn.setAttribute('aria-busy', 'true');
     try {
+      if (release) {
+        /* the log so far: the lines after it are the stop's. A read in flight was asked for before this press,
+           so its lines would come after rel exists: it ends first, then a read of its own */
+        if (logRun) await logRun;
+        await pollLog();
+        rel = { from: logSince, t: performance.now(), ips: new Map(), stopped: false, shown: false };
+      }
       await api(path, {});
-      setMsg($('actMsg'), doneText, '');
+      if (rel) { rel.shown = true; showRel(); } else setMsg($('actMsg'), doneText, '');
       await refresh();
       pollLog();
     } catch (err) {
+      rel = null;
       setMsg($('actMsg'), err.message, 'err');
     } finally {
       busy = false;
@@ -528,9 +543,48 @@ footer.wrap {
       if (st) renderControls(st);
     }
   }
+  /* A stop releases what streams to us (R14): joystick_end, so the module broadcasts again and another app finds
+     it; a module known as Crossfire is left as it is (it broadcasts while streaming). /api/stop answers before the
+     module does, so the message follows the stop's log lines and shows them as logged (the core's texts, the same in
+     every app): "Releasing <ip>: joystick_end ..." (shown as waiting for its answer), then "Released <ip>: ..." or
+     "Releasing <ip> failed: <why> - ...", or "Not releasing <ip>: Crossfire ...". The value per module: null
+     waiting, else { text: its line, failed }. */
+  function relLine(seq, text) {
+    if (!rel || seq <= rel.from) return false;
+    let m;
+    if (text === 'Stopped.') rel.stopped = true;
+    else if ((m = /^Releasing (\S+): joystick_end/.exec(text))) { if (!rel.ips.has(m[1])) rel.ips.set(m[1], null); }
+    else if ((m = /^Released (\S+):/.exec(text))) {
+      if (!rel.ips.has(m[1])) return false;
+      rel.ips.set(m[1], { text, failed: false });
+    }
+    else if ((m = /^Releasing (\S+) failed: /.exec(text))) {
+      if (!rel.ips.has(m[1])) return false;                /* (a late answer to an earlier stop) */
+      rel.ips.set(m[1], { text, failed: true });
+    }
+    else if ((m = /^Not releasing (\S+): Crossfire/.exec(text))) rel.ips.set(m[1], { text, failed: false });
+    else return false;
+    return true;
+  }
+  function relText(r) {
+    const out = ['Stopped.'];
+    for (const [ip, v] of r.ips)
+      out.push(v ? v.text + '.' : 'Releasing ' + ip + ' (joystick_end): waiting for its answer.');
+    return out.join(' ');
+  }
+  function showRel() {
+    if (!rel || !rel.shown) return;
+    const failed = [...rel.ips.values()].some((v) => v && v.failed);
+    setMsg($('actMsg'), relText(rel), failed ? 'warn' : '');
+  }
+  /* the stop's lines are still to come (the stop not applied yet, or an answer awaited): the log is read faster */
+  function relWaiting() {
+    if (!rel || !rel.shown) return false;
+    return [...rel.ips.values()].includes(null) || (!rel.stopped && performance.now() - rel.t < 3000);
+  }
   $('startStop').addEventListener('click', () => {
     const run = st && st.running;
-    action($('startStop'), run ? '/api/stop' : '/api/start', run ? 'Stopped.' : 'Started.');
+    action($('startStop'), run ? '/api/stop' : '/api/start', 'Started.', run);
   });
   /* what the program does with it: a module with no beacon yet that sends 16 channels may be Crossfire, which
      is never sent joystick_end: its restart waits (up to 20 s of streaming) for a beacon that says so */
@@ -733,11 +787,14 @@ footer.wrap {
     logEl.append(d);
   }
   /* logGen: an answer asked for before a reset belongs to the old log (dropped) */
-  function resetLog() { logSince = 0; logInstance = null; logGen++; logEl.replaceChildren(); }
+  function resetLog() { logSince = 0; logInstance = null; logGen++; logEl.replaceChildren(); rel = null; }
 
-  async function pollLog() {
-    if (logBusy) return;
-    logBusy = true;
+  /* one read at a time: a call while one runs gets that one (its lines may be older than the call) */
+  function pollLog() {
+    if (!logRun) logRun = readLog().finally(() => { logRun = null; });
+    return logRun;
+  }
+  async function readLog() {
     try {
       for (let again = 0; again < 3; again++) {
         const gen = logGen;
@@ -751,7 +808,12 @@ footer.wrap {
         const atEnd = logEl.scrollTop + logEl.clientHeight >= logEl.scrollHeight - 8;
         const missed = r.lines[0].seq - logSince - 1;
         if (missed > 0) addLine('… ' + missed + (logSince ? ' lines' : ' earlier lines') + ' not shown', 'gap');
-        for (const l of r.lines) addLine(l.text, '', l.time_ms);
+        let relNew = false;
+        for (const l of r.lines) {
+          addLine(l.text, '', l.time_ms);
+          if (relLine(l.seq, l.text)) relNew = true;
+        }
+        if (relNew) showRel();
         while (logEl.childElementCount > LOG_KEEP) logEl.firstElementChild.remove();
         logSince = r.seq;
         if (atEnd) logEl.scrollTop = logEl.scrollHeight;
@@ -760,8 +822,6 @@ footer.wrap {
       }
     } catch (e) {
       /* the status poll shows the lost connection */
-    } finally {
-      logBusy = false;
     }
   }
   logEl.addEventListener('scroll', () => {
@@ -774,7 +834,7 @@ footer.wrap {
     logLoop = true;
     while (visible()) {
       await pollLog();
-      await sleep(LOG_MS);
+      await sleep(relWaiting() ? REL_LOG_MS : LOG_MS);
     }
     logLoop = false;
   }

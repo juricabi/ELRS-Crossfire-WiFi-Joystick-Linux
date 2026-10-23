@@ -1,7 +1,8 @@
 # Usage reference
 
 Everything `elrs-wifi-joystick` takes and does: command-line options, keys, stdin commands, the web
-page, the settings file, the request (rate and channels), the joystick, the environment and exit codes.
+page, the settings file, the request (rate and channels), using the module from another app, the joystick,
+the environment and exit codes.
 [README.md](../README.md) is the overview; [INSTALL.md](INSTALL.md) covers installing, the service and
 updates; [TROUBLESHOOTING.md](TROUBLESHOOTING.md) helps when something does not work;
 [DESIGN.md](DESIGN.md) explains how it works; [WEB_API.md](WEB_API.md) is the web page's API.
@@ -68,7 +69,7 @@ bars for CH1..CH8 and marks for the 8 buttons. Keys (upper or lower case):
 
 | key | |
 |---|---|
-| `s` | start / stop listening |
+| `s` | start / stop listening (a stop releases the module: [another app can use it](#using-the-module-from-another-app)) |
 | `t` | prompt for the module's IP; empty = find it by its broadcast |
 | `r` | prompt for the rate (the presets, or 10..1000 Hz) |
 | `c` | prompt for the channels (4..16) |
@@ -76,15 +77,18 @@ bars for CH1..CH8 and marks for the 8 buttons. Keys (upper or lower case):
 | `a` | restart the stream, so that a new rate or channel count takes effect (a module known as Crossfire by its beacon is never sent `joystick_end`); see [the request](#the-request-rate-and-channels) |
 | `w` | print the web page's address |
 | `h`, `?` | help |
-| `q`, Ctrl+C | quit (the joystick is centered and removed) |
+| `q`, Ctrl+C | quit (the joystick is centered and removed, the module released) |
 
 In a prompt, Enter alone keeps the value (for `t` it means "find it by its broadcast"), and Esc then
 Enter cancels; the rest of an answer longer than the prompt takes (a paste) is dropped, never run as keys.
 The terminal is restored on exit, on every signal (also `Ctrl+\`, SIGQUIT) and around Ctrl+Z. Ctrl+Z
 stops listening first, so the joystick is centered while the program is stopped ("Suspended: not
-listening (the joystick is centered) until the program goes on (fg)"); it listens again after `fg` or
-`bg`. In the background (after `bg`, or started with `&`) it neither reads the keys nor draws the status
-line: it runs on, its log lines show after `fg`, and `kill %1` ends it.
+listening (the joystick is centered) until the program goes on (fg)"), and releases the module before the
+program stops (it waits for the answer at most 1.5 s after the stop, also after an `s` just before); it
+listens again after `fg` or `bg` if it was listening, and finds the module by its next broadcast. In the
+background (after `bg`, or started with `&`) it neither reads the keys nor draws the status line: it
+runs on, its log lines show after `fg`, and `kill %1` ends it. Stopped (Ctrl+Z), `kill %1` or a closed
+terminal ends it too, without listening again: the module gets nothing more.
 
 **Not interactive** (stdin or stdout is not a terminal, or it runs in the background): log lines with
 the time, and a plain status line every 2 s while streaming, for example
@@ -104,7 +108,7 @@ stdout is a pipe whose reader goes away (`| head -5`), the program quits (not wi
 
 | command | |
 |---|---|
-| `start`, `stop`, `s` | listen, stop, toggle |
+| `start`, `stop`, `s` | listen, stop (it releases the module), toggle |
 | `t IP`, `module IP` | the module's IP; `t` alone: find it by its broadcast |
 | `rate HZ`, `r HZ` | the rate |
 | `interval US`, `i US` | the rate as an interval |
@@ -115,7 +119,7 @@ stdout is a pipe whose reader goes away (`| head -5`), the program quits (not wi
 | `status` | print one status line now |
 | `web`, `w` | print the web page's address |
 | `help`, `h`, `?` | the list of commands |
-| `quit`, `q`, `exit` | quit |
+| `quit`, `q`, `exit` | quit (it releases the module) |
 
 **`--daemon`**: log lines only, each with an ISO 8601 timestamp, a status line every 60 s while
 streaming, and stdin is not read. This is what the service runs ([INSTALL.md](INSTALL.md#the-systemd-user-service)).
@@ -123,9 +127,10 @@ streaming, and stdin is not read. This is what the service runs ([INSTALL.md](IN
 ## The web page
 
 `http://127.0.0.1:11000/` by default: the sticks and buttons live, the rate and jitter, the module, the
-request (rate and channels, with the supported values), the module IP and ports, start / stop /
-restart, and the log. It polls the program 10 times a second while it is visible and loads nothing
-from the internet. When the program restarts, the page starts its log over and reads the settings again.
+request (rate and channels, with the supported values), the module IP and ports, start / stop (Stop
+releases the module, and says how that went as the log tells it: waiting for the answer, released, or
+failed) / restart, and the log. It polls the program 10 times a second while it is visible and loads
+nothing from the internet. When the program restarts, the page starts its log over and reads the settings again.
 Changes apply at once and are saved like the keys' changes.
 
 It accepts requests only for `localhost`, `127.0.0.1`, `[::1]` or an IPv4 address in the `Host`
@@ -211,12 +216,14 @@ is **250 Hz and 16 channels**, the same as the Windows app.
   (up to 8 modules, never forgetting the kind of the one streaming now; with more modules the one heard
   from longest ago is forgotten), and keeps both across a stop and start or a port change (those clear the
   lock, the 5 s limits and waiting restarts): a module that streams to the program again with an older
-  request (it streams on through those) is restarted then, by the rules above ("<ip> still streams
-  250 Hz, 16 channels from before the change - restarting its stream with ..."; a rate that is not one of
-  the presets is shown with its interval, "286 Hz (3500 us)").
+  request (one whose release failed streams on through those) is restarted then, by the rules above, so
+  Crossfire is only logged ("<ip> still streams 250 Hz, 16 channels from before the change - restarting
+  its stream with ..."; a rate that is not one of the presets is shown with its interval, "286 Hz (3500
+  us)"). A module the stop released ("Released <ip>") is not streaming: what it was asked is forgotten,
+  and the start's `joystick_begin` gives it the new request, with no restart.
 - **At startup** the values from the command line and the settings file only set the next
-  `joystick_begin`. A module still streaming from before (it keeps streaming after the program quits,
-  below) keeps its old rate: press `a` (or restart in the web page) to apply them. Only a different
+  `joystick_begin`. A module still streaming from before (another app's stream, or one a killed program
+  left, below) keeps its old rate: press `a` (or restart in the web page) to apply them. Only a different
   channel count is fixed by itself, once per module and session: a module that is surely ELRS and
   streams another channel count than the request (left over from another app or run) is restarted at
   once ("<ip> streams 8 channels, 16 asked for ..."); one of unknown kind that streams 16 while fewer are
@@ -253,9 +260,41 @@ is **250 Hz and 16 channels**, the same as the Windows app.
 
 The web page and the status line show the measured rate and jitter, so you can compare settings.
 
-**The module keeps streaming** after you stop or quit the program: it sends until it is powered off,
-or until something asks it to stop. The program only sends ELRS a stop (`joystick_end`) as part of a
-restart, to change the request.
+## Using the module from another app
+
+An ELRS module streams to the app that asked until it gets `joystick_end`, loses power or loses its
+WiFi, and it broadcasts (beacons) only while it does not stream. So a module left streaming to a
+program that stopped can't be found by any other app: the Windows app, VelociDrone, sticktime-pi, this
+program on another machine. This program releases it:
+
+- **When**: on stop (`s`, `stop`, the web page's Stop, Ctrl+Z), on quit (`q`, Ctrl+C, SIGTERM and
+  SIGHUP, so also when the service stops or you log out) and on a UDP port change.
+- **What**: `action=joystick_end` alone to the module streaming to the program ("Releasing <ip>:
+  joystick_end, so it stops streaming and broadcasts again"). The module stops streaming and broadcasts
+  again at once ("Released <ip>: it broadcasts again, any app can connect to it"): any app finds it by its
+  broadcast, or by its IP. Also released: a module that streams to the program while it is ignored (a
+  second module, one sending placeholder frames, one left by switching the module IP), and one asked to
+  stream less than 3 s ago that has not streamed yet (it may be about to).
+- **Not Crossfire**: a module known as Crossfire by its beacon is never sent `joystick_end` ("Not
+  releasing <ip>: Crossfire broadcasts while streaming, other apps find it as it is"): it broadcasts while
+  it streams, so other apps find it anyway, and what `joystick_end` does to it is unknown. A module that
+  sent no beacon yet (its kind unknown: an ELRS module streaming since before the program started never
+  beacons) is released, except, with a module IP set, another module the program neither asked nor
+  streamed from (it hears only the module IP's broadcasts then, so that one could be a Crossfire).
+- **When it fails**: the log says why ("Releasing <ip> failed: HTTP 500 - it may stream on until its
+  WiFi or power is cycled", or "... failed: connection refused - ..."), and the module streams on: power it
+  off and on, or turn its WiFi off and on. A module gets 2 s to answer ("... failed: timed out after 2 s -
+  ..."). Quitting and Ctrl+Z wait for the module's answer at most 1.5 s after the stop (also a stop just
+  before: a quit 1 s after it waits 0.5 s more), showing the lines as they come, then say "Releasing <ip>
+  failed: no answer in time - ..." and go on. A release still waiting behind that one is not sent then,
+  nor later ("Releasing <ip> failed: not sent, the wait ran out before its turn - ..."). A program that is
+  killed (`kill -9`, a crash, a power cut) or ended by Ctrl+\ (SIGQUIT) releases nothing; a third Ctrl+C
+  ends it without waiting for the answer (the module may stream on).
+- **After a stop** the program does not listen until you start it again; then it finds the module by its
+  next broadcast (ELRS broadcasts every 5 s), or at once with a module IP set (`--module`, `t`): within 2 s
+  when a release of the stop has no answer yet (the requests to the modules go out one at a time). A stop
+  and a start in one go (a script's `s` twice) may catch the last frames before the `joystick_end` lands;
+  the module then comes back with its next broadcast once those frames are 3 s old.
 
 ## The joystick
 
@@ -308,7 +347,10 @@ so bindings carry over, and CH9-CH16 as 8 buttons (like the ELRS Bluetooth joyst
 | 128 + N | ended at once by the third quit signal N (e.g. 130 for SIGINT), below |
 
 SIGINT, SIGTERM and SIGHUP end the program cleanly: the joystick is centered and removed, the socket
-closed. If it hangs while quitting, the third of these signals ends it at once, with exit code
-128 + the signal number. SIGHUP and SIGINT that were ignored when it started stay ignored (`nohup`, a
-script's `cmd &`). SIGPIPE is ignored. Ctrl+Z (SIGTSTP) centers the joystick and stops listening before
-the program stops. Without `--daemon`, a stdout pipe whose reader went away ends it (exit code 0).
+closed, and the module released ([above](#using-the-module-from-another-app); it waits for the module's
+answer at most 1.5 s after the stop). If it hangs while quitting, the third of these signals ends it at
+once, with exit code 128 + the signal number, without waiting for the module's answer (it may stream on).
+SIGHUP and SIGINT that were ignored when it started stay ignored (`nohup`, a script's `cmd &`). SIGPIPE is
+ignored. Ctrl+Z (SIGTSTP) centers the joystick, stops listening and releases the module before the program
+stops; Ctrl+C while it waits for the module's answer quits instead. Without `--daemon`, a stdout pipe whose
+reader went away ends it (exit code 0).

@@ -46,6 +46,8 @@ See the header comment of `core/wifi_proto.h`. In short:
   u16le 0..32767`).
 - Activation: `POST /udpcontrol` with `action=joystick_begin&interval=<us>&channels=<n>`; the module
   streams to the IP that posted. One POST per module per 5 s, on a worker thread.
+- Release: `action=joystick_end` alone on stop, exit and a port change (rule 14), so the module beacons
+  again and other apps find it.
 - Source lock: the first module with real channel data; others are ignored until it is silent for 3 s.
   With a module IP set, only that IP counts.
 - Crossfire placeholder frames (any channel = 0xF26A) and all-out-of-range frames are dropped.
@@ -54,7 +56,7 @@ See the header comment of `core/wifi_proto.h`. In short:
   module only by a **restart**: `joystick_end`, then `joystick_begin` with the request. Crossfire ignores it
   (16 channels, ~90 Hz) and, as what it does with `joystick_end` is unknown, a module known as Crossfire
   by its beacon is never sent one. Only beacons tell the two apart: ELRS beacons only while idle, Crossfire
-  about every 8 s also while streaming. The rules (the Windows app follows the same ones):
+  about every 8 s also while streaming. The rules (the Windows app and sticktime-pi follow the same ones):
   1. Defaults 250 Hz (4000 µs) and 16 channels. Supported: interval 1000..100000 µs (presets
      1000/2000/3000/4000/5000/6667/10000/20000 µs = 1000/500/333/250/200/150/100/50 Hz), channels 4..16.
   2. A change while locked: Crossfire (known by its beacon): logged once per session, nothing sent.
@@ -64,13 +66,14 @@ See the header comment of `core/wifi_proto.h`. In short:
      out when that module locks again (after its 20 s); it is dropped when that module's ELRS beacon gets
      it a `joystick_begin` carrying the request, or when another module takes the lock.
   3. Not locked: the next `joystick_begin` carries the request. What each module was last asked is
-     remembered per module (a table of 8); a module that locks with another remembered request is restarted
-     under rule 2's kind rules (Crossfire: only logged). So a change made while it was not locked (during
-     its activation, a WiFi dropout, a stop, before a switch to it) reaches a module that streams on. (The
-     check runs on every frame: a locked module whose remembered request differs is restarted too, which
-     only `wifi_proto_store_request` without a switch to another module leads to - the engine calls
-     `wifi_proto_set_request` then.) A restart that did not take (rule 6, failed and its module no longer
-     locked; rule 9, cut short) leaves that module's remembered request unknown: its next lock restarts it.
+     remembered per module (a table of 8), and forgotten when a release of it took (rule 14); a module that
+     locks with another remembered request is restarted under rule 2's kind rules (Crossfire: only logged).
+     So a change made while it was not locked (during its activation, a WiFi dropout, a stop, before a
+     switch to it) reaches a module that streams on. (The check runs on every frame: a locked module whose
+     remembered request differs is restarted too, which only `wifi_proto_store_request` without a switch to
+     another module leads to - the engine calls `wifi_proto_set_request` then.) A restart that did not take
+     (rule 6, failed and its module no longer locked; rule 9, cut short) leaves that module's remembered
+     request unknown: its next lock restarts it.
   4. Explicit restart (key `a`, the web page's Restart, the `restart` command): locked: as rule 2
      (Crossfire: logged, nothing sent). Not locked with a module IP set: a module known as ELRS is
      restarted; unknown or Crossfire gets a plain `joystick_begin` past the throttle, never `joystick_end`.
@@ -92,9 +95,10 @@ See the header comment of `core/wifi_proto.h`. In short:
   8. The module IP and the request changed together: the request is stored, the new module's
      `joystick_begin` carries it, the module being left gets nothing.
   9. Stop/start and a port change start a new session: lock, throttles and restart state are cleared; the
-     kinds learnt from beacons and the remembered requests are kept (an ELRS module streams on after a
-     stop, and it never beacons while it streams), except that a module whose restart had not taken (its
-     answer still awaited, or failed) is remembered as unknown (rule 3).
+     kinds learnt from beacons and the remembered requests are kept (an ELRS module whose release failed,
+     or that another app or a killed program left streaming, streams on, and it never beacons while it
+     streams), except that a module whose restart had not taken (its answer still awaited, or failed) is
+     remembered as unknown (rule 3), and a release that took forgets its module's (rule 14).
   10. Tables are bounded (8 modules); the locked module's kind is never evicted. A full table drops the
       entry written longest ago (by a counter, not the time: the datagrams of one drain share a time), never
       the locked module's or the module IP's kind or remembered request. With more than 8 modules each
@@ -107,6 +111,34 @@ See the header comment of `core/wifi_proto.h`. In short:
   13. One POST per module per 5 s for plain activations (the throttle); restarts bypass it and restart it.
       Plain means the automatic ones (beacons, the module IP's re-POST); the `joystick_begin` of rules 4
       and 7 goes out at once too.
+  14. Release: ELRS streams until it gets `joystick_end`, loses power or loses its WiFi, and beacons only
+      while idle, so a module left streaming to a program that stopped can't be found by any other app (the
+      Windows app, a phone, sticktime-pi). A stop (`s`, `stop`, the web page's Stop, Ctrl+Z), the exit (`q`,
+      Ctrl+C, SIGTERM, SIGHUP: also the service stopping) and a port change send `action=joystick_end` alone
+      to the locked module, then to every module that streams to us while we drop its frames (a frame of it
+      less than 3 s ago, and it is a second source, sends placeholder frames, or is not the module IP, e.g.
+      the module left by a switch), then to every module activated less than 3 s ago that has not locked
+      since (it may be about to stream to us); each once, the ones known to stream to us first (the worker
+      sends them in turn: one that does not answer must not hold the others up). Not to a module known as
+      Crossfire by its beacon: it beacons while streaming, so other apps find it anyway, and what
+      `joystick_end` does to it is unknown (logged, nothing sent). A module of unknown kind gets it (an ELRS
+      module streaming since before the start never beaconed to us); with a module IP set, other modules'
+      beacons are not heard, so one of unknown kind that we neither activated nor had locked this session is
+      left alone. The releases outlive the session (a start right after a stop does not drop them; a
+      `joystick_begin` queued after them goes out after them). A release changes no lock, kind or throttle.
+      One that took forgets the module's remembered request: the module is idle, and its next
+      `joystick_begin` gives it the request, so a rate changed while stopped (stop, `rate 500`, start, with a
+      module IP set) is no reason to restart it when it locks. One that fails leaves the module streaming,
+      and its remembered request, as before. Every step is logged with
+      the core's texts, the same in every app: "Releasing <ip>: joystick_end, so it stops streaming and
+      broadcasts again", "Released <ip>: it broadcasts again, any app can connect to it", "Releasing <ip>
+      failed: <why> - it may stream on until its WiFi or power is cycled", "Not releasing <ip>: Crossfire
+      broadcasts while streaming, other apps find it as it is". After a stop the program does not listen,
+      so nothing answers the module's beacons until the next start. A port change is a stop and a start
+      with its release: the modules send to 11000 only, so on another port no frame of theirs would come,
+      and a later stop could not release them. A switch to another module IP is not (rule 7: the module
+      left gets nothing; a stop releases it if it still streams to us). The Windows app and sticktime-pi
+      release the same modules in the same order.
 
 ## 3. Threads and data flow
 
@@ -129,6 +161,15 @@ module ───────────────▶ receive thread ───
   ring under a mutex).
 - **Worker thread**: takes requests from the `wifi_actq_t`, runs `wifi_net_post` (5 s timeout per
   POST, abort when the session changes or on shutdown), puts results back, wakes the receive thread.
+  A release (rule 14) belongs to no session: a stop or a start never drops or aborts it, and its result is
+  logged (`wifi_proto_release_done`, which also forgets the module's remembered request when it took; not
+  counted as an activation). Its POST gets 2 s, not 5: the
+  worker is one thread, so a module that does not answer it (a mistyped module IP, one that just lost
+  power) holds what queues behind it, a start's `joystick_begin` too, 2 s at most ("timed out after 2 s").
+  It is cut short when its wait is over: 1.5 s after the stop at quit and Ctrl+Z (`eng_wait_released`, the
+  exit, below), before its own 2 s; then it fails with "no answer in time" when it was in flight, or "not
+  sent, the wait ran out before its turn" when it still waited behind one that did not answer (it is never
+  sent then, not even later), logged like any other result.
 - **CLI** (main thread) and **web** (its own thread) only use `engine.h`. Commands are kept as state, not
   queued, so none is lost however many come at once (a stop before a start still ends the session); a
   config change names the fields it changes and is merged under the engine's lock, so the CLI and the web
@@ -141,12 +182,34 @@ module ───────────────▶ receive thread ───
   a session: an instance started from `su -`, `sudo -u` or cron finds the one of the session or the user
   service), else `/tmp/elrs-wifi-joystick-<uid>.lock`; a second instance exits with a clear message (exit
   code 3). Closed fds 0-2 at the start are opened on `/dev/null` first (the lock never becomes stdout).
-- Signals: SIGINT/SIGTERM/SIGHUP end the program cleanly (joystick centered and removed); the third one
-  ends it at once (exit code 128 + the signal). SIGHUP and SIGINT ignored at the start stay ignored
-  (nohup, a script's `cmd &`). SIGPIPE ignored; not `--daemon`, a stdout pipe whose reader is gone ends
-  the program. Ctrl+Z (SIGTSTP) stops listening first (the joystick centers: nothing stays held while the
-  process is stopped), then the process; it listens again when it goes on (fg or bg). Interactive, SIGQUIT
-  (`Ctrl+\`) and the fatal signals restore the terminal before the default action.
+- Stop: `do_stop` closes the socket, then in the core's order: `wifi_actq_new_session` (a request in
+  flight is aborted, queued ones dropped; releases stay), `wifi_proto_release` (the hook queues each with
+  `wifi_actq_push_release`: no socket needed, nothing waits), `wifi_proto_reset`; then the joystick centers.
+- Exit (`q`, Ctrl+C, SIGTERM, SIGHUP, a stdout reader gone): the CLI stops the engine, waits for the
+  stop and then for its releases at most 1.5 s (`WIFI_RELEASE_WAIT_US`) after the stop, printing their log
+  lines as they come (`eng_wait_releasing`: "Releasing <ip>: ..." shows at once, "Released <ip>: ..." when
+  the module answers, also in the journal), cuts what is left short (`eng_wait_released`), prints the last
+  lines and gives the terminal back. The 1.5 s count from the last stop that handed releases over,
+  not from the quit: a quit 1 s after a stop whose release is unanswered waits 0.5 s more, one 2 s after
+  it none. `eng_destroy` then ends the receive thread, which stops (and so releases) if it was still
+  running and waits for the releases still under way until 1.5 s after that stop, logging their results;
+  an exit waits that long in all, not twice. Only then does the worker end. Ctrl+Z does the same stop and
+  wait before the process stops, also when the program was stopped already (a stop just before), so no
+  `joystick_end` is left half sent or queued while it is stopped: one sent after a long stop could end a
+  stream another app has taken since. A quit signal during that wait (Ctrl+C) makes it quit instead: the
+  process is not stopped and does not listen again. The receive path never waits: the waits are on the
+  CLI's thread and on the receive thread after its loop has ended.
+- Signals: SIGINT/SIGTERM/SIGHUP end the program cleanly (joystick centered and removed, the module
+  released); the third one ends it at once (exit code 128 + the signal), without waiting for anything (a
+  release still waiting for its answer is left as it is: the module may stream on).
+  SIGHUP and SIGINT ignored at the start stay ignored (nohup, a script's `cmd &`). SIGPIPE ignored; not
+  `--daemon`, a stdout pipe whose reader is gone ends the program. Ctrl+Z (SIGTSTP) stops listening first
+  (the joystick centers: nothing stays held while the process is stopped; the module is released), then
+  the process; it listens again when it goes on (fg or bg), and finds the module by its next beacon. A quit
+  signal that came while it was stopped (`kill %1`: SIGTERM, then SIGCONT; a closed terminal: SIGHUP, then
+  SIGCONT) ends it without listening again: a start would make the quit release the module IP (activated
+  less than 3 s ago), ending the stream of an app that took the module meanwhile.
+  Interactive, SIGQUIT (`Ctrl+\`) and the fatal signals restore the terminal before the default action.
 
 ## 4. The virtual joystick (uinput)
 
@@ -208,9 +271,10 @@ elrs-wifi-joystick [options]
   (CH1-8) + CH9-16 button marks. Keys (raw mode, restored on exit and on every signal):
   `s` start/stop, `t` module IP (prompt; empty = discovery), `r` rate (prompt listing the presets),
   `c` channels (prompt 4-16), `p` UDP port, `a` restart the stream (re-send our request), `w` print the
-  web address, `h`/`?` help, `q` quit (also Ctrl+C). Prompts use cooked mode with echo; Esc/empty input
-  cancels where noted; the rest of an answer longer than the prompt reads (a paste) is dropped, never
-  taken as keys. In the background (Ctrl+Z, then bg) it neither reads nor draws on the terminal (a read
+  web address, `h`/`?` help, `q` quit (also Ctrl+C); a stop and quit release the module (rule 14), which
+  the header's key line and the help say. Prompts use cooked mode with echo; Esc/empty input cancels
+  where noted; the rest of an answer longer than the prompt reads (a paste) is dropped, never taken as
+  keys. In the background (Ctrl+Z, then bg) it neither reads nor draws on the terminal (a read
   would stop it, drawing would write over the shell's line): it runs on, the log lines wait for fg.
 - Not interactive (stdin or stdout not a terminal, or `--daemon`): log lines only, plus a status line
   every 2 s while streaming (like the Windows CLI when redirected); `--daemon` adds ISO timestamps
@@ -246,7 +310,7 @@ also when that file does not exist yet.
 Default `http://127.0.0.1:11000/` (this machine only). The full API is in `docs/WEB_API.md`; summary:
 
 - `GET /` the page; `GET /api/status`, `GET /api/config`, `POST /api/config`, `POST /api/start`,
-  `POST /api/stop`, `POST /api/restart`, `GET /api/log?since=N`.
+  `POST /api/stop` (it releases the module: rule 14), `POST /api/restart`, `GET /api/log?since=N`.
 - Security: `Host` must be `localhost`, `127.0.0.1`, `[::1]` or an IPv4 literal (with an optional
   port), else 403 (DNS rebinding); the page itself asked for by a host name (`raspberrypi.local`) gets a
   short HTML page that says to open it by the IP address. An `Origin` header, when present, must name the same host:port as
@@ -256,6 +320,13 @@ Default `http://127.0.0.1:11000/` (this machine only). The full API is in `docs/
 - The page polls `/api/status` every 100 ms while visible and `/api/log` every second; it never loads
   anything from the internet. Both answers carry the program's `instance`: when it changes (the program
   restarted, whatever its uptime), the page starts its log over and reads the settings again.
+- Stop: `/api/stop` answers before the module does, so the page's message follows the stop's log lines
+  and shows them as logged (rule 14's texts, each ended with a full stop): "Releasing <ip> (joystick_end):
+  waiting for its answer" until the answer, then "Released <ip>: ..." or "Releasing <ip> failed: <why> -
+  it may stream on ..." (a warning), or "Not releasing <ip>: Crossfire ...". It reads the log every 200 ms
+  while it waits. Only lines logged after the press count (a log read under way at the press ends first),
+  and only answers for the modules that stop released. The next button press has its own message: a late
+  answer does not overwrite it.
 
 ## 8. Builds
 
@@ -278,13 +349,21 @@ Tests that replace a module with their own stubs say so in a first-line comment 
 
 - `core/tests`: protocol (every C# engine test, ported) and the POST client.
 - `tests/test_*.c`: joymap, config/options, hints, engine over loopback (fake module in-process, no
-  uinput), web (HTTP parsing, security checks, JSON, with a stub engine), uinput event encoding.
+  uinput; the release on stop, port change and exit, its logs, the exit's 1.5 s at most after the stop,
+  also line by line, what is cut short and how it is logged, a release nobody answers holding a start
+  2 s at most, Crossfire never),
+  web (HTTP parsing, security checks, JSON, with a stub engine), uinput event encoding.
 - `tests/e2e.py` (stdlib Python 3.8+): the real binary with `--no-joystick` against `fake_elrs.py`
   modules on 127.0.0.2/127.0.0.3: discovery, streaming, rate change → restart, Crossfire, module IP,
-  stop/start, CLI stdin commands, settings file, web API, single instance, signals.
+  stop/start, CLI stdin commands, settings file, web API, single instance, signals, the release (stop,
+  `q`, SIGTERM, SIGHUP, Ctrl+Z and a port change send `joystick_end`; the module beacons again and
+  another program finds it; Crossfire never; an exit and Ctrl+Z wait for an answer at most 1.5 s after the
+  stop, also a stop just before, showing the lines as they come, and what they cut short never goes out
+  later; Ctrl+C while Ctrl+Z waits quits; `kill %1` of the stopped program quits without listening again).
 - `tests/uinput_e2e.py`: with `/dev/uinput` (CI: `sudo modprobe uinput`): the device appears with the
   right name, axes and ranges, follows the fake module's sticks, centers on lock loss, disappears at exit.
-- `tests/test_ui.py` (Playwright, headless Chromium): the page against the real binary + fake module.
+- `tests/test_ui.py` (Playwright, headless Chromium): the page against the real binary + fake module
+  (Stop's message follows the release's log lines: waiting, released, refused, Crossfire).
 - Every unit test on every architecture under qemu-user in CI.
 
 ## 10. Install and update

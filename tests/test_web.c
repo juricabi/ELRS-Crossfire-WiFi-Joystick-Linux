@@ -102,6 +102,8 @@ int eng_set_config(engine_t *e, const eng_config_t *c, char *err, size_t cap) {
   return eng_update_config(e, c, ENG_F_ALL, NULL, err, cap);
 }
 bool eng_wait_applied(engine_t *e, int timeout_ms) { return true; }
+bool eng_wait_released(engine_t *e, int timeout_ms) { return true; }     /* (the CLI's; it is linked in) */
+int eng_wait_releasing(engine_t *e, uint32_t log_seq, int timeout_ms) { return 1; }
 
 void eng_snapshot(engine_t *e, eng_snapshot_t *out) {
   pthread_mutex_lock(&smu);

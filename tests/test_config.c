@@ -660,6 +660,9 @@ static void texts(void) {
                                       "--web", "--no-web", "--no-joystick", "--no-buttons", "--name", "--config",
                                       "--no-config", "--daemon", "--list-rates", "--version", "--help" };
   for (size_t i = 0; i < sizeof opts / sizeof opts[0]; i++) CHECK(strstr(buf, opts[i]) != NULL);
+  /* R14: what stop and quit do to the module */
+  CHECK(strstr(buf, "Stop and quit (also Ctrl+C, SIGTERM) release the module: it stops streaming to this machine and\n"
+                    "broadcasts again, so another app can connect to it") != NULL);
   /* the last line: the project, the author's GitHub profile and Ko-fi */
   static const char links[] = "https://github.com/juricabi/ELRS-Crossfire-WiFi-Joystick-Linux"
                               " - by juricabi: https://github.com/juricabi - Ko-fi: https://ko-fi.com/juricabi\n";

@@ -6,10 +6,11 @@ build/native/elrs-wifi-joystick), else against tests/web_demo.c (src/web.c + a f
 builds itself. --demo / --real force one. Checks: the page loads without console errors, the bars
 follow the sticks (CH9-16 as buttons with the joystick's hysteresis), the rate and channel selects
 offer exactly the supported values, applying a change works and errors show inline, Crossfire
-disables rate/channels with its note, start/stop, restart, the log panel (autoscroll unless scrolled
-up), polling only while visible, phone width without sideways scrolling, light and dark, keyboard
-use, no layout shift while numbers change, the footer's links (a new tab; nothing is loaded from them or
-from anywhere but the program), and the lost-connection banner.
+disables rate/channels with its note, start/stop (Stop releases the module, and says how that went, from
+the log: waiting, released, refused; not Crossfire; not lines older than the press), restart, the log panel
+(autoscroll unless scrolled up), polling only while visible, phone width without sideways scrolling, light
+and dark, keyboard use, no layout shift while numbers change, the footer's links (a new tab; nothing is
+loaded from them or from anywhere but the program), and the lost-connection banner.
 
     python3 tests/test_ui.py [--demo | --real] [-k name]
 Environment: BIN (the program), CC (for the demo), CHROMIUM (a Chromium binary, when Playwright's own
@@ -203,8 +204,12 @@ class Real:
 
     def restart(self, power_cycle=True):
         """the program ends and starts again (a service restart, an update); power_cycle: the module too (it
-        beacons again), else it streams on to the new program, which then knows nothing about it"""
-        self.p.terminate()
+        beacons again), else the program is killed (SIGKILL: no release, R14) and the module streams on to the
+        new program, which then knows nothing about it"""
+        if power_cycle:
+            self.p.terminate()
+        else:
+            self.p.kill()
         self.p.wait(5)
         if power_cycle:
             with self.elrs.lock:
@@ -501,6 +506,23 @@ def t_crossfire(br, h):
         expect(p.locator("#ask")).to_contain_text(re.compile(r"getting (8[5-9]|9[0-5]) Hz × 16 ch"), timeout=5000)
         expect(p.locator("#fPort")).to_be_enabled()
         expect(p.locator("#fIp")).to_be_enabled()
+        # Stop: a Crossfire module is not released (it broadcasts while streaming), and the page says so
+        p.locator("#startStop").click()
+        xf_ip = "127.0.0.3" if h.name == "real" else "127.0.0.2"
+        text = "Stopped. Not releasing " + xf_ip + ": Crossfire broadcasts while streaming, other apps find it as it is."
+        if h.name == "real":
+            # the ELRS module left by the switch to the Crossfire module IP still streams to us: released (R14)
+            text += " Released 127.0.0.2: it broadcasts again, any app can connect to it."
+        expect(p.locator("#actMsg")).to_have_text(text, timeout=3000)
+        expect(p.locator("#actMsg")).to_have_class("msg")
+        if h.name == "real":
+            assert not h.elrs.state()["active"]
+        expect(p.locator("#log")).to_contain_text("Not releasing " + xf_ip + ": Crossfire broadcasts while streaming",
+                                                  timeout=3000)
+        p.locator("#startStop").click()
+        wait_streaming_page(pg, h)
+        if h.name == "real":
+            assert h.xf.npost("joystick_end") == 0
     finally:
         h.crossfire(False)
     expect(p.locator("#bDetail")).to_contain_text("ELRS", timeout=15000 * h.slow)
@@ -513,12 +535,15 @@ def t_crossfire(br, h):
 
 
 def t_start_stop(br, h):
-    """Stop and Start"""
+    """Stop and Start; Stop releases the module (R14), and says so once the log does"""
+    h.identify()                               # (whatever ran before: an ELRS module known by its beacon)
     pg = Page(br, h.url)
     p = pg.page
     wait_streaming_page(pg, h)
     ss = p.locator("#startStop")
     expect(ss).to_have_text("Stop")
+    expect(p.locator("#stopHint")).to_have_text("Stop releases the module, so another app can connect to it.")
+    expect(ss).to_have_accessible_description("Stop releases the module, so another app can connect to it.")
     ss.click()
     expect(p.locator("#bState")).to_have_text("Stopped", timeout=3000)
     expect(p.locator("#banner")).to_have_class("banner st-stopped")
@@ -527,19 +552,163 @@ def t_start_stop(br, h):
     expect(p.locator("#restart")).to_be_disabled()
     expect(pct(p, 0)).to_have_text("--")
     expect(p.locator("#rate")).to_have_text("--")
-    expect(p.locator("#actMsg")).to_have_text("Stopped.")
+    # (the message shows the log lines as logged)
+    expect(p.locator("#actMsg")).to_have_text("Stopped. Released 127.0.0.2: it broadcasts again, any app can connect "
+                                              "to it.", timeout=3000)
+    expect(p.locator("#log")).to_contain_text("Released 127.0.0.2: it broadcasts again, any app can connect to it")
     assert http(h.url, "/api/status")[1]["running"] is False
+    if h.name == "real":
+        assert h.elrs.npost("joystick_end") >= 1 and not h.elrs.state()["active"]
     ss.click()
     expect(ss).to_have_text("Stop", timeout=3000)
-    wait_streaming_page(pg, h)
+    wait_streaming_page(pg, h)                 # (real: the released module is found again by its beacon)
     expect(pct(p, 0)).not_to_have_text("--")
-    # the module streamed on (Stop sends no joystick_end) and so sent no beacon: still known as ELRS, and a
-    # restart goes out at once (not after the 20 s wait for a module that may be Crossfire)
+    # known as ELRS (its beacon), and a restart goes out at once (not after the 20 s wait for a module that may
+    # be Crossfire)
     expect(p.locator("#bDetail")).to_contain_text("127.0.0.2 · ELRS · Unified TX", timeout=3000)
     before = http(h.url, "/api/status")[1]["counters"]["restarts"]
     p.get_by_role("button", name="Restart stream").click()
     expect(p.locator("#actMsg")).to_have_text("Asked the module to restart its stream.", timeout=3000)
     wait_until(lambda: http(h.url, "/api/status")[1]["counters"]["restarts"] > before, 5, "the restart counter")
+    assert not pg.problems(), pg.problems()
+    pg.close()
+
+
+def t_stop_release(br, h):
+    """Stop's message says what the log says about the release, not more: waiting for the answer, then released;
+    refused (the module streams on: said so, as a warning)"""
+    h.identify()                               # (whatever ran before: an ELRS module known by its beacon)
+    pg = Page(br, h.url)
+    p = pg.page
+    wait_streaming_page(pg, h)
+    ss = p.locator("#startStop")
+    msg = p.locator("#actMsg")
+
+    def click():                               # (a press while the button's last request runs is ignored)
+        expect(ss).not_to_have_attribute("aria-busy", "true")
+        ss.click()
+
+    # the answer takes a while: the page waits for it (real: within the 2 s a release gets)
+    if h.name == "real":
+        with h.elrs.lock:
+            h.elrs.http_delay = 1.2
+    else:
+        h.cmd("release wait")
+    click()
+    expect(msg).to_have_text("Stopped. Releasing 127.0.0.2 (joystick_end): waiting for its answer.", timeout=3000)
+    expect(msg).to_have_class("msg")
+    if h.name == "demo":
+        h.cmd("log Released 127.0.0.2: it broadcasts again, any app can connect to it")
+    expect(msg).to_have_text("Stopped. Released 127.0.0.2: it broadcasts again, any app can connect to it.",
+                             timeout=5000)
+    if h.name == "real":
+        assert not h.elrs.state()["active"]
+        with h.elrs.lock:
+            h.elrs.http_delay = 0.0
+    else:
+        h.cmd("release ok")
+    click()
+    expect(msg).to_have_text("Started.", timeout=3000)
+    wait_streaming_page(pg, h)                 # (real: found again by its beacon)
+    # refused: the page says so, and the module streams on
+    if h.name == "real":
+        with h.elrs.lock:
+            h.elrs.http_status = 500
+    else:
+        h.cmd("release fail HTTP 500")
+    try:
+        click()
+        expect(msg).to_have_text("Stopped. Releasing 127.0.0.2 failed: HTTP 500 - it may stream on until its WiFi or "
+                                 "power is cycled.", timeout=3000)
+        expect(msg).to_have_class("msg warn")
+        expect(p.locator("#log")).to_contain_text("Releasing 127.0.0.2 failed: HTTP 500 - it may stream on until its "
+                                                  "WiFi or power is cycled")
+        if h.name == "real":
+            assert h.elrs.state()["active"]
+    finally:
+        if h.name == "real":
+            with h.elrs.lock:
+                h.elrs.http_status = 200
+        else:
+            h.cmd("release ok")
+    click()
+    expect(msg).to_have_text("Started.", timeout=3000)
+    expect(msg).to_have_class("msg")
+    wait_streaming_page(pg, h)                 # (real: it streamed on: locked again at once)
+    # the next action's message is its own: a release answered after it does not overwrite it
+    if h.name == "real":
+        with h.elrs.lock:
+            h.elrs.http_delay = 1.5
+    else:
+        h.cmd("release wait")
+    released = p.locator("#log div").filter(has_text="Released 127.0.0.2")
+    n0 = released.count()
+    try:
+        click()
+        expect(msg).to_have_text("Stopped. Releasing 127.0.0.2 (joystick_end): waiting for its answer.", timeout=3000)
+        click()
+        expect(msg).to_have_text("Started.", timeout=3000)
+        if h.name == "demo":
+            h.cmd("log Released 127.0.0.2: it broadcasts again, any app can connect to it")
+        expect(released).to_have_count(n0 + 1, timeout=5000)
+        expect(msg).to_have_text("Started.")
+    finally:
+        if h.name == "real":
+            with h.elrs.lock:
+                h.elrs.http_delay = 0.0
+        else:
+            h.cmd("release ok")
+    wait_streaming_page(pg, h)                 # (real: found again by its beacon)
+    assert not pg.problems(), pg.problems()
+    pg.close()
+
+
+def t_stop_log_in_flight(br, h):
+    """Stop pressed while a log read is under way: what that read brings (older than the press: here an earlier
+    stop's release) is not taken for this stop's, nor is a late answer to a module this stop did not release (demo
+    only: its log takes any line)"""
+    if h.name != "demo":
+        return "skipped (demo only)"
+    pg = Page(br, h.url)
+    p = pg.page
+    wait_streaming_page(pg, h)
+    ss = p.locator("#startStop")
+    msg = p.locator("#actMsg")
+    # the first log answer that carries 127.0.0.7 is held 1.5 s in the page (a slow link): it is in flight when
+    # Stop is pressed
+    p.evaluate("""() => {
+      const f = window.fetch;
+      window.held = 0;
+      window.fetch = async (u, o) => {
+        const r = await f(u, o);
+        if (!window.held && String(u).startsWith('/api/log') && (await r.clone().text()).includes('127.0.0.7')) {
+          window.held = 1;
+          await new Promise((ok) => setTimeout(ok, 1500));
+          window.held = 2;
+        }
+        return r;
+      };
+    }""")
+    h.cmd("log Releasing 127.0.0.7: joystick_end, so it stops streaming and broadcasts again")
+    wait_until(lambda: p.evaluate("() => window.held") == 1, 3, "the log read held")   # (the page's CSP: no eval)
+    h.cmd("release wait")
+    try:
+        ss.click()
+        expect(msg).to_have_text("Stopped. Releasing 127.0.0.2 (joystick_end): waiting for its answer.", timeout=4000)
+        wait_until(lambda: p.evaluate("() => window.held") == 2, 3, "the held log read done")
+        expect(p.locator("#log")).to_contain_text("Releasing 127.0.0.7: joystick_end")
+        # a late answer to a module this stop did not release
+        h.cmd("log Releasing 127.0.0.9 failed: HTTP 500 - it may stream on until its WiFi or power is cycled")
+        expect(p.locator("#log")).to_contain_text("Releasing 127.0.0.9 failed: HTTP 500", timeout=3000)
+        h.cmd("log Released 127.0.0.2: it broadcasts again, any app can connect to it")
+        expect(msg).to_have_text("Stopped. Released 127.0.0.2: it broadcasts again, any app can connect to it.",
+                                 timeout=3000)
+        expect(msg).to_have_class("msg")
+    finally:
+        h.cmd("release ok")
+    expect(ss).not_to_have_attribute("aria-busy", "true")
+    ss.click()
+    expect(msg).to_have_text("Started.", timeout=3000)
     assert not pg.problems(), pg.problems()
     pg.close()
 
@@ -953,9 +1122,9 @@ def t_offline(br, h):
     pg.close()
 
 
-TESTS = [t_load, t_bars, t_selects, t_apply, t_errors, t_crossfire, t_start_stop, t_restart, t_log, t_visibility,
-         t_phone, t_keyboard, t_no_shift, t_joystick, t_states, t_restart_deferred, t_restart_keeps_unapplied,
-         t_log_restart, t_counters, t_footer, t_offline]
+TESTS = [t_load, t_bars, t_selects, t_apply, t_errors, t_crossfire, t_start_stop, t_stop_release, t_stop_log_in_flight,
+         t_restart, t_log, t_visibility, t_phone, t_keyboard, t_no_shift, t_joystick, t_states, t_restart_deferred,
+         t_restart_keeps_unapplied, t_log_restart, t_counters, t_footer, t_offline]
 
 
 def chromium(pw):

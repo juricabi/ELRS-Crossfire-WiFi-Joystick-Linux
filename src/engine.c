@@ -1,7 +1,7 @@
 /* The receiver: see engine.h. One receive thread owns the socket, wifi_proto and the joystick; one
- * worker thread sends the activation POSTs and does what the receive thread must not (file reads,
- * getifaddrs). Everything else reaches them through the command queue (mu), the activation queue
- * (qmu) and the snapshot + log ring (smu).
+ * worker thread sends the activation POSTs and the releases (R14: joystick_end on a stop) and does what
+ * the receive thread must not (file reads, getifaddrs). Everything else reaches them through the command
+ * queue (mu), the activation queue (qmu) and the snapshot + log ring (smu).
  *
  * Ported from sticktime-pi host/src/input_wifi.c (the same author's, MIT here): the socket, the drain
  * with kernel timestamps, the worker, activation logging, the status text and the gap log. That follows
@@ -40,6 +40,19 @@
 #define RCVBUF (256 * 1024)
 #define SIGNAL_PERIOD_MS 2000         /* the WiFi signal sample for the gap log, while streaming */
 #define TS_MAX_AGE_US 2000000         /* an older kernel receive time is not believed */
+#define CUT_WAIT_MS 1000              /* the results of releases cut short: an abort is noticed within 100 ms */
+/* why a release cut short failed (its log line: wifi_proto_release_done): in flight, or still queued behind one
+ * that did not answer (never sent) */
+#define CUT_TEXT "no answer in time"
+#define CUT_UNSENT_TEXT "not sent, the wait ran out before its turn"
+/* A release's POST (R14), not WIFI_POST_TIMEOUT_MS: the worker is one thread, so a module that does not answer (a
+ * mistyped module IP, one that just lost power) holds what queues behind it, a start's joystick_begin too, at most
+ * this long. A module answers joystick_end in milliseconds. Longer than WIFI_RELEASE_WAIT_US plus the 100 ms an
+ * abort takes, so the wait of an exit or Ctrl+Z always ends first and cuts short what is left itself (CUT_TEXT,
+ * CUT_UNSENT_TEXT): a release that timed out just before the cut would let the next one go out. Whole seconds, as
+ * the core's text says them: "timed out after 2 s". */
+#define RELEASE_POST_MS 2000
+_Static_assert(RELEASE_POST_MS >= WIFI_RELEASE_WAIT_US / 1000 + 300, "the exit's wait ends before a release's POST");
 
 struct engine {
   eng_options_t opt;
@@ -76,6 +89,7 @@ struct engine {
   uint32_t gaps, gaps_unlogged;
   int64_t gap_max_us, gap_logged_at;
   uint32_t posts, posts_ok, posts_failed;
+  int64_t rel_at;                 /* R14: when the last stop handed releases to the worker (0 = never) */
   uint8_t buf[2048];
   eng_snapshot_t work;            /* built each pass, published when it differs */
   uint32_t cmd_taken;             /* cmd_seq of the commands applied in this pass */
@@ -97,6 +111,8 @@ struct engine {
   pthread_cond_t qcv;
   wifi_actq_t q;
   bool wquit;
+  bool rel_cut;                   /* the releases under way are cut short (eng_wait_released, the exit), until
+                                     none is left */
   bool want_addrs;                /* a bind happened: log this machine's addresses, look at the firewall */
   bool want_signal;               /* streaming: sample the WiFi signal for the gap log */
   int signal_dbm;                 /* 0 = unknown */
@@ -109,6 +125,8 @@ struct engine {
   pthread_cond_t scv;
   eng_snapshot_t snap;
   uint32_t cmd_done;              /* cmd_seq of the commands applied and published */
+  int64_t rel_by;                 /* published with cmd_done: rel_at + WIFI_RELEASE_WAIT_US, the end of the wait
+                                     for the releases under way (0 = no stop handed any over yet) */
   eng_logline_t ring[ENG_LOG_LINES];
   uint32_t log_seq;
 };
@@ -301,6 +319,60 @@ void eng_restart_stream(engine_t *e) {
   wake(e);
 }
 
+/* the commands given before want applied (their releases handed over) and the snapshot's releasing 0, at most
+ * until dl and, with by_stop, once those commands are applied at most until rel_by (WIFI_RELEASE_WAIT_US after the
+ * stop that handed the releases over, also when that stop came long before): 1 when both are, -1 when the time ran
+ * out first, 0 when a log line after log_seq came first (UINT32_MAX: never) */
+static int wait_releasing(engine_t *e, uint32_t want, uint32_t log_seq, const struct timespec *dl, bool by_stop) {
+  pthread_mutex_lock(&e->smu);
+  int r;
+  for (;;) {
+    bool applied = (int32_t)(e->cmd_done - want) >= 0;
+    if (applied && e->snap.releasing == 0) { r = 1; break; }
+    if (e->snap.log_seq > log_seq) { r = 0; break; }
+    struct timespec d = *dl;
+    if (by_stop && applied && e->rel_by) {
+      /* (the clocks agree: wifi_net_now_us and scv are CLOCK_MONOTONIC) */
+      struct timespec t = { (time_t)(e->rel_by / 1000000), (long)(e->rel_by % 1000000) * 1000L };
+      if (t.tv_sec < d.tv_sec || (t.tv_sec == d.tv_sec && t.tv_nsec < d.tv_nsec)) d = t;
+    }
+    if (pthread_cond_timedwait(&e->scv, &e->smu, &d) == ETIMEDOUT) { r = -1; break; }
+  }
+  pthread_mutex_unlock(&e->smu);
+  return r;
+}
+
+int eng_wait_releasing(engine_t *e, uint32_t log_seq, int timeout_ms) {
+  pthread_mutex_lock(&e->mu);
+  uint32_t want = e->cmd_seq;
+  pthread_mutex_unlock(&e->mu);
+  if (timeout_ms < 0) timeout_ms = 0;
+  struct timespec dl;
+  abs_deadline(&dl, timeout_ms);
+  return wait_releasing(e, want, log_seq, &dl, true);
+}
+
+bool eng_wait_released(engine_t *e, int timeout_ms) {
+  pthread_mutex_lock(&e->mu);
+  uint32_t want = e->cmd_seq;
+  pthread_mutex_unlock(&e->mu);
+  if (timeout_ms < 0) timeout_ms = 0;
+  struct timespec dl;
+  abs_deadline(&dl, timeout_ms);
+  if (wait_releasing(e, want, UINT32_MAX, &dl, true) == 1) return true;
+  /* what is left is cut short (each one logged as failed), so no joystick_end is still on its way when the
+   * program ends or stops: the one in flight notices within 100 ms, the queued ones are not sent */
+  pthread_mutex_lock(&e->qmu);
+  if (wifi_actq_releases(&e->q)) {
+    e->rel_cut = true;
+    pthread_cond_signal(&e->qcv);
+  }
+  pthread_mutex_unlock(&e->qmu);
+  abs_deadline(&dl, CUT_WAIT_MS);
+  wait_releasing(e, want, UINT32_MAX, &dl, false);
+  return false;
+}
+
 bool eng_wait_applied(engine_t *e, int timeout_ms) {
   pthread_mutex_lock(&e->mu);
   uint32_t want = e->cmd_seq;
@@ -365,12 +437,15 @@ int eng_set_config(engine_t *e, const eng_config_t *c, char *err, size_t cap) {
 }
 
 /* ================================================================ worker */
-typedef struct { engine_t *e; uint32_t session; } abort_ctx_t;
+typedef struct { engine_t *e; uint32_t session; bool release; } abort_ctx_t;
 
+/* A request of an old session (a stop, a start) ends at once. A release (R14) is never stale: it is cut short
+ * only when its wait is over (rel_cut: the end of eng_wait_released or of the exit, at most WIFI_RELEASE_WAIT_US
+ * after the stop), or by wquit, which comes after that */
 static bool post_aborted(void *ud) {
   abort_ctx_t *a = ud;
   pthread_mutex_lock(&a->e->qmu);
-  bool r = a->e->wquit || wifi_actq_stale(&a->e->q, a->session);
+  bool r = a->e->wquit || wifi_actq_stale(&a->e->q, a->session) || (a->release && a->e->rel_cut);
   pthread_mutex_unlock(&a->e->qmu);
   return r;
 }
@@ -412,12 +487,25 @@ static void *worker_main(void *arg) {
     }
     wifi_actreq_t rq;
     if (wifi_actq_take(&e->q, &rq)) {
-      pthread_mutex_unlock(&e->qmu);
       wifi_actres_t rs;
-      abort_ctx_t ac = { e, rq.session };
-      wifi_net_post(&rq, &rs, WIFI_POST_TIMEOUT_MS, post_aborted, &ac);
+      if (rq.release && e->rel_cut) {
+        /* its wait is over before it went out (an earlier one took it): failed, never sent */
+        memset(&rs, 0, sizeof rs);
+        rs.ip = rq.ip;
+        rs.session = rq.session;
+        rs.release = true;
+        snprintf(rs.err, sizeof rs.err, "%s", CUT_UNSENT_TEXT);
+        wifi_actq_put(&e->q, &rs);
+        wake(e);
+        continue;
+      }
+      pthread_mutex_unlock(&e->qmu);
+      abort_ctx_t ac = { e, rq.session, rq.release };
+      wifi_net_post(&rq, &rs, rq.release ? RELEASE_POST_MS : WIFI_POST_TIMEOUT_MS, post_aborted, &ac);
       pthread_mutex_lock(&e->qmu);
-      wifi_actq_put(&e->q, &rs);        /* dropped when the session changed meanwhile */
+      if (rs.release && !rs.ok && e->rel_cut && !strcmp(rs.err, "aborted"))
+        snprintf(rs.err, sizeof rs.err, "%s", CUT_TEXT);      /* cut short: its wait is over */
+      wifi_actq_put(&e->q, &rs);        /* dropped when the session changed meanwhile (a release never) */
       wake(e);
       continue;
     }
@@ -530,6 +618,15 @@ static void h_frame(void *ud, uint32_t src, const uint16_t *raw, int n) {
 
 static int h_activate(void *ud, const wifi_act_t *a) {
   engine_t *e = ud;
+  if (a->release) {
+    /* R14: joystick_end alone, of no session (a stop's new session keeps it). The queue's answer alone, before
+     * the checks below: a release needs no socket, and do_stop has closed it */
+    pthread_mutex_lock(&e->qmu);
+    int r = wifi_actq_push_release(&e->q, a->ip, e->cfg.http_port);
+    if (r == WIFI_ACT_QUEUED) pthread_cond_signal(&e->qcv);
+    pthread_mutex_unlock(&e->qmu);
+    return r;
+  }
   if (!e->wth_ok) return WIFI_ACT_FAILED;
   if (e->sock < 0) return WIFI_ACT_BUSY;        /* not listening: POST after the bind */
   char body[64];
@@ -681,9 +778,15 @@ static void collect_results(engine_t *e, int64_t now) {
   int n = 0;
   pthread_mutex_lock(&e->qmu);
   while (n < WIFI_ACTQ && wifi_actq_get(&e->q, &res[n])) n++;
+  if (e->rel_cut && !wifi_actq_releases(&e->q)) e->rel_cut = false;    /* the cut releases are all in */
   pthread_mutex_unlock(&e->qmu);
   for (int i = 0; i < n; i++) {
     const wifi_actres_t *r = &res[i];
+    if (r->release) {
+      /* R14: a stop's joystick_end. Only logged: no activation (activation_done never sees it), no counter */
+      wifi_proto_release_done(&e->p, r->ip, r->ok, r->status, r->err);
+      continue;
+    }
     char ip[16];
     wifi_ip_str(r->ip, ip);
     /* a restart: its joystick_end first (a failure there still lets the joystick_begin go out). It only took
@@ -731,22 +834,29 @@ static void do_start(engine_t *e, int64_t now) {
   try_bind(e, now);
 }
 
-static void do_stop(engine_t *e, bool quiet) {
+/* A stop (also of a port change, Ctrl+Z and the exit). R14: ELRS streams until it gets joystick_end and beacons
+ * only while idle, so a module left streaming to us could not be found by any other app: what streams to us is
+ * released, in the core's order (the queue's new session first, so the worker aborts a request in flight and a
+ * joystick_begin queued for a module can't follow its joystick_end; the reset after the release, which reads the
+ * lock). The releases go out on the worker after the socket is closed: nothing listens for the beacons that
+ * follow until the next start. */
+static void do_stop(engine_t *e, int64_t now, bool quiet) {
   if (!e->running) return;
   e->running = false;
   if (e->sock >= 0) close(e->sock);
   e->sock = -1;
   pthread_mutex_lock(&e->qmu);
-  wifi_actq_new_session(&e->q);       /* the worker aborts a request in flight */
+  wifi_actq_new_session(&e->q);       /* the worker aborts a request in flight (a release stays) */
   e->want_signal = false;
   pthread_mutex_unlock(&e->qmu);
+  if (wifi_proto_release(&e->p, now) > 0) e->rel_at = now;
   wifi_proto_reset(&e->p);
   wifi_proto_set_state(&e->p, WIFI_ST_STOPPED, "");
   joy_center(e);
   e->was_bound = false;
   e->gap_prev = 0;
   e->rs_at = 0;
-  if (!quiet) eng_log(e, "Stopped. (The module keeps broadcasting until powered off.)");
+  if (!quiet) eng_log(e, "Stopped.");
 }
 
 /* the module IP of e->cfg as the target: at once while running, else at the next bind (rebinding: the
@@ -775,7 +885,13 @@ static void apply_target(engine_t *e, int64_t now, bool rebinding) {
 static void apply_config(engine_t *e, const eng_config_t *n, int64_t now) {
   eng_config_t old = e->cfg;
   bool port = n->port != old.port, rebind = port && e->running;
-  if (rebind) do_stop(e, true);
+  if (rebind) {
+    /* a stop and a start, with its release (R14: the modules send to 11000 only, so on another port no frame
+     * of theirs comes and a later stop could not release them); a new module web port in the same change is
+     * where the release goes */
+    e->cfg.http_port = n->http_port;
+    do_stop(e, now, true);
+  }
   e->cfg = *n;
   if (n->interval_us != old.interval_us || n->channels != old.channels) {
     eng_log(e, "Asking for %d Hz (%d us) and %d channels", wifi_interval_hz(n->interval_us), n->interval_us,
@@ -807,7 +923,7 @@ static bool run_commands(engine_t *e, int64_t now) {
   bool quit = e->quit;
   eng_config_t req = e->cfg_req;
   pthread_mutex_unlock(&e->mu);
-  if (stop) do_stop(e, false);
+  if (stop) do_stop(e, now, false);
   if (cfg_new && memcmp(&req, &e->cfg, sizeof req)) apply_config(e, &req, now);
   if (run == 1 && !e->running) do_start(e, now);
   if (restart) {
@@ -865,6 +981,9 @@ static void publish(engine_t *e) {
   eng_snapshot_t *w = &e->work;
   const wifi_proto_t *p = &e->p;
   uint32_t pend = activating_ip(e);
+  pthread_mutex_lock(&e->qmu);
+  w->releasing = wifi_actq_releases(&e->q);
+  pthread_mutex_unlock(&e->qmu);
   w->running = e->running;
   w->listening = e->sock >= 0;
   w->state = p->state;
@@ -914,6 +1033,7 @@ static void publish(engine_t *e) {
   memcpy(&w->cfg, &e->snap.cfg, sizeof w->cfg);
   bool changed = e->cmd_done != e->cmd_taken;   /* eng_wait_applied waits for this */
   e->cmd_done = e->cmd_taken;
+  e->rel_by = e->rel_at ? e->rel_at + WIFI_RELEASE_WAIT_US : 0;   /* (a stop in those commands: with them) */
   if (memcmp(w, &e->snap, sizeof *w)) {
     memcpy(&e->snap, w, sizeof *w);
     e->snap.seq++;
@@ -935,6 +1055,36 @@ static void lock_changes(engine_t *e) {
     /* lock lost: the sticks go to the center (vJoy's ResetVJD in the Windows app); a later lock is no gap */
     joy_center(e);
     e->gap_prev = 0;
+  }
+}
+
+/* R14 at exit, after the last stop: the releases still under way (this one's, or an earlier stop's) get until
+ * WIFI_RELEASE_WAIT_US after that stop handed them over, so an exit waits at most that long in all (the CLI's
+ * eng_wait_released before it included). Their results are logged as they come: the worker wakes this thread
+ * after each one. What is left then is cut short, and logged too. The receive path is over: this holds up
+ * nothing. */
+static void exit_releases(engine_t *e) {
+  int64_t by = e->rel_at + WIFI_RELEASE_WAIT_US, cut_by = 0;
+  for (;;) {
+    pthread_mutex_lock(&e->qmu);
+    int left = wifi_actq_releases(&e->q);
+    int64_t now = wifi_net_now_us();
+    if (left && now >= by && !cut_by) {
+      e->rel_cut = true;
+      pthread_cond_signal(&e->qcv);
+      cut_by = now + (int64_t)CUT_WAIT_MS * 1000;
+    }
+    pthread_mutex_unlock(&e->qmu);
+    if (!left || (cut_by && now >= cut_by)) return;     /* (what is left then, stop_worker ends) */
+    int64_t until = cut_by ? cut_by : by;
+    int ms = (int)((until - now + 999) / 1000);
+    struct pollfd pf = { e->wake_rd, POLLIN, 0 };
+    if (poll(&pf, 1, ms < TICK_MS ? ms : TICK_MS) > 0) {
+      char b[64];
+      while (read(e->wake_rd, b, sizeof b) > 0) {}
+    }
+    collect_results(e, wifi_net_now_us());
+    publish(e);
   }
 }
 
@@ -968,7 +1118,8 @@ static void *rx_main(void *arg) {
     if (e->joy_write_failed && !e->p.bound) joy_center(e);
     publish(e);
   }
-  do_stop(e, false);
+  do_stop(e, wifi_net_now_us(), false);
+  exit_releases(e);
   publish(e);
   return NULL;
 }
@@ -1027,7 +1178,7 @@ static void stop_worker(engine_t *e) {
   wifi_actq_new_session(&e->q);
   pthread_cond_broadcast(&e->qcv);
   pthread_mutex_unlock(&e->qmu);
-  pthread_join(e->wth, NULL);           /* a POST in flight notices within 100 ms */
+  pthread_join(e->wth, NULL);           /* a POST in flight (a release left after the wait) notices within 100 ms */
   e->wth_ok = false;
 }
 
@@ -1112,7 +1263,8 @@ engine_t *eng_create(const eng_config_t *cfg, const eng_options_t *opt, char *er
   publish(e);
   if (start_thread(&e->rth, rx_main, e) != 0) {
     snprintf(err, cap, "cannot start the receive thread");
-    do_stop(e, true);
+    do_stop(e, wifi_net_now_us(), true);        /* (a module IP activated by the start is released) */
+    exit_releases(e);
     stop_worker(e);
     ujoy_close(&e->joy);
     free_engine(e);
@@ -1128,7 +1280,9 @@ void eng_destroy(engine_t *e) {
   e->quit = true;
   pthread_mutex_unlock(&e->mu);
   wake(e);
-  if (e->rth_ok) pthread_join(e->rth, NULL);    /* it stops: socket closed, joystick centered */
+  /* it stops (socket closed, joystick centered, the module released) and waits for the releases, at most
+   * WIFI_RELEASE_WAIT_US after the stop (exit_releases) */
+  if (e->rth_ok) pthread_join(e->rth, NULL);
   stop_worker(e);
   ujoy_close(&e->joy);
   free_engine(e);

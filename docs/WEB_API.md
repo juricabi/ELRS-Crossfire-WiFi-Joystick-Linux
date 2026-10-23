@@ -30,7 +30,7 @@ The page (`text/html; charset=utf-8`). `GET /index.html` is the same. `HEAD` is 
 
 ```json
 {
-  "version": "1.0.0",
+  "version": "1.1.0",
   "instance": "1f3a-6230a4c5e1b2c",
   "seq": 1234,
   "uptime_s": 12.5,
@@ -62,6 +62,9 @@ The page (`text/html; charset=utf-8`). `GET /index.html` is the same. `HEAD` is 
   `engine.h` (`eng_snapshot_t.status`). `module`: `null` when not locked; `kind`: `ELRS` | `Crossfire` |
   `WiFi` (not identified by a beacon yet); `name`: the ELRS device name or `""`.
 - `raw`: always 16 numbers (0 beyond `nch`). `nch` 0 = no frame yet.
+- `counters.posts`, `posts_ok`, `posts_failed`: activation POSTs (a restart's `joystick_end` and
+  `joystick_begin` are one); a stop's release (`joystick_end` alone) counts in none of them: its result is
+  in the log.
 - `rate_hz` / `jitter_ms`: one decimal / two decimals. `request.rate_hz` = round(1e6 / interval_us).
 
 ## `GET /api/config`
@@ -89,7 +92,9 @@ The page (`text/html; charset=utf-8`). `GET /index.html` is the same. `HEAD` is 
 Body: a JSON object with any of `module_ip` (string), `port`, `http_port`, `interval_us`, `channels`
 (integers); missing keys keep their current value, also when another client (the terminal, another
 page) changed them meanwhile: only the keys named change (`eng_update_config`). Applied live and saved
-to the settings file.
+to the settings file. A `port` change while running is a stop and a start: what streams to the program is
+released first, as by `POST /api/stop` (to the new `http_port` when the same request changes it; the log
+says how it went), then it listens on the new port.
 
 - 200 `{"ok":true,"config":{...},"warning":""}`: `config` is the whole config now in effect, as the
   program has it (`module_ip` in its plain form: `" 10.0.0.5\r\n"` answers `"10.0.0.5"`); `warning`: e.g.
@@ -102,8 +107,20 @@ to the settings file.
 
 ## `POST /api/start`, `POST /api/stop`, `POST /api/restart`
 
-Body ignored (send `{}`). `start`/`stop` listen or not; `restart` re-sends our request to the module
-(`eng_restart_stream`). 200 `{"ok":true}` once the command is taken; what the module gets is in the log:
+Body ignored (send `{}`). `start`/`stop` listen or not. `stop` also releases the module (rule 14 of
+[DESIGN.md](DESIGN.md#2-protocol-what-the-core-does), [USAGE.md](USAGE.md#using-the-module-from-another-app)):
+`action=joystick_end` alone to the module streaming to the program (and to the others rule 14 names: one
+whose frames it ignores, one asked to stream less than 3 s ago), so it broadcasts again and another app can
+find it; never to a module known as Crossfire by its beacon. 200 `{"ok":true}` comes once the stop is
+taken, before the module answers; `/api/status` then says `"state": "stopped"`, and the log says what the
+module did: "Releasing <ip>: joystick_end, so it stops streaming and broadcasts again", then "Released <ip>: it
+broadcasts again, any app can connect to it" or "Releasing <ip> failed: <why> - it may stream on until its
+WiFi or power is cycled"; for Crossfire "Not releasing <ip>: Crossfire broadcasts while streaming, other apps
+find it as it is". A module gets 2 s to answer ("... failed: timed out after 2 s - ..."). The next `start`
+finds the module by its next broadcast, or at once with a module IP set (within those 2 s when the release
+has no answer yet: the requests to the modules go out one at a time).
+`restart` re-sends our request to the module (`eng_restart_stream`). 200 `{"ok":true}` once the command is
+taken; what the module gets is in the log:
 a restart (`joystick_end`, then `joystick_begin`); nothing for a locked Crossfire; for a locked module that
 may be Crossfire (16 channels, no beacon from it yet) the restart waits until it has streamed 20 s without
 a Crossfire beacon; the module IP, not locked and not known as ELRS by its beacon (no beacon yet, or

@@ -28,8 +28,8 @@ typedef struct {
 /* Signal handling for the whole program: SIGINT/SIGTERM/SIGHUP ask to quit (the third quit signal ends
  * the program at once, exit code 128 + the signal); SIGINT and SIGHUP stay ignored when they were at
  * the start (nohup, a background job of a script); SIGPIPE is ignored. cli_run adds Ctrl+Z (listening
- * stops and the joystick centers while suspended, fg goes on) and, interactive, SIGQUIT (the terminal
- * restored first). Call once, early (before any thread starts). 0 ok. */
+ * stops and the joystick centers while suspended, fg goes on; a quit signal while stopped quits without
+ * listening again) and, interactive, SIGQUIT (the terminal restored first). Call once, early (before any thread starts). 0 ok. */
 int  cli_signals_init(void);
 bool cli_quit_requested(void);
 /* Runs until quit (q, Ctrl+C, a signal, the quit command). Returns the exit code (0). */

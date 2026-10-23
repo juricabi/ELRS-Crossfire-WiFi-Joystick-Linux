@@ -17,7 +17,7 @@
 
 Both radios use the same "WiFi joystick" protocol (the one VelociDrone Mobile speaks), so setup is identical: put the module on your WiFi and run the program. The only difference is the discovery beacon - ELRS announces itself as `ELRS`, Crossfire as `VELOCIDRONE` - and the program handles both automatically.
 
-> **v1.0**: ELRS is asked for **250 Hz × 16 channels** by default, adjustable live from the keys or the web page, and **CH9-CH16 are joystick buttons 1-8**. One static binary per architecture: no dependencies, any distribution.
+> **v1.1**: stop and quit **release the module** (`joystick_end`), so it broadcasts again and another app (the Windows app, a phone, sticktime-pi) finds it without a power cycle ([details](docs/USAGE.md#using-the-module-from-another-app)). ELRS is asked for **250 Hz × 16 channels** by default, adjustable live from the keys or the web page, and **CH9-CH16 are joystick buttons 1-8**. One static binary per architecture: no dependencies, any distribution.
 
 > 🪟 **On Windows?** [ELRS-Crossfire-WiFi-Joystick-Windows](https://github.com/juricabi/ELRS-Crossfire-WiFi-Joystick-Windows) does the same there (vJoy joystick, a visual app and a CLI), with the same protocol behaviour, defaults and axis order, so bindings carry over. The protocol core (`core/`) is also shared with [sticktime-pi](https://github.com/juricabi/sticktime-pi), the Raspberry Pi FPV simulator.
 
@@ -70,7 +70,7 @@ Other machines, or changes to the code: [build it from source](docs/INSTALL.md#b
 
 ## 🎮 Usage
 
-- **Terminal**: the status line at the bottom shows the state, the module, the rate and jitter, the request and the sticks. Keys: `s` start/stop, `t` module IP, `r` rate, `c` channels, `p` port, `a` restart the stream, `w` web page address, `h` help, `q` quit.
+- **Terminal**: the status line at the bottom shows the state, the module, the rate and jitter, the request and the sticks. Keys: `s` start/stop, `t` module IP, `r` rate, `c` channels, `p` port, `a` restart the stream, `w` web page address, `h` help, `q` quit. Stop and quit release the module, so another app can connect to it.
 - **Web page**: <http://127.0.0.1:11000/> - the sticks and buttons live, the settings, start/stop/restart and the log. Changes apply at once and are saved ([its API](docs/WEB_API.md)).
 
 **Command line (optional):** `elrs-wifi-joystick [--module IP] [--rate HZ | --interval US] [--channels N] [--web [ADDR:]PORT] [--daemon]` - e.g. `--module 192.168.1.50` asks that module at once, without waiting for its broadcast. Every option, the stdin commands and the settings file: [docs/USAGE.md](docs/USAGE.md); the systemd user service: [docs/INSTALL.md](docs/INSTALL.md#the-systemd-user-service).
@@ -115,6 +115,7 @@ The same order as the Windows app's vJoy device, so bindings carry over:
 | Searching, no module found | Same network? Guest WiFi often isolates clients; VPNs and virtual adapters can get in the way. Or give the IP: `--module 192.168.1.50` |
 | Steam shows a gamepad, or axes are missing or doubled | Turn Steam Input off for that game (the game's Properties, Controller) |
 | "already running" (exit code 3) | Only one copy may run, e.g. the service: `systemctl --user stop elrs-wifi-joystick` |
+| Another app can't find the module | ELRS broadcasts only while it is not streaming: stop or quit the app it streams to (this one releases it and says "Released <ip>"). After a crash, power the module off and on - see [TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md#another-app-cant-find-the-module) |
 
 More (games, Proton and Wine, two modules, port in use): [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md).
 

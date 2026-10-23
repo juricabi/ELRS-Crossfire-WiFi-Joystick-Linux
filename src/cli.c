@@ -22,6 +22,7 @@
 #define STATUS_LINES_MS 2000          /* redirected: a status line this often while streaming */
 #define STATUS_DAEMON_MS 60000
 #define STOP_WAIT_MS 1500             /* at quit: time for the engine to say "Stopped" */
+#define RELEASE_WAIT_MS (WIFI_RELEASE_WAIT_US / 1000)   /* at quit and Ctrl+Z: the stop's joystick_end (R14) */
 
 /* ================================================================ signals */
 static int sig_pipe[2] = { -1, -1 };
@@ -431,6 +432,8 @@ static void help(cli_t *c) {
     say(c, "Commands: start, stop, s (start/stop), t <ip> (t alone: find the module by its broadcast), rate <hz>,");
     say(c, "          interval <us>, channels <n>, port <n>, http-port <n>, restart, status, web, help, quit");
   }
+  say(c, "Stop and quit release the module: it stops streaming here and broadcasts again, so another app can use it");
+  say(c, "(a Crossfire module is left as it is: it broadcasts anyway).");
 }
 
 #define APPLY_WAIT_MS 2000          /* a command that reads the state waits this long for the ones before it */
@@ -659,10 +662,12 @@ static void header(cli_t *c) {
     const char *b = c->color ? "\x1b[1;36m" : "", *d = c->color ? "\x1b[90m" : "", *n = c->color ? "\x1b[0m" : "";
     printf("%sELRS / Crossfire WiFi Joystick %s%s - UDP %u - %s\n", b, c->o->version, n, s.cfg.port, web);
     printf("%sKeys: [s] start/stop  [t] module IP  [r] rate  [c] channels  [p] UDP port  [a] restart stream  "
-           "[w] web  [h] help  [q] quit%s\n", d, n);
+           "[w] web  [h] help  [q] quit  (stop and quit release the module)%s\n", d, n);
   } else if (c->mode == M_LINES) {
     printf("elrs-wifi-joystick %s - UDP %u - %s\n", c->o->version, s.cfg.port, web);
-    if (c->read_stdin) printf("Commands on stdin: start, stop, t <ip>, rate <hz>, channels <n>, port <n>, restart, status, quit\n");
+    if (c->read_stdin)
+      printf("Commands on stdin: start, stop, t <ip>, rate <hz>, channels <n>, port <n>, restart, status, quit "
+             "(stop and quit release the module)\n");
   } else {
     char ts[48];
     cli_time(wall_ms(), true, ts, sizeof ts);
@@ -671,23 +676,47 @@ static void header(cli_t *c) {
   fflush(stdout);
 }
 
-/* Ctrl+Z (on_tstp): stop listening (the joystick centers) and give the terminal back, then stop the
- * process; when it goes on (fg, or bg), listen again if it was listening */
+/* The stop's releases (R14): wait for them (at most 1.5 s after the stop: it counts from the stop, not from now),
+ * showing their log lines as they come, so the wait says what it waits for; then what is left is cut short
+ * (eng_wait_released, logged) */
+static void wait_released(cli_t *c, bool show) {
+  if (show) {
+    int64_t end = mono_ms() + RELEASE_WAIT_MS;
+    for (;;) {
+      print_logs(c);
+      fflush(stdout);
+      int left = (int)(end - mono_ms());
+      if (left <= 0 || eng_wait_releasing(c->e, c->since, left) != 0) break;
+    }
+  }
+  eng_wait_released(c->e, RELEASE_WAIT_MS);
+}
+
+/* Ctrl+Z (on_tstp): stop listening (the joystick centers, the module is released: its joystick_end goes out
+ * before the process stops) and give the terminal back, then stop the process; when it goes on (fg, or bg),
+ * listen again if it was listening (the released module beacons: it is found again) */
 static void suspend(cli_t *c) {
   eng_snapshot_t s;
   eng_snapshot(c->e, &s);
   bool was = s.running;
+  bool fg = !c->in_tty || foreground();
+  if (fg && c->prompt) {                               /* an open prompt is cancelled */
+    fputc('\n', stdout);
+    c->prompt = 0;
+    tty_raw(true);
+  }
   if (was) {
     eng_stop(c->e);
     eng_wait_applied(c->e, STOP_WAIT_MS);
   }
-  bool fg = !c->in_tty || foreground();
+  /* also when stopped already: the releases of a stop just before are answered or cut short before the process
+   * stops (at most 1.5 s after that stop), so none goes out late, after a long stop, maybe to end a stream another
+   * app has taken since */
+  wait_released(c, fg);
+  /* Ctrl+C (or SIGTERM) while it waited: quit now (the main loop), not stop the process and listen again after fg.
+   * The releases are over: the quit waits for nothing more */
+  if (cli_quit_requested()) return;
   if (fg) {
-    if (c->prompt) {                                   /* an open prompt is cancelled */
-      fputc('\n', stdout);
-      c->prompt = 0;
-      tty_raw(true);
-    }
     print_logs(c);
     clear_status(c);
     if (was) say(c, "Suspended: not listening (the joystick is centered) until the program goes on (fg)");
@@ -695,8 +724,12 @@ static void suspend(cli_t *c) {
   fflush(stdout);
   if (g_raw) tty_set(&g_orig);
   kill(getpid(), SIGSTOP);
-  /* going on: on_cont put raw mode back when this is the foreground */
-  if (was) eng_start(c->e);
+  /* going on: on_cont put raw mode back when this is the foreground. A quit signal that came while it was
+   * stopped ran its handler before this (the other threads block signals): "kill %1" on a stopped job (SIGTERM,
+   * then SIGCONT), or its terminal closed (SIGHUP, then SIGCONT). Then it quits without listening again: a start
+   * would make the quit release the module (activated less than 3 s ago), ending the stream of an app that took
+   * it while this one was stopped */
+  if (was && !cli_quit_requested()) eng_start(c->e);
   g_redraw = 1;
 }
 
@@ -794,7 +827,9 @@ int cli_run(const cli_opts_t *o) {
     }
     fflush(stdout);
   }
-  /* quitting: stop (the joystick centers), show the last lines, give the terminal back */
+  /* quitting: stop (the joystick centers, the module is released), show the last lines (the release's answer, as it
+   * comes: at most WIFI_RELEASE_WAIT_US after the stop, also an earlier one, which eng_destroy does not wait
+   * again), give the terminal back */
   bool show = c.mode != M_TTY || foreground();         /* the interactive UI says nothing from the background */
   if (c.prompt && show) fputc('\n', stdout);
   c.prompt = 0;
@@ -809,6 +844,7 @@ int cli_run(const cli_opts_t *o) {
       eng_wait(c.e, s.seq, s.log_seq, 50);
     }
   }
+  wait_released(&c, show);
   if (show) {
     print_logs(&c);
     clear_status(&c);

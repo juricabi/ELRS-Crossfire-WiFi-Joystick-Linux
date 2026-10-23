@@ -20,7 +20,11 @@ these defaults:
   on your network). Opening UDP 11000 in a firewall, as the program suggests, lets the network reach it.
 - **The requests to a module are plain HTTP.** Asking a module to stream is an HTTP `POST /udpcontrol`
   to the module's IP (port 80 unless `--http-port` says otherwise), as the module firmware requires. It
-  carries only the rate and the channel count.
+  carries only the rate and the channel count. A stop, quit or port change also POSTs
+  `action=joystick_end` (nothing else) to the module streaming to the program, to any address that sent
+  it channel data in the last 3 s (with `--module`, only one it asked, streamed from or heard a beacon from)
+  and to one asked to stream less than 3 s ago, so the module broadcasts again; never to a module known as
+  Crossfire.
 - **Access to `/dev/uinput`.** The udev rule that `install.sh` installs gives `/dev/uinput` to the user
   logged in at the machine's screen and to the members of the `input` group. Access to `/dev/uinput`
   lets that user's programs create input devices, keyboards included, and members of the `input` group

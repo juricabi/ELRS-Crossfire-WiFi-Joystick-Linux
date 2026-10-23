@@ -741,6 +741,8 @@ void cfg_print_help(FILE *f) {
         "Keys while running: s start/stop, t module IP, r rate, c channels, p UDP port, a restart the stream,\n"
         "w web address, h help, q quit. With stdin not a terminal, the same as lines: start, stop, t <ip>,\n"
         "rate <hz>, interval <us>, channels <n>, port <n>, restart, status, quit.\n"
+        "Stop and quit (also Ctrl+C, SIGTERM) release the module: it stops streaming to this machine and\n"
+        "broadcasts again, so another app can connect to it (a Crossfire module broadcasts anyway).\n"
         "Exit codes: 0 ok, 1 error, 2 bad options, 3 already running.\n"
         CFG_LINKS "\n", f);
 }

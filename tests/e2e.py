@@ -8,7 +8,10 @@ Crossfire (never sent joystick_end), the module IP, stop/start, a port change, s
 (a UTF-8 BOM, unknown commands, EOF), the settings file (written, re-read at the next start, the
 default XDG location, --no-config), a second instance (exit 3), SIGTERM / SIGINT / SIGHUP (clean
 exit 0), --daemon, the interactive keys and prompts on a pseudo terminal (and the terminal restored),
-and the web API when src/web.c serves one.
+the web API when src/web.c serves one, and the release (R14: stop, q, SIGTERM, Ctrl+Z and a port change
+send the module joystick_end, so it beacons again and another app finds it; never to Crossfire; an exit
+and Ctrl+Z wait for an answer at most 1.5 s after the stop, and what they cut short never goes out later; a
+rate changed while stopped reaches a released module with the start's joystick_begin, with no restart).
 
 Standard library only. BIN = the binary (default build/native/elrs-wifi-joystick); RUN = a prefix to
 run it with, like build.sh's (e.g. RUN=qemu-aarch64-static BIN=build/aarch64/elrs-wifi-joystick).
@@ -198,6 +201,15 @@ def bodies(m, action=None):
         return [p["body"] for p in m.posts if p["method"] == "POST" and (action is None or action in p["body"])]
 
 
+def released(m, n=1):
+    """the module got its n-th joystick_end (R14), took it, and beaconed after it: another app can find it now"""
+    wait_until(lambda: m.npost("joystick_end") >= n, what="joystick_end number %d" % n)
+    with m.lock:
+        t = [p["t"] for p in m.posts if p["method"] == "POST" and p["params"].get("action") == "joystick_end"][n - 1]
+    wait_until(lambda: not m.state()["active"], what="the module stopped streaming")
+    wait_until(lambda: any(b > t for b in list(m.beacon_times)), what="a beacon after the joystick_end")
+
+
 def wait_until(fn, timeout=8.0, what="condition"):
     end = time.monotonic() + timeout
     while time.monotonic() < end:
@@ -319,26 +331,43 @@ def case_stream_and_commands():
         p.wait_for("No web page: it is turned off (--no-web, or web = off in the settings file)", start=mk)
         time.sleep(0.3)
         check(len(bodies(m)) == n, "a bad value changed something")
-        # stop: the port is free; start: back, without a POST (the module never stopped)
+        # stop: the port is free, the module released (R14: joystick_end alone, so it stops streaming and
+        # beacons again: another app can find it); start: found again by its beacon
+        n = len(bodies(m))
+        mk = p.mark()
         p.send("stop")
-        p.wait_for("Stopped. (The module keeps broadcasting until powered off.)")
+        p.wait_for("Releasing 127.0.0.2: joystick_end, so it stops streaming and broadcasts again", start=mk)
+        p.wait_for("Stopped.", start=mk)
+        p.wait_for("Released 127.0.0.2: it broadcasts again, any app can connect to it", start=mk)
+        check(p.count("keeps broadcasting") == 0, "the old stop line")
+        check(bodies(m)[n:] == ["action=joystick_end"], "stop sent %r" % bodies(m)[n:])
+        released(m, 5)                          # (the 4 before: restarts)
         wait_until(lambda: udp_free(e.udp), what="the UDP port free after stop")
         mk = p.mark()
         p.send("s")
         p.wait_for("Listening for joystick data on UDP %d" % e.udp, start=mk)
+        p.wait_for("Discovery beacon from ELRS module 127.0.0.2 - activating", start=mk)
         p.wait_for("Joystick source locked to 127.0.0.2", start=mk)
         p.send("s")
         p.wait_for("Stopped.", start=mk)
+        p.wait_for("Released 127.0.0.2", start=mk)
         p.send("start")
         p.wait_for("Listening for joystick data on UDP %d" % e.udp, start=mk, n=2)
+        p.wait_for("Joystick source locked to 127.0.0.2", start=mk, n=2)
         # the settings file has what changed (not the command line's port)
         text = open(e.config).read()
         check("interval_us = 6667\n" in text and "channels = 8\n" in text, "settings file:\n" + text)
         check(not re.search(r"^(port|http_port) *=", text, re.M), "command-line values were saved:\n" + text)
+        # quit releases it too, and says so before the program ends
+        mk = p.mark()
         p.send("quit")
         code = p.p.wait(8)
         check(code == 0, "quit: exit %d" % code)
+        p.finish()
         check(p.count("Stopped.") >= 3, "no Stopped at quit")
+        check(p.count("Released 127.0.0.2: it broadcasts again", start=mk) == 1, "quit: no release:\n" +
+              "\n".join(p.lines()[mk:]))
+        released(m, 7)
     finally:
         e.close()
 
@@ -436,17 +465,27 @@ def case_crossfire_and_module_ip():
         p.wait_for("streaming from ELRS 127.0.0.2", start=mk)
         p.send("t")
         p.wait_for("Module IP cleared - finding the module by its broadcast")
+        # the Crossfire module streams on to us, its frames ignored: what the release below knows it by (a stop
+        # right after the switch, before its next frame, would not know it streams to us)
+        p.wait_for("Ignoring 2nd source 127.0.0.3 (locked to 127.0.0.2)")
         text = open(e.config).read()
         check("module_ip =\n" in text, "module_ip not saved as discovery:\n" + text)
-        # a port change: rebind, the old one free
+        # a port change: rebind, the old one free; a stop and a start, so the ELRS module streaming to us is
+        # released (on the new port its frames would not come), the Crossfire one next to it (its frames dropped)
+        # is not: it broadcasts while streaming
         u2 = free_port()
+        mk = p.mark()
         p.send("port %d" % u2)
         p.wait_for("Listening for joystick data on UDP %d" % u2)
         wait_until(lambda: udp_free(e.udp), what="the old port free")
         check(not udp_free(u2), "the new port is not bound")
+        p.wait_for("Released 127.0.0.2: it broadcasts again, any app can connect to it", start=mk)
+        p.wait_for("Not releasing 127.0.0.3: Crossfire broadcasts while streaming, other apps find it as it is", start=mk)
+        released(m)
         p.send("q")
         check(p.p.wait(8) == 0, "quit")
         check(bodies(x, "joystick_end") == [], "Crossfire got joystick_end in the end: %r" % bodies(x))
+        check(x.state()["active"], "the Crossfire module stopped streaming")
     finally:
         e.close()
 
@@ -466,7 +505,8 @@ def case_stdin_details():
         check(p.p.poll() is None, "EOF on stdin ended the program")
         code = p.finish(signal.SIGTERM)
         check(code == 0, "SIGTERM exit %d" % code)
-        p.wait_for("Stopped. (The module keeps broadcasting until powered off.)")
+        p.wait_for("Stopped.")
+        check(p.count("Releasing") == 0, "released a module that was not there")
         # stdin /dev/null from the start: runs until a signal
         p = e.prog(stdin=subprocess.DEVNULL)
         p.wait_for("Listening for joystick data")
@@ -515,7 +555,7 @@ def case_single_instance():
 def case_daemon():
     e = Env()
     try:
-        e.module()
+        m = e.module()
         p = e.prog("--daemon")
         line = p.wait_for("Joystick source locked to 127.0.0.2")
         check(re.match(r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}[+-]\d\d:\d\d Joystick source locked", line),
@@ -526,6 +566,10 @@ def case_daemon():
         check(p.count("Unknown command") == 0, "--daemon answered stdin")
         check(p.finish() == 0, "daemon SIGTERM exit")
         check(all(re.match(r"^\d{4}-\d\d-\d\dT", l) for l in p.lines() if l), "a line without a timestamp")
+        # the service stopping (SIGTERM) releases the module, and the journal gets the answer
+        check(p.count("Released 127.0.0.2: it broadcasts again, any app can connect to it") == 1,
+              "SIGTERM: no release in the log:\n" + "\n".join(p.lines()[-8:]))
+        released(m)
     finally:
         e.close()
 
@@ -586,11 +630,15 @@ def case_web_api():
         s1 = json.loads(web_req(wp, "GET", "/api/status")[1])
         lg = json.loads(web_req(wp, "GET", "/api/log?since=0")[1])
         check(s1["instance"] and s1["instance"] == lg["instance"], "instance %r / %r" % (s1.get("instance"), lg.get("instance")))
+        n_end = m.npost("joystick_end")
         st, data = web_req(wp, "POST", "/api/stop", {})
         check(st == 200, "stop %d" % st)
         p.wait_for("Stopped.")
+        p.wait_for("Released 127.0.0.2: it broadcasts again, any app can connect to it")   # (R14)
+        released(m, n_end + 1)
         st, data = web_req(wp, "POST", "/api/start", {})
         p.wait_for("Listening for joystick data", n=2)
+        p.wait_for("Joystick source locked to 127.0.0.2", n=2)                             # by its beacon
         st, data = web_req(wp, "GET", "/api/log?since=0")
         lg = json.loads(data)
         check(any("Joystick source locked" in l["text"] for l in lg["lines"]), "log %r" % lg)
@@ -633,7 +681,7 @@ def case_interactive():
                         sys.stdout.write(d.decode("utf-8", "replace"))
             raise Fail("pty: no %r in:\n%s" % (pat, bytes(buf[-2000:]).decode("utf-8", "replace")))
 
-        read_until(rb"Keys: \[s\] start/stop")
+        read_until(rb"Keys: \[s\] start/stop[^\n]*\[q\] quit  \(stop and quit release the module\)")
         read_until(rb"Joystick source locked to 127.0.0.2")
         # the status line: bars and state, redrawn in place
         read_until("\u25cf streaming".encode())
@@ -653,15 +701,17 @@ def case_interactive():
         time.sleep(0.5)
         check(len(bodies(m)) == n, "Esc did not cancel")
         check(not (termios.tcgetattr(fd)[3] & termios.ICANON), "raw mode not back after the prompt")
-        # s: stop, s: start
+        # s: stop (the module released), s: start (found again by its beacon)
         os.write(fd, b"s")
-        read_until(rb"Stopped\. \(The module")
+        read_until(rb"Stopped\.[\s\S]*Released 127\.0\.0\.2: it broadcasts again")
+        released(m, 2)                          # (the first: the r prompt's restart)
         os.write(fd, b"s")
         read_until(rb"Listening for joystick data on UDP %d[\s\S]*Listening for joystick data" % e.udp)
+        read_until(rb"locked to 127\.0\.0\.2[\s\S]*locked to 127\.0\.0\.2")
         os.write(fd, b"h")
-        read_until(rb"Keys: s start/stop")
+        read_until(rb"Keys: s start/stop[\s\S]*Stop and quit release the module")
         # a pasted answer longer than the prompt reads: the rest of the line never becomes keys (s, q)
-        stops = bytes(buf).count(b"Stopped. (The module")
+        stops = bytes(buf).count(b"Stopped.")
         os.write(fd, b"t")
         read_until(rb"Module IP \(now")
         os.write(fd, b"x" * 300 + b"sq\n")
@@ -671,7 +721,7 @@ def case_interactive():
         if r:
             buf.extend(os.read(fd, 65536))
         check(os.waitpid(pid, os.WNOHANG) == (0, 0), "the rest of a long prompt line was run as keys (it quit)")
-        check(bytes(buf).count(b"Stopped. (The module") == stops, "the rest of a long prompt line was run as keys (s)")
+        check(bytes(buf).count(b"Stopped.") == stops, "the rest of a long prompt line was run as keys (s)")
         check(not (termios.tcgetattr(fd)[3] & termios.ICANON), "raw mode not back after the long answer")
         os.write(fd, b"q")
         end = time.monotonic() + 8
@@ -688,6 +738,8 @@ def case_interactive():
                 except OSError:
                     pass
         check(code == 0, "q: exit %r" % code)
+        check(bytes(buf).count(b"Released 127.0.0.2: it broadcasts again") == 2, "q: the release not shown")
+        released(m, 3)
         after = termios.tcgetattr(fd)
         check(after[3] == before[3], "the terminal's lflag was not restored (%x, was %x)" % (after[3], before[3]))
         os.close(fd)
@@ -948,28 +1000,36 @@ class JobShell:
 
 
 def case_job_control():
-    """Ctrl+Z (listening stops, the joystick centers; fg goes on), bg (runs on unseen: no reading or drawing
-    on the shell's terminal, no stop on the shell's input), quitting from the background, Ctrl+backslash
-    (the terminal restored), and a start with & then fg (its commands are read after fg)"""
+    """Ctrl+Z (listening stops, the joystick centers, the module is released before the process stops; fg goes
+    on and finds it again), bg (runs on unseen: no reading or drawing on the shell's terminal, no stop on the
+    shell's input), quitting from the background, Ctrl+Z right after a stop (that stop's releases end before
+    the process stops: answered, or cut short and never sent later), Ctrl+C while Ctrl+Z waits for the release
+    (it quits, no stop), "kill %1" of the stopped job (SIGTERM or SIGHUP, then SIGCONT: it quits without listening
+    again, so the module another app took meanwhile gets nothing), Ctrl+backslash (the terminal restored), and a
+    start with & then fg (its commands are read after fg)"""
     e = Env()
     try:
         env = dict(e.env, TERM="xterm", LANG="C.UTF-8")
-        argv = CMD + ["--no-joystick", "--no-web", "--no-config", "-p", str(e.udp)]
+        argv = CMD + ["--no-joystick", "--no-web", "--no-config", "-p", str(e.udp), "--http-port", str(e.http)]
+        m = e.module()
         # ---- Ctrl+Z, fg
         j = JobShell(argv, env)
         try:
             j.wait_for(rb"Listening for joystick data on UDP %d" % e.udp)
+            j.wait_for(rb"locked to 127\.0\.0\.2")
             check(j.raw_mode(), "not in raw mode")
             j.keys(b"\x1a")
             check(j.ask("wait", 5) == "stopped %d" % signal.SIGSTOP, "Ctrl+Z did not suspend it")
-            j.wait_for(rb"Stopped\. \(The module keeps broadcasting")
-            j.wait_for(rb"Suspended: not listening \(the joystick is centered\)")
+            j.wait_for(rb"Stopped\.[\s\S]*Released 127\.0\.0\.2: it broadcasts again[\s\S]*Suspended: not listening "
+                       rb"\(the joystick is centered\)")
+            released(m)                                         # while the program is stopped
             check(udp_free(e.udp), "suspended but still listening (the joystick would hold the sticks)")
             check(j.lflag_restored(), "the terminal is not the shell's while suspended")
             mk = j.mark()
             j.ask("give")
             j.ask("signal", "group", signal.SIGCONT)            # fg
             j.wait_for(rb"Listening for joystick data on UDP %d" % e.udp, start=mk)
+            j.wait_for(rb"locked to 127\.0\.0\.2", start=mk)  # by its beacon
             check(j.ask("wait", 0.5) == "running", "not running after fg")
             check(j.raw_mode(), "raw mode not back after fg")
             # ---- Ctrl+Z, bg: runs (listening) in the background, silently; the shell's input is not read
@@ -989,6 +1049,101 @@ def case_job_control():
             check(udp_free(e.udp), "the port was not freed")
         finally:
             j.close()
+        # ---- s, then Ctrl+Z while that stop's releases are under way: they end before the process stops, at most
+        # 1.5 s after the stop (what is left is cut short), so none goes out while it is stopped or after (it could
+        # end a stream another app has taken meanwhile)
+        b = e.module("127.0.0.4", beacons=False)               # a 2nd module streaming to us (its frames dropped)
+        j = JobShell(argv, env)
+        try:
+            j.wait_for(rb"locked to 127\.0\.0\.2")              # (released by the SIGTERM: found by its beacon)
+            with b.lock:
+                b.active, b.remote_ip, b.channels = True, "127.0.0.1", 16
+            j.wait_for(rb"Ignoring 2nd source 127\.0\.0\.4")
+            m.http_delay = 6.0                                  # its answer comes after the 1.5 s
+            mk = j.mark()
+            j.keys(b"s")
+            j.wait_for(rb"Releasing 127\.0\.0\.4: joystick_end", start=mk)
+            t0 = time.monotonic()
+            j.keys(b"\x1a")
+            check(j.ask("wait", 5) == "stopped %d" % signal.SIGSTOP, "Ctrl+Z after s did not suspend it")
+            took = time.monotonic() - t0
+            print("    Ctrl+Z right after s, the release unanswered: stopped after %.2f s" % took)
+            check(1.0 <= took < 3.0, "Ctrl+Z after s: the process stopped after %.2f s, not 1.5 s after the stop" %
+                  took)
+            j.wait_for(rb"Releasing 127\.0\.0\.2 failed: no answer in time[\s\S]*Releasing 127\.0\.0\.4 failed: not "
+                       rb"sent, the wait ran out before its turn", start=mk)
+            time.sleep(1.0)                                     # a while suspended
+            j.ask("give")
+            j.ask("signal", "group", signal.SIGCONT)            # fg
+            check(j.ask("wait", 1.0) == "running", "not running after fg")
+            check(b.npost("joystick_end") == 0 and b.state()["active"], "a release cut short went out after fg")
+            check(udp_free(e.udp), "listening after fg, though it was stopped before Ctrl+Z")
+        finally:
+            j.close()
+        m.http_delay = 0.0
+        for x in (m, b):                                        # (the rest: no module)
+            x.stop()
+            e.modules.remove(x)
+        # ---- Ctrl+Z, then Ctrl+C while it waits for the release: it quits, without stopping the process first
+        n = e.module("127.0.0.6")
+        j = JobShell(argv, env)
+        try:
+            j.wait_for(rb"locked to 127\.0\.0\.6")
+            n.http_delay = 6.0                                  # its answer comes after the 1.5 s
+            mk = j.mark()
+            t0 = time.monotonic()
+            j.keys(b"\x1a")
+            j.wait_for(rb"Releasing 127\.0\.0\.6: joystick_end", start=mk)   # (shown while it waits)
+            j.keys(b"\x03")
+            st = j.ask("wait", 5)
+            took = time.monotonic() - t0
+            check(st == "exited 0", "Ctrl+C during Ctrl+Z's wait: %s, not a quit" % st)
+            check(took < 2.5, "Ctrl+C during Ctrl+Z's wait: it ended after %.2f s" % took)
+            out = j.text(mk)
+            check(b"Suspended" not in out and b"Listening" not in out, "it suspended or listened again:\n%s" %
+                  out.decode("utf-8", "replace")[-800:])
+            check(re.search(rb"Releasing 127\.0\.0\.6 failed: no answer in time", out), "the cut release not said")
+            check(udp_free(e.udp), "the port was not freed")
+        finally:
+            j.close()
+        n.http_delay = 0.0
+        n.stop()
+        e.modules.remove(n)
+        # ---- Ctrl+Z, another app takes the module, then "kill %1" of the stopped job (SIGTERM, then SIGCONT; its
+        # terminal closed: SIGHUP, then SIGCONT): it quits without listening again. A start would make the quit
+        # release the module IP (activated less than 3 s ago) and end the other app's stream
+        k = e.module("127.0.0.7")
+        for sg in (signal.SIGTERM, signal.SIGHUP):
+            j = JobShell(argv + ["--module", "127.0.0.7"], env)
+            try:
+                j.wait_for(rb"locked to 127\.0\.0\.7")
+                nend = k.npost("joystick_end")
+                j.keys(b"\x1a")
+                check(j.ask("wait", 5) == "stopped %d" % signal.SIGSTOP, "Ctrl+Z did not suspend it")
+                released(k, nend + 1)
+                j.ask("take")                                   # the shell has the terminal again
+                with k.lock:
+                    n0 = len(k.posts)
+                st, body = fake_elrs.post_udpcontrol("127.0.0.7", e.http, {"action": "joystick_begin",
+                                                     "interval": "4000", "channels": "16"}, source_ip="127.0.0.9")
+                check(st == 200 and k.state()["remote_ip"] == "127.0.0.9", "the other app: %r %r" % (st, body))
+                j.ask("signal", "group", sg)                    # kill %1
+                j.ask("signal", "group", signal.SIGCONT)
+                st = j.ask("wait", 5)
+                check(st == "exited 0", "%s, then SIGCONT, to the stopped job: %s, not a quit" % (sg.name, st))
+                time.sleep(0.3)                                 # (a request still on its way)
+                with k.lock:
+                    after = [(p["client"], p["params"].get("action")) for p in k.posts[n0:] if p["method"] == "POST"]
+                check(after == [("127.0.0.9", "joystick_begin")], "%s, then SIGCONT: requests to the module after "
+                      "the suspend's release: %r" % (sg.name, after))
+                s = k.state()
+                check(s["active"] and s["remote_ip"] == "127.0.0.9", "the other app's stream ended: %r" % s)
+                check(udp_free(e.udp), "the port was not freed")
+            finally:
+                j.close()
+            fake_elrs.post_udpcontrol("127.0.0.7", e.http, {"action": "joystick_end"}, source_ip="127.0.0.9")
+        k.stop()
+        e.modules.remove(k)
         # ---- Ctrl+backslash: SIGQUIT ends it, the terminal restored first
         j = JobShell(argv, env)
         try:
@@ -1017,6 +1172,157 @@ def case_job_control():
         e.close()
 
 
+def case_release():
+    """R14, the user's case: a module streams to the program, which quits; the module is released, beacons again,
+    and another app finds it (a second program here: the Windows app, a phone). SIGHUP too, its lines shown as they
+    come. One that does not answer: the exit waits for it 1.5 s, then says so; after a stop, 1.5 s from the stop,
+    not from the quit. One of unknown kind (streaming since before the start, so no beacon) gets joystick_end too;
+    Crossfire never."""
+    e = Env()
+    try:
+        m = e.module()
+        p = e.prog()
+        p.wait_for("Joystick source locked to 127.0.0.2")
+        p.send("q")
+        check(p.p.wait(8) == 0, "quit")
+        p.finish()
+        check(p.count("Released 127.0.0.2: it broadcasts again, any app can connect to it") == 1, "q: no release")
+        check(bodies(m)[-1] == "action=joystick_end", "q sent %r" % bodies(m)[-1:])
+        released(m)
+        # SIGHUP (a logout, the terminal closed) releases too; the wait shows the release's lines as they come: here
+        # the answer takes 1 s, and "Releasing" is out long before it
+        p = e.prog()
+        p.wait_for("Discovery beacon from ELRS module 127.0.0.2 - activating")
+        p.wait_for("Joystick source locked to 127.0.0.2")
+        m.http_delay = 1.0
+        mk = p.mark()
+        t0 = time.monotonic()
+        p.p.send_signal(signal.SIGHUP)
+        p.wait_for("Releasing 127.0.0.2: joystick_end, so it stops streaming and broadcasts again", start=mk)
+        shown = time.monotonic() - t0
+        check(shown < 0.7 and p.count("Released", mk) == 0, "the release's line came %.2f s after SIGHUP" % shown)
+        check(p.p.wait(8) == 0, "SIGHUP exit")
+        p.finish()
+        check(p.count("Released 127.0.0.2: it broadcasts again, any app can connect to it") == 1, "SIGHUP: no release")
+        released(m, 2)
+        m.http_delay = 0.0
+        q = e.prog()
+        q.wait_for("Discovery beacon from ELRS module 127.0.0.2 - activating")
+        q.wait_for("Joystick source locked to 127.0.0.2")
+        # no answer: the exit waits 1.5 s (WIFI_RELEASE_WAIT_US), then cuts it short and says so
+        m.http_delay = 6.0
+        t0 = time.monotonic()
+        code = q.finish(signal.SIGTERM)
+        took = time.monotonic() - t0
+        check(code == 0, "SIGTERM exit %d" % code)
+        check(m.state()["active"], "the module took a joystick_end it had not answered")
+        print("    exit with a release nobody answers: %.2f s" % took)
+        check(1.3 <= took < 4.0, "the exit took %.2f s" % took)
+        check(q.count("Releasing 127.0.0.2 failed: no answer in time - it may stream on until its WiFi or power is "
+                      "cycled") == 1, "the cut release not said:\n" + "\n".join(q.lines()[-6:]))
+        m.stop()
+        e.modules.remove(m)
+        # a stop, then quit 1 s later, the release unanswered: the exit comes 1.5 s after the stop (0.5 s after the
+        # quit), not 1.5 s after the quit
+        m = e.module("127.0.0.5")
+        p = e.prog()
+        p.wait_for("Joystick source locked to 127.0.0.5")
+        m.http_delay = 6.0
+        t0 = time.monotonic()
+        p.send("stop")
+        p.wait_for("Releasing 127.0.0.5: joystick_end")
+        time.sleep(1.0)
+        t1 = time.monotonic()
+        p.send("quit")
+        check(p.p.wait(8) == 0, "quit after a stop")
+        t2 = time.monotonic()
+        p.finish()
+        print("    quit 1 s after a stop, its release unanswered: %.2f s after the stop, %.2f s after the quit" %
+              (t2 - t0, t2 - t1))
+        check(1.3 <= t2 - t0 < 2.4 and t2 - t1 < 1.2, "the exit came %.2f s after the stop, %.2f s after the quit" %
+              (t2 - t0, t2 - t1))
+        check(p.count("Releasing 127.0.0.5 failed: no answer in time - it may stream on until its WiFi or power is "
+                      "cycled") == 1, "the cut release not said:\n" + "\n".join(p.lines()[-6:]))
+        m.stop()
+        e.modules.remove(m)
+        # unknown kind (no beacon: it streams since before the program started): released too
+        u = e.module("127.0.0.4", beacons=False)
+        with u.lock:
+            u.active, u.remote_ip, u.channels = True, "127.0.0.1", 16
+        p = e.prog()
+        p.wait_for("Joystick source locked to 127.0.0.4")
+        check(p.finish(signal.SIGINT) == 0, "SIGINT exit")
+        check(p.count("Released 127.0.0.4: it broadcasts again") == 1, "unknown kind not released")
+        wait_until(lambda: not u.state()["active"], what="the unknown module stopped streaming")
+        # Crossfire, known by its beacon: logged, never sent joystick_end (it broadcasts while streaming)
+        x = e.module("127.0.0.3", "xf")
+        p = e.prog("--module", "127.0.0.3")
+        p.wait_for("Joystick source locked to 127.0.0.3")
+        wait_until(lambda: x.sent_beacons >= 2, what="the Crossfire beacon")
+        mk = p.mark()
+        p.send("status")
+        p.wait_for("streaming from Crossfire 127.0.0.3", start=mk)
+        t0 = time.monotonic()
+        check(p.finish(signal.SIGTERM) == 0, "SIGTERM exit")
+        check(time.monotonic() - t0 < 1.3, "the exit waited for nothing")
+        check(p.count("Not releasing 127.0.0.3: Crossfire broadcasts while streaming, other apps find it as it is") == 1,
+              "Crossfire: not said")
+        check(bodies(x, "joystick_end") == [], "Crossfire got joystick_end: %r" % bodies(x))
+        check(x.state()["active"], "Crossfire stopped streaming")
+    finally:
+        e.close()
+
+
+def case_release_then_change():
+    """R14 + R3: a module the stop released (it took the joystick_end) is idle, so a rate changed while stopped
+    reaches it with the start's joystick_begin, and it locks without a restart: no joystick_end but the release's.
+    With the module IP set, known as ELRS by its beacon: stop, rate 500, start. A module that missed its release
+    streams on with the old rate, so the start restarts it (as before)."""
+    e = Env()
+    try:
+        m = e.module()
+        p = e.prog()
+        p.wait_for("Discovery beacon from ELRS module 127.0.0.2 - activating")
+        p.wait_for("Joystick source locked to 127.0.0.2")
+        p.send("t 127.0.0.2")
+        p.wait_for("Target module set to 127.0.0.2 - streaming from it already")
+        wait_until(lambda: m.state()["active"] and m.state()["interval_us"] == 4000, what="the stream at 250 Hz")
+        mk = p.mark()
+        p.send("stop")
+        p.wait_for("Released 127.0.0.2: it broadcasts again, any app can connect to it", start=mk)
+        released(m)
+        p.send("rate 500")
+        p.wait_for("Asking for 500 Hz (2000 us) and 16 channels", start=mk)
+        n = len(bodies(m))
+        p.send("start")
+        p.wait_for("Joystick source locked to 127.0.0.2", start=mk)
+        time.sleep(1.5)                         # a restart of a module known as ELRS goes out at once
+        check(bodies(m)[n:] == ["action=joystick_begin&interval=2000&channels=16"], "start sent %r" % bodies(m)[n:])
+        check(m.npost("joystick_end") == 1, "joystick_end beyond the release: %r" % bodies(m))
+        st = m.state()
+        check(st["active"] and st["interval_us"] == 2000, "the module %r" % st)
+        check(p.count("from before the change", mk) == 0 and p.count("Restarting the stream", mk) == 0,
+              "restarted for nothing:\n" + "\n".join(p.lines()[mk:]))
+        # the release fails (HTTP 500, the module streams on at 500 Hz): rate 250 while stopped restarts it at the
+        # start
+        m.http_fail_first = 1
+        mk = p.mark()
+        p.send("stop")
+        p.wait_for("Releasing 127.0.0.2 failed: HTTP 500 - it may stream on until its WiFi or power is cycled",
+                   start=mk)
+        check(m.state()["active"], "the module took the joystick_end it was refused")
+        p.send("rate 250")
+        p.wait_for("Asking for 250 Hz (4000 us) and 16 channels", start=mk)
+        p.send("start")
+        p.wait_for("127.0.0.2 still streams 500 Hz, 16 channels from before the change - restarting its stream "
+                   "with 250 Hz, 16 channels", start=mk)
+        wait_until(lambda: m.state()["interval_us"] == 4000, what="the module at 4000 us")
+        check(m.npost("joystick_end") == 3, "joystick_end: %r" % bodies(m))
+        check(p.finish() == 0, "SIGTERM exit")
+    finally:
+        e.close()
+
+
 CASES = [
     ("version_help_rates", case_version_help_rates),
     ("bad_options", case_bad_options),
@@ -1033,6 +1339,8 @@ CASES = [
     ("std_fds", case_closed_std_fds),
     ("stdout_gone", case_stdout_reader_gone),
     ("job_control", case_job_control),
+    ("release", case_release),
+    ("release_then_change", case_release_then_change),
 ]
 
 

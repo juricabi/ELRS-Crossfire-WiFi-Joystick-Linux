@@ -568,12 +568,14 @@ def run_joystick(t, w, p, dev, name, line, m_node):
     set_and_wait(dev, m, [9000] * 8, (MAXV,) * 4 + (0,) * 4, range(4), "the stream back after the silence")
     t.check("the sticks follow again after the silence", True)
 
-    # stop centers; start follows again
+    # stop centers (and releases the module: joystick_end, R14); start: found again by its beacon, follows again
     mk = p.mark()
     p.send("stop")
     p.wait_for("Stopped.", start=mk)
     dev.wait(lambda: all(dev.abs[c] == CENTER for c in range(8)) and not dev.btn, "centering at stop")
     t.check("stop: centered and released", all(dev.absinfo(c)[0] == CENTER for c in range(8)) and not dev.keys_down())
+    p.wait_for("Released 127.0.0.2: it broadcasts again", start=mk)
+    t.check("stop: the module released", m.npost("joystick_end") >= 1 and not m.state()["active"])
     p.send("start")
     set_and_wait(dev, m, [9001] * 8, (MAXV,) * 8, range(8), "the stream after start")
     t.check("start: the sticks follow again", True)
